@@ -198,8 +198,24 @@ fn build_pr_list_items_ref(
             };
             let number_span = Span::styled(format!("#{:<5}", pr.number), number_style);
 
+            // Build labels and CI icon first to measure their widths
+            let labels_str = if !pr.labels.is_empty() {
+                let label_names: Vec<&str> =
+                    pr.labels.iter().take(2).map(|l| l.name.as_str()).collect();
+                if pr.labels.len() > 2 {
+                    format!(" [{}+{}]", label_names.join(", "), pr.labels.len() - 2)
+                } else {
+                    format!(" [{}]", label_names.join(", "))
+                }
+            } else {
+                String::new()
+            };
+
+            let ci_status = CiStatus::from_rollup(&pr.status_check_rollup);
+            let ci_width = if ci_status == CiStatus::None { 0 } else { 3 };
+
             let author_width = 4 + pr.author.login.width();
-            let fixed_width = 6 + 2 + 2 + author_width;
+            let fixed_width = 6 + 2 + 2 + author_width + labels_str.width() + ci_width;
             let title_width = area_width.saturating_sub(fixed_width).max(20);
             let full_title = format!("{}{}", draft_marker, pr.title);
             let title = truncate_with_width(&full_title, title_width);
@@ -222,20 +238,8 @@ fn build_pr_list_items_ref(
                 Style::default().fg(Color::Cyan),
             );
 
-            let labels_str = if !pr.labels.is_empty() {
-                let label_names: Vec<&str> =
-                    pr.labels.iter().take(2).map(|l| l.name.as_str()).collect();
-                if pr.labels.len() > 2 {
-                    format!(" [{}+{}]", label_names.join(", "), pr.labels.len() - 2)
-                } else {
-                    format!(" [{}]", label_names.join(", "))
-                }
-            } else {
-                String::new()
-            };
             let labels_span = Span::styled(labels_str, Style::default().fg(Color::Blue));
 
-            let ci_status = CiStatus::from_rollup(&pr.status_check_rollup);
             let ci_span = match ci_status {
                 CiStatus::Success => Span::styled("  ✓", Style::default().fg(Color::Green)),
                 CiStatus::Failure => Span::styled("  ✕", Style::default().fg(Color::Red)),

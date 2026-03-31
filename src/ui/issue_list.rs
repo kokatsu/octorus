@@ -186,8 +186,33 @@ fn build_issue_list_items(
             };
             let number_span = Span::styled(format!("#{:<5}", issue.number), number_style);
 
+            // Build labels and comment count first to measure their widths
+            let labels_str = if !issue.labels.is_empty() {
+                let label_names: Vec<&str> = issue
+                    .labels
+                    .iter()
+                    .take(2)
+                    .map(|l| l.name.as_str())
+                    .collect();
+                if issue.labels.len() > 2 {
+                    format!(" [{}+{}]", label_names.join(", "), issue.labels.len() - 2)
+                } else {
+                    format!(" [{}]", label_names.join(", "))
+                }
+            } else {
+                String::new()
+            };
+
+            let comment_count = issue.comments.len();
+            let comment_str = if comment_count > 0 {
+                format!("  💬 {}", comment_count)
+            } else {
+                String::new()
+            };
+
             let author_width = 4 + issue.author.login.width();
-            let fixed_width = 2 + 6 + 2 + 2 + author_width;
+            let fixed_width =
+                2 + 6 + 2 + 2 + author_width + labels_str.width() + comment_str.width();
             let title_width = area_width.saturating_sub(fixed_width).max(20);
             let title = truncate_with_width(&issue.title, title_width);
             let title_style = if is_selected {
@@ -207,29 +232,10 @@ fn build_issue_list_items(
                 Style::default().fg(Color::Cyan),
             );
 
-            let labels_str = if !issue.labels.is_empty() {
-                let label_names: Vec<&str> = issue
-                    .labels
-                    .iter()
-                    .take(2)
-                    .map(|l| l.name.as_str())
-                    .collect();
-                if issue.labels.len() > 2 {
-                    format!(" [{}+{}]", label_names.join(", "), issue.labels.len() - 2)
-                } else {
-                    format!(" [{}]", label_names.join(", "))
-                }
-            } else {
-                String::new()
-            };
             let labels_span = Span::styled(labels_str, Style::default().fg(Color::Blue));
 
-            let comment_count = issue.comments.len();
             let comment_span = if comment_count > 0 {
-                Span::styled(
-                    format!("  💬 {}", comment_count),
-                    Style::default().fg(Color::DarkGray),
-                )
+                Span::styled(comment_str, Style::default().fg(Color::DarkGray))
             } else {
                 Span::raw("")
             };
@@ -385,7 +391,7 @@ mod tests {
         │Issue List: test/repo (open)                                                                      │
         └──────────────────────────────────────────────────────────────────────────────────────────────────┘
         ┌Issues (1)────────────────────────────────────────────────────────────────────────────────────────┐
-        │● #5      Bug report                                                                    by @carol │
+        │● #5      Bug report                                                    by @carol [bug, priority] │
         │                                                                                                  │
         │                                                                                                  │
         │                                                                                                  │
