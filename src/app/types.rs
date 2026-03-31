@@ -895,9 +895,12 @@ pub struct ChecksState {
     pub checks_target_pr: Option<u32>,
     pub checks_return_state: AppState,
     pub ci_status: Option<crate::github::CiStatus>,
+    pub review_decision: Option<crate::github::ReviewDecision>,
     pub(crate) checks_receiver:
         super::PrReceiver<Result<Vec<crate::github::CheckItem>, String>>,
     pub(crate) ci_status_receiver: Option<tokio::sync::mpsc::Receiver<crate::github::CiStatus>>,
+    pub(crate) review_decision_receiver:
+        Option<tokio::sync::mpsc::Receiver<Option<crate::github::ReviewDecision>>>,
 }
 
 impl Default for ChecksState {
@@ -910,8 +913,10 @@ impl Default for ChecksState {
             checks_target_pr: None,
             checks_return_state: AppState::FileList,
             ci_status: None,
+            review_decision: None,
             checks_receiver: None,
             ci_status_receiver: None,
+            review_decision_receiver: None,
         }
     }
 }

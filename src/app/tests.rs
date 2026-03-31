@@ -2933,6 +2933,7 @@ fn test_reapply_filter_pr_list() {
             labels: vec![],
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             status_check_rollup: vec![],
+            review_decision: None,
         },
         PullRequestSummary {
             number: 2,
@@ -2945,6 +2946,7 @@ fn test_reapply_filter_pr_list() {
             labels: vec![],
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             status_check_rollup: vec![],
+            review_decision: None,
         },
     ]);
     let mut filter = crate::filter::ListFilter::new();
@@ -4528,6 +4530,7 @@ async fn test_handle_pr_list_input_loading_blocks() {
         labels: vec![],
         updated_at: "2024-01-01T00:00:00Z".to_string(),
         status_check_rollup: vec![],
+        review_decision: None,
     }]);
     app.prs.selected_pr = 0;
 
@@ -4555,6 +4558,7 @@ async fn test_handle_pr_list_input_move_down() {
             labels: vec![],
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             status_check_rollup: vec![],
+            review_decision: None,
         },
         PullRequestSummary {
             number: 2,
@@ -4567,6 +4571,7 @@ async fn test_handle_pr_list_input_move_down() {
             labels: vec![],
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             status_check_rollup: vec![],
+            review_decision: None,
         },
     ]);
     app.prs.selected_pr = 0;
@@ -4594,6 +4599,7 @@ async fn test_handle_pr_list_input_move_up() {
             labels: vec![],
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             status_check_rollup: vec![],
+            review_decision: None,
         },
         PullRequestSummary {
             number: 2,
@@ -4606,6 +4612,7 @@ async fn test_handle_pr_list_input_move_up() {
             labels: vec![],
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             status_check_rollup: vec![],
+            review_decision: None,
         },
     ]);
     app.prs.selected_pr = 1;
@@ -4634,6 +4641,7 @@ async fn test_handle_pr_list_input_jump_to_last() {
                 labels: vec![],
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
                 status_check_rollup: vec![],
+                review_decision: None,
             })
             .collect(),
     );
@@ -6917,6 +6925,7 @@ async fn test_poll_pr_list_error_recovers_from_loading_more() {
         labels: vec![],
         updated_at: "".to_string(),
         status_check_rollup: vec![],
+        review_decision: None,
     }];
     app.prs.pr_list = LoadState::LoadingMore(existing);
 
@@ -6949,6 +6958,7 @@ async fn test_poll_pr_list_disconnect_recovers_from_loading_more() {
         labels: vec![],
         updated_at: "".to_string(),
         status_check_rollup: vec![],
+        review_decision: None,
     }];
     app.prs.pr_list = LoadState::LoadingMore(existing);
 

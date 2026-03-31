@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::common::{render_update_bar, truncate_with_width};
 use crate::app::App;
-use crate::github::{CiStatus, PullRequestSummary};
+use crate::github::{CiStatus, PrStatus, PullRequestSummary, ReviewDecision};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let has_filter_bar = app.prs.pr_list_filter.as_ref().is_some_and(|f| f.input_active);
@@ -212,7 +212,12 @@ fn build_pr_list_items_ref(
             };
 
             let ci_status = CiStatus::from_rollup(&pr.status_check_rollup);
-            let ci_width = if ci_status == CiStatus::None { 0 } else { 3 };
+            let review = pr
+                .review_decision
+                .as_deref()
+                .and_then(ReviewDecision::parse);
+            let pr_status = PrStatus::resolve(ci_status, review);
+            let ci_width = if pr_status == PrStatus::None { 0 } else { 3 };
 
             let author_width = 4 + pr.author.login.width();
             let fixed_width = 6 + 2 + 2 + author_width + labels_str.width() + ci_width;
@@ -240,11 +245,17 @@ fn build_pr_list_items_ref(
 
             let labels_span = Span::styled(labels_str, Style::default().fg(Color::Blue));
 
-            let ci_span = match ci_status {
-                CiStatus::Success => Span::styled("  ✓", Style::default().fg(Color::Green)),
-                CiStatus::Failure => Span::styled("  ✕", Style::default().fg(Color::Red)),
-                CiStatus::Pending => Span::styled("  ○", Style::default().fg(Color::Yellow)),
-                CiStatus::None => Span::raw(""),
+            let ci_span = match pr_status {
+                PrStatus::Ready | PrStatus::CiPassed => {
+                    Span::styled("  ✓", Style::default().fg(Color::Green))
+                }
+                PrStatus::CiFailed | PrStatus::ChangesRequested => {
+                    Span::styled("  ✕", Style::default().fg(Color::Red))
+                }
+                PrStatus::CiPending | PrStatus::ReviewRequired => {
+                    Span::styled("  ○", Style::default().fg(Color::Yellow))
+                }
+                PrStatus::None => Span::raw(""),
             };
 
             let line = Line::from(vec![

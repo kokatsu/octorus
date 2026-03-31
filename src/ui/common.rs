@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ai::RallyState;
 use crate::app::{App, DataState};
-use crate::github::CiStatus;
+use crate::github::{CiStatus, PrStatus};
 
 /// Build PR info string for header display (shared between file_list and ai_rally)
 pub fn build_pr_info(app: &App) -> String {
@@ -31,17 +31,28 @@ pub fn build_pr_info(app: &App) -> String {
     }
 }
 
-/// Build CI status span with color for header display
-pub fn build_ci_status_span(app: &App) -> Span<'static> {
-    match app.chk.ci_status {
-        Some(CiStatus::Success) => Span::styled("  ✓ CI passed", Style::default().fg(Color::Green)),
-        Some(CiStatus::Failure) => Span::styled("  ✕ CI failed", Style::default().fg(Color::Red)),
-        Some(CiStatus::Pending) => {
+/// Build PR status span with color for header display (CI + review combined)
+pub fn build_pr_status_span(app: &App) -> Span<'static> {
+    let ci = app.chk.ci_status.unwrap_or(CiStatus::None);
+    let review = app.chk.review_decision;
+    let status = PrStatus::resolve(ci, review);
+    match status {
+        PrStatus::Ready => Span::styled("  ✓ Approved", Style::default().fg(Color::Green)),
+        PrStatus::CiPassed => Span::styled("  ✓ CI passed", Style::default().fg(Color::Green)),
+        PrStatus::CiFailed => Span::styled("  ✕ CI failed", Style::default().fg(Color::Red)),
+        PrStatus::ChangesRequested => {
+            Span::styled("  ✕ Changes requested", Style::default().fg(Color::Red))
+        }
+        PrStatus::CiPending => {
             Span::styled("  ○ CI pending", Style::default().fg(Color::Yellow))
         }
-        Some(CiStatus::None) | None => Span::raw(""),
+        PrStatus::ReviewRequired => {
+            Span::styled("  ○ Review required", Style::default().fg(Color::Yellow))
+        }
+        PrStatus::None => Span::raw(""),
     }
 }
+
 
 /// Render rally status bar for background rally indication
 pub fn render_rally_status_bar(frame: &mut Frame, area: Rect, app: &App) {

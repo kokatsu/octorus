@@ -342,6 +342,7 @@ impl App {
             self.poll_rally_events();
             self.poll_checks_updates();
             self.poll_ci_status_updates();
+            self.poll_review_decision_updates();
             self.poll_git_ops_updates();
             self.poll_issue_list_updates();
             self.poll_issue_detail_updates();

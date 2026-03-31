@@ -925,6 +925,23 @@ impl App {
                         let _ = tx.send(status).await;
                     });
                 }
+                // CLI 直接指定時: review_decision をバックグラウンドで取得
+                if !self.local_mode
+                    && self.chk.review_decision.is_none()
+                    && self.chk.review_decision_receiver.is_none()
+                {
+                    let (tx, rx) = mpsc::channel(1);
+                    self.chk.review_decision_receiver = Some(rx);
+                    let repo = self.repo.clone();
+                    tokio::spawn(async move {
+                        let decision =
+                            crate::github::fetch_review_decision(&repo, origin_pr)
+                                .await
+                                .ok()
+                                .flatten();
+                        let _ = tx.send(decision).await;
+                    });
+                }
                 if should_start_rally {
                     self.start_ai_rally_on_load = false; // Clear the flag
                     self.start_ai_rally();
@@ -1140,6 +1157,23 @@ impl App {
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 self.chk.ci_status_receiver = None;
+            }
+        }
+    }
+
+    pub(crate) fn poll_review_decision_updates(&mut self) {
+        let Some(ref mut rx) = self.chk.review_decision_receiver else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(decision) => {
+                self.chk.review_decision = decision;
+                self.chk.review_decision_receiver = None;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.chk.review_decision_receiver = None;
             }
         }
     }

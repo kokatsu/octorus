@@ -61,6 +61,49 @@ impl CiStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+impl ReviewDecision {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "APPROVED" => Some(Self::Approved),
+            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
+            "REVIEW_REQUIRED" => Some(Self::ReviewRequired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrStatus {
+    Ready,
+    CiPassed,
+    CiFailed,
+    ChangesRequested,
+    CiPending,
+    ReviewRequired,
+    None,
+}
+
+impl PrStatus {
+    pub fn resolve(ci: CiStatus, review: Option<ReviewDecision>) -> Self {
+        match (ci, review) {
+            (CiStatus::Failure, _) => Self::CiFailed,
+            (_, Some(ReviewDecision::ChangesRequested)) => Self::ChangesRequested,
+            (CiStatus::Pending, _) => Self::CiPending,
+            (_, Some(ReviewDecision::ReviewRequired)) => Self::ReviewRequired,
+            (_, Some(ReviewDecision::Approved)) => Self::Ready,
+            (CiStatus::Success, _) => Self::CiPassed,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckItem {
     pub name: String,
@@ -89,6 +132,8 @@ pub struct PullRequestSummary {
     pub updated_at: String,
     #[serde(default, rename = "statusCheckRollup")]
     pub status_check_rollup: Vec<StatusCheckRollupItem>,
+    #[serde(default, rename = "reviewDecision")]
+    pub review_decision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,7 +393,7 @@ pub async fn fetch_pr_list_with_offset(
         "-s",
         state.as_gh_arg(),
         "--json",
-        "number,title,state,author,isDraft,labels,updatedAt,statusCheckRollup",
+        "number,title,state,author,isDraft,labels,updatedAt,statusCheckRollup,reviewDecision",
         "--limit",
         &fetch_count.to_string(),
     ])
@@ -385,6 +430,32 @@ pub async fn fetch_pr_checks(repo: &str, pr_number: u32) -> Result<Vec<CheckItem
     )
     .await?;
     serde_json::from_str(&output).context("Failed to parse PR checks response")
+}
+
+pub async fn fetch_review_decision(repo: &str, pr_number: u32) -> Result<Option<ReviewDecision>> {
+    let output = gh_command(&[
+        "pr",
+        "view",
+        &pr_number.to_string(),
+        "-R",
+        repo,
+        "--json",
+        "reviewDecision",
+    ])
+    .await?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        #[serde(rename = "reviewDecision")]
+        review_decision: Option<String>,
+    }
+
+    let resp: Response =
+        serde_json::from_str(&output).context("Failed to parse review decision response")?;
+    Ok(resp
+        .review_decision
+        .as_deref()
+        .and_then(ReviewDecision::parse))
 }
 
 #[cfg(test)]
@@ -555,5 +626,141 @@ mod tests {
         assert_eq!(item.type_name, "CheckRun");
         assert_eq!(item.name.as_deref(), Some("build"));
         assert_eq!(item.conclusion.as_deref(), Some("SUCCESS"));
+    }
+
+    #[test]
+    fn test_review_decision_parse() {
+        assert_eq!(
+            ReviewDecision::parse("APPROVED"),
+            Some(ReviewDecision::Approved)
+        );
+        assert_eq!(
+            ReviewDecision::parse("CHANGES_REQUESTED"),
+            Some(ReviewDecision::ChangesRequested)
+        );
+        assert_eq!(
+            ReviewDecision::parse("REVIEW_REQUIRED"),
+            Some(ReviewDecision::ReviewRequired)
+        );
+        assert_eq!(ReviewDecision::parse("UNKNOWN"), None);
+        assert_eq!(ReviewDecision::parse(""), None);
+    }
+
+    #[test]
+    fn test_pr_status_resolve_ci_failed_takes_priority() {
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Failure, Some(ReviewDecision::Approved)),
+            PrStatus::CiFailed
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Failure, Some(ReviewDecision::ChangesRequested)),
+            PrStatus::CiFailed
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Failure, None),
+            PrStatus::CiFailed
+        );
+    }
+
+    #[test]
+    fn test_pr_status_resolve_changes_requested() {
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Success, Some(ReviewDecision::ChangesRequested)),
+            PrStatus::ChangesRequested
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Pending, Some(ReviewDecision::ChangesRequested)),
+            PrStatus::ChangesRequested
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::None, Some(ReviewDecision::ChangesRequested)),
+            PrStatus::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn test_pr_status_resolve_ci_pending() {
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Pending, Some(ReviewDecision::Approved)),
+            PrStatus::CiPending
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Pending, Some(ReviewDecision::ReviewRequired)),
+            PrStatus::CiPending
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Pending, None),
+            PrStatus::CiPending
+        );
+    }
+
+    #[test]
+    fn test_pr_status_resolve_review_required() {
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Success, Some(ReviewDecision::ReviewRequired)),
+            PrStatus::ReviewRequired
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::None, Some(ReviewDecision::ReviewRequired)),
+            PrStatus::ReviewRequired
+        );
+    }
+
+    #[test]
+    fn test_pr_status_resolve_ready() {
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Success, Some(ReviewDecision::Approved)),
+            PrStatus::Ready
+        );
+        assert_eq!(
+            PrStatus::resolve(CiStatus::None, Some(ReviewDecision::Approved)),
+            PrStatus::Ready
+        );
+    }
+
+    #[test]
+    fn test_pr_status_resolve_ci_passed_no_review() {
+        assert_eq!(
+            PrStatus::resolve(CiStatus::Success, None),
+            PrStatus::CiPassed
+        );
+    }
+
+    #[test]
+    fn test_pr_status_resolve_none() {
+        assert_eq!(PrStatus::resolve(CiStatus::None, None), PrStatus::None);
+    }
+
+    #[test]
+    fn test_pr_summary_deserialize_with_review_decision() {
+        let json = r#"{
+            "number": 42,
+            "title": "test PR",
+            "state": "OPEN",
+            "author": {"login": "user"},
+            "isDraft": false,
+            "labels": [],
+            "updatedAt": "2024-01-01T00:00:00Z",
+            "statusCheckRollup": [],
+            "reviewDecision": "APPROVED"
+        }"#;
+        let pr: PullRequestSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.review_decision.as_deref(), Some("APPROVED"));
+    }
+
+    #[test]
+    fn test_pr_summary_deserialize_without_review_decision() {
+        let json = r#"{
+            "number": 42,
+            "title": "test PR",
+            "state": "OPEN",
+            "author": {"login": "user"},
+            "isDraft": false,
+            "labels": [],
+            "updatedAt": "2024-01-01T00:00:00Z",
+            "statusCheckRollup": []
+        }"#;
+        let pr: PullRequestSummary = serde_json::from_str(json).unwrap();
+        assert!(pr.review_decision.is_none());
     }
 }

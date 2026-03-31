@@ -58,7 +58,7 @@ pub use issue::{
 
 pub use pr::{
     fetch_changed_files, fetch_files_viewed_state, fetch_pr, fetch_pr_checks, fetch_pr_diff,
-    fetch_pr_list, fetch_pr_list_with_offset, set_file_viewed, submit_review, Branch,
-    ChangedFile, CheckItem, CiStatus, Label, PrListPage,
-    PrStateFilter, PullRequest, PullRequestSummary, StatusCheckRollupItem, User,
+    fetch_pr_list, fetch_pr_list_with_offset, fetch_review_decision, set_file_viewed,
+    submit_review, Branch, ChangedFile, CheckItem, CiStatus, Label, PrListPage, PrStatus,
+    PrStateFilter, PullRequest, PullRequestSummary, ReviewDecision, StatusCheckRollupItem, User,
 };

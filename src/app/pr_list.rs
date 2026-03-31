@@ -281,16 +281,24 @@ impl App {
         self.chk.checks_loading = false;
         self.chk.checks_target_pr = None;
         self.chk.checks_receiver = None;
+        self.chk.ci_status_receiver = None;
+        self.chk.review_decision_receiver = None;
 
         if let Some(prs) = self.prs.pr_list.as_loaded() {
             if let Some(pr_summary) = prs.iter().find(|p| p.number == pr_number) {
                 let status = CiStatus::from_rollup(&pr_summary.status_check_rollup);
                 self.chk.ci_status = Some(status);
+                self.chk.review_decision = pr_summary
+                    .review_decision
+                    .as_deref()
+                    .and_then(crate::github::ReviewDecision::parse);
             } else {
                 self.chk.ci_status = None;
+                self.chk.review_decision = None;
             }
         } else {
             self.chk.ci_status = None;
+            self.chk.review_decision = None;
         }
 
         if self.pending_ai_rally {
@@ -357,6 +365,8 @@ impl App {
         self.chk.checks_receiver = None;
         self.chk.ci_status = None;
         self.chk.ci_status_receiver = None;
+        self.chk.review_decision = None;
+        self.chk.review_decision_receiver = None;
     }
 
     pub fn back_to_pr_list(&mut self) {
