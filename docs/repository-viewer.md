@@ -1,6 +1,13 @@
 # octorus を Repository Viewer へ — 技術調査と進化方針
 
-> 対象読者: octorus のメンテナ。ここでは「なぜ Viewer なのか」「競合と何が違うのか」「どこまで実装したか」「次に何をやるか」を記録する。
+> 対象読者: octorus のメンテナ、および次にこの作業を引き継ぐ人（人間・エージェントを問わず）。
+> ここでは「なぜ Viewer なのか」「競合と何が違うのか」「どこまで実装したか」「次に何をやるか」を記録する。
+>
+> 関連ドキュメント:
+> - [symbol-index.md](symbol-index.md) — シンボルエンジンの技術リファレンス
+> - [repo-browse-architecture.md](repo-browse-architecture.md) — ブラウザ画面のアーキテクチャ
+> - [roadmap/code-archaeology.md](roadmap/code-archaeology.md) — Pillar C の実装設計
+> - [session-log.md](session-log.md) — 実装時の判断・踏んだ罠・実測値
 
 ## 1. 前提 — なぜ「エディタ」ではなく「ビューワ」なのか
 
@@ -74,6 +81,9 @@ UI からは `o`（アウトライン）/ `s`（リポジトリ横断シンボ�
 
 既存の `src/symbol.rs`（`fn ` などのキーワード前方一致 + grep）との違いは決定的で、**コメントや文字列中の同名トークンに引っかからない**。CST 上の定義ノードだけを見ている。
 
+落とし穴と言語別の癖は [symbol-index.md](symbol-index.md) に全部書いてある。
+言語を追加するときは必ずそちらを読むこと。
+
 実測（octorus 自身、162 ファイル / 約 70k LOC、デバッグではなく release ビルド）:
 
 | 操作 | 実測値 |
@@ -106,6 +116,10 @@ Zed も Helix も blame は出せるが、そこから「その変更を承認�
 
 実装コスト見積り: blame 取得と行→commit マップは小さい（`git blame --porcelain` のパース）。commit → PR の解決は `gh api repos/{repo}/commits/{sha}/pulls` で 1 リクエスト。既存の PR / コメント表示にそのまま合流できるので、UI の新規作成はオーバーレイ 1 枚で済む。
 
+**詳細な実装設計は [roadmap/code-archaeology.md](roadmap/code-archaeology.md) にある。**
+C-1（blame）→ C-2（commit diff）→ C-3（PR 解決）→ C-4（行コメント）の 4 フェーズに
+分割してあり、それぞれ独立した PR にできる。C-1 だけでも単体で価値がある。
+
 ### Pillar C の先にあるもの（ラフスケッチ）
 
 - **References（`gr`）** — tags.scm には `@reference.call` / `@reference.class` も含まれている。定義側と同じ仕組みで参照検索が作れる。
@@ -125,3 +139,14 @@ Zed も Helix も blame は出せるが、そこから「その変更を承認�
 | 変更 | `AppState` に `RepoBrowseTree` / `RepoBrowseFile`、Cockpit に `Repo Browse`、`--browse` フラグ、`repo_browse` / `symbol_outline` / `symbol_search` キーバインド |
 
 状態は既存の設計原則どおり列挙型で表現している — 画面は `AppState`、ファイル一覧の読み込みは `LoadState`、インデックスは `IndexState`（`Idle` → `Building` → `Ready` / `Failed`）、オーバーレイは `BrowseOverlay`。真偽値フラグの追加は無い。
+
+テストは 94 本追加（言語別抽出のスナップショット、境界ケース、ユーザ操作を再現する
+シナリオテスト、描画スナップショット）。`cargo clippy --all-targets -- -D warnings` /
+`cargo test` / `cargo fmt --check` の 3 ゲートすべて通過している。
+
+## 5. 引き継ぎ
+
+次にやることは [roadmap/code-archaeology.md](roadmap/code-archaeology.md) の Phase C-1
+から。実装中の判断・踏んだ罠・実測値は [session-log.md](session-log.md) に残してある —
+同じ穴を掘り直さないために、tree-sitter の言語別の癖と octorus のコードベース側の
+落とし穴を具体的に列挙してある。

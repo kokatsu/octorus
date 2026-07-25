@@ -1037,6 +1037,18 @@ Press `Space /` in the PR list or file list to activate keyword filtering. Type 
 
 **Note**: Arrow keys (`↑/↓/←/→`) always work as alternatives to Vim-style keys and cannot be remapped.
 
+## Design Docs
+
+Working notes on the Repository Viewer direction live in [`docs/`](docs/):
+
+| Document | What it holds |
+|----------|---------------|
+| [docs/repository-viewer.md](docs/repository-viewer.md) | Why Viewer instead of Editor, the competitive research, and the three-pillar plan |
+| [docs/symbol-index.md](docs/symbol-index.md) | Technical reference for the tree-sitter tags symbol engine — language matrix, per-grammar quirks, how to add a language |
+| [docs/repo-browse-architecture.md](docs/repo-browse-architecture.md) | Architecture of the Repository Browser — state machine, background tasks, extension points |
+| [docs/roadmap/code-archaeology.md](docs/roadmap/code-archaeology.md) | Design for line → commit → PR → review-discussion navigation |
+| [docs/session-log.md](docs/session-log.md) | Decisions, dead ends, and measurements from building the browser |
+
 ## License
 
 MIT

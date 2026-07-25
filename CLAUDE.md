@@ -6,6 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Plz read README.md.
 
+Design notes for the Repository Viewer direction live in `docs/`. Read
+`docs/README.md` first — it indexes the competitive research, the symbol-engine
+reference (including per-grammar quirks you will otherwise rediscover the hard
+way), the browser architecture, and the roadmap.
+
 ## Build & Test Commands
 
 ```bash
