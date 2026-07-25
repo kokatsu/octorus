@@ -36,6 +36,7 @@ pub use types::{
 use types::MarkViewedResult;
 
 mod ai_rally;
+pub mod browse;
 mod cockpit;
 mod comments;
 mod diff_cache;
@@ -43,6 +44,7 @@ pub mod file_tree;
 mod filter;
 mod git_ops;
 mod input;
+mod input_browse;
 mod input_diff;
 mod input_text;
 mod issue_detail;
@@ -196,6 +198,8 @@ pub struct App {
     pub cockpit_state: Option<CockpitState>,
     /// Root return destination when launched from cockpit.
     pub home_state: Option<AppState>,
+    /// Repository Browser state (None = browser inactive).
+    pub browse_state: Option<browse::BrowseState>,
 }
 
 impl App {
@@ -273,6 +277,7 @@ impl App {
             shell_abort_handle: None,
             cockpit_state: None,
             home_state: None,
+            browse_state: None,
         }
     }
 
@@ -372,6 +377,7 @@ impl App {
             self.poll_update_check();
             self.poll_symbol_search_updates();
             self.poll_shell_result();
+            self.poll_browse_updates();
             if let SymbolSearchState::Ready(..) = &self.symbol_search {
                 if let Some(result) = self.symbol_search.take_ready() {
                     let full_path = std::path::Path::new(&result.repo_root).join(&result.file_path);

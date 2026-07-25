@@ -983,6 +983,53 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
         )),
         Line::from(""),
         Line::from(vec![Span::styled(
+            "Repo Browse",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(format!(
+            "{}  Open Repository Browser (from File List)",
+            fmt_key(&kb.repo_browse.display(), key_width)
+        )),
+        Line::from(vec![Span::styled(
+            "  Tree Focus:",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(format!(
+            "{}  Open file / expand directory",
+            fmt_key(&kb.open_panel.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Filter paths",
+            fmt_key(&kb.filter.display(), key_width)
+        )),
+        Line::from(vec![Span::styled(
+            "  File Focus:",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(format!(
+            "{}  File outline",
+            fmt_key(&kb.symbol_outline.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Repository symbol search",
+            fmt_key(&kb.symbol_search.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Go to definition (tree-sitter index)",
+            fmt_key(&kb.go_to_definition.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Open file in $EDITOR",
+            fmt_key(&kb.go_to_file.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Jump back",
+            fmt_key(&kb.jump_back.display(), key_width)
+        )),
+        Line::from(""),
+        Line::from(vec![Span::styled(
             "Git Ops View",
             Style::default()
                 .fg(Color::Yellow)

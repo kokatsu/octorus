@@ -11,7 +11,8 @@ High-performance code review in your terminal for GitHub PRs, issues, local diff
 
 ## Key Features
 - **Fast and smooth**: Handles 1,000,000+ diff lines and 6,000+ files
-- **Multifunctional**: PR review, issue view, local diff view, CI status, and Git operations are integrated into one system with search, filters, comments, suggestions, and more.
+- **Multifunctional**: Repository browsing, PR review, issue view, local diff view, CI status, and Git operations are integrated into one system with search, filters, comments, suggestions, and more.
+- **Code intelligence without an LSP**: tree-sitter symbol index powers file outlines, repository-wide symbol search, and Go to Definition — no language server to install, nothing to configure
 - **Automatic Review and Code Fix**: Automated review and fix workflows for Claude and Codex, while keeping the process under your control
 - **Customization**: Customize all settings, including keybindings, themes, and agent prompts
 
@@ -49,6 +50,9 @@ or --pr 123
 
 # 4. Preview local changes
 or --local
+
+# 5. Browse the repository (read any file, jump by symbol)
+or --browse
 ```
 
 ### Options
@@ -62,6 +66,7 @@ or --local
 | `--ai-rally` | Start AI Rally mode directly. Runs in headless mode when combined with `--pr <number>` or `--local` |
 | `--review-only[=BOOL]` | Force AI Rally proposal-iteration mode. Use with `--ai-rally`, for example `--review-only=true` |
 | `--git-ops` | Open Git Ops view directly on startup |
+| `--browse` | Open the Repository Browser directly on startup |
 | `--auto-focus` | Auto-focus changed file when local diff updates (local mode only) |
 | `--working-dir <DIR>` | Working directory for AI agents (default: current directory) |
 | `--accept-local-overrides` | Accept local `.octorus/` overrides for AI settings in headless mode |
@@ -96,9 +101,79 @@ octorus is an all-in-one review tool for the terminal UI. It shows GitHub PRs, i
 Running `or` with no flags opens the Cockpit — a dashboard that serves as the main entry point.
 
 - Live counts: issues mentioning you and PRs requesting your review
-- Navigation menu to PR List, Issue List, Local Diff, and Git Ops
+- Navigation menu to PR List, Issue List, Local Diff, Git Ops, and Repo Browse
 - Press `Enter` to navigate, `q` to quit, `?` for help, `r` to refresh counts
-- When no GitHub repo is detected, remote features (PR List, Issue List) are disabled; Local Diff and Git Ops remain available
+- When no GitHub repo is detected, remote features (PR List, Issue List) are disabled; Local Diff, Git Ops, and Repo Browse remain available
+
+### Repository Browser
+
+octorus is not only a review tool — `or --browse` (or `b` from the file list, or **Repo Browse** in the Cockpit) opens the whole repository read-only.
+
+- **Browse every file**, not just the ones a PR touched. The tree is built from `git ls-files --cached --others --exclude-standard`, so `.gitignore`, submodules, and sparse checkouts are honoured — and files an AI agent created seconds ago are visible before they are ever committed.
+- **Same highlighting as the diff view** — tree-sitter for 24 languages, your configured theme, injections for Vue/Svelte/Markdown. File content is rendered through the exact same cache the diff view uses, so there is no second rendering path to drift.
+- **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your `$EDITOR` at the cursor line when you actually want to change something.
+- **Binary and oversized files** render an explanatory notice instead of garbage.
+
+```bash
+or --browse
+```
+
+#### Symbol Intelligence
+
+When the browser opens, octorus builds a repository-wide symbol index in the background using tree-sitter `tags.scm` queries — the same queries GitHub uses for its own code navigation. There is **no language server to install and nothing to configure**; the grammars are compiled into the binary.
+
+The header shows `symbols: indexing` while it builds and `symbols: ready` when done. Every other part of the browser stays usable meanwhile — the index is an accelerator, never a prerequisite.
+
+| Feature | Key | Description |
+|---------|-----|-------------|
+| File outline | `o` | Symbols of the open file, nested, with the cursor's enclosing symbol pre-selected |
+| Symbol search | `s` | Fuzzy search across every symbol in the repository; `Enter` opens the file at the definition |
+| Go to definition | `gd` | Resolve the identifier under the cursor via the index — a CST match, not a grep for `fn <name>` |
+| Jump back | `Ctrl-o` | Return to the position before the last jump |
+
+Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Ruby, C, C++, Java, C#, Lua, PHP, Swift, Bash, Zig, Haskell, MoonBit, and Markdown (headings become the outline of a README).
+
+#### Repository Browser Keybindings
+
+**Tree Focus:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `Ctrl-d` / `Ctrl-u` | Page down / up |
+| `gg` / `G` | Jump to first / last row |
+| `Enter` / `l` / `→` | Open file, or expand/collapse directory |
+| `Space /` | Filter paths by keyword |
+| `s` | Repository symbol search |
+| `Z` | Toggle zen mode |
+| `?` | Toggle help |
+| `q` / `Esc` | Back to the previous screen |
+
+**File Focus:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
+| `Ctrl-d` / `Ctrl-u`, `PageDown` / `PageUp` | Page down / up |
+| `gg` / `G` | Jump to first / last line |
+| `o` | File outline |
+| `s` | Repository symbol search |
+| `gd` | Go to definition |
+| `gf` | Open file in `$EDITOR` at the cursor line |
+| `Ctrl-o` | Jump back |
+| `h` / `←` / `q` / `Esc` | Back to the tree |
+
+**Outline / Symbol search overlay:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move selection (outline only — in symbol search, letters type into the query) |
+| `↑` / `↓`, `Ctrl-p` / `Ctrl-n` | Move selection (symbol search) |
+| `Ctrl-u` | Clear the query |
+| `Enter` | Jump to the symbol |
+| `Esc` | Close |
 
 ### Pull Requests
 
@@ -583,6 +658,7 @@ PRs are loaded with infinite scroll — additional PRs are fetched automatically
 | `A` | Start AI Rally |
 | `S` | View CI checks status |
 | `G` | Open git ops view |
+| `b` | Open Repository Browser |
 | `I` | Open issue list |
 | `t` | Toggle file tree view |
 | `Space /` | Keyword filter |
@@ -929,6 +1005,10 @@ go_to_definition = ["g", "d"]
 | `go_to_file` | `gf` | Open file in $EDITOR |
 | `multiline_select` | `V` | Enter multiline selection mode |
 | `tree_toggle` | `t` | Toggle file tree view |
+| **Repository Browser** |||
+| `repo_browse` | `b` | Open the Repository Browser |
+| `symbol_outline` | `o` | File outline (browser only) |
+| `symbol_search` | `s` | Repository symbol search (browser only) |
 | `toggle_zen_mode` | `Z` | Toggle zen mode (fullscreen diff) |
 | **Git Ops** |||
 | `git_ops_stage` | `Space` | Stage/unstage file or directory |

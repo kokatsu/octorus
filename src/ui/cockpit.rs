@@ -209,7 +209,7 @@ mod tests {
         │    Issue List     Browse issues                                                                  │
         │    Local Diff     View local git diff                                                            │
         │    Git Ops        Git operations (stage, commit, push)                                           │
-        │                                                                                                  │
+        │    Repo Browse    Browse the repository and jump by symbol                                       │
         │                                                                                                  │
         │                                                                                                  │
         │                                                                                                  │
@@ -241,7 +241,7 @@ mod tests {
         │    Issue List     Browse issues                                                                  │
         │    Local Diff     View local git diff                                                            │
         │    Git Ops        Git operations (stage, commit, push)                                           │
-        │                                                                                                  │
+        │    Repo Browse    Browse the repository and jump by symbol                                       │
         │                                                                                                  │
         │                                                                                                  │
         │                                                                                                  │
@@ -273,7 +273,7 @@ mod tests {
         │    Issue List     Browse issues                                                                  │
         │    Local Diff     View local git diff                                                            │
         │    Git Ops        Git operations (stage, commit, push)                                           │
-        │                                                                                                  │
+        │    Repo Browse    Browse the repository and jump by symbol                                       │
         │                                                                                                  │
         │                                                                                                  │
         │                                                                                                  │
@@ -309,7 +309,7 @@ mod tests {
         │    Issue List     Browse issues                                                                  │
         │    Local Diff     View local git diff                                                            │
         │>   Git Ops        Git operations (stage, commit, push)                                           │
-        │                                                                                                  │
+        │    Repo Browse    Browse the repository and jump by symbol                                       │
         │                                                                                                  │
         │                                                                                                  │
         │                                                                                                  │

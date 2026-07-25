@@ -63,6 +63,10 @@ struct Args {
     #[arg(long, default_value = "false")]
     git_ops: bool,
 
+    /// Start in the Repository Browser directly
+    #[arg(long, default_value = "false")]
+    browse: bool,
+
     /// Auto-focus changed file when local diff updates (for local mode)
     #[arg(long, default_value = "false")]
     auto_focus: bool,
@@ -326,8 +330,12 @@ async fn main() -> Result<()> {
         };
     }
 
-    let is_no_args =
-        args.pr.is_none() && !args.local && args.issue.is_none() && !args.git_ops && !args.ai_rally;
+    let is_no_args = args.pr.is_none()
+        && !args.local
+        && args.issue.is_none()
+        && !args.git_ops
+        && !args.browse
+        && !args.ai_rally;
 
     let (repo, repo_available) = match args.repo.clone() {
         Some(r) => (r, true),
@@ -441,6 +449,9 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
     }
     if args.git_ops {
         app.open_git_ops();
+    }
+    if args.browse {
+        app.open_repo_browse();
     }
 
     let cancel_token = CancellationToken::new();
@@ -564,6 +575,9 @@ async fn run_with_pr(repo: &str, pr: u32, config: &config::Config, args: &Args) 
     if args.git_ops {
         app.open_git_ops();
     }
+    if args.browse {
+        app.open_repo_browse();
+    }
 
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
@@ -636,6 +650,9 @@ async fn run_with_pr_list(
     }
     if args.git_ops {
         app.open_git_ops();
+    }
+    if args.browse {
+        app.open_repo_browse();
     }
 
     match issue_arg {
@@ -947,6 +964,7 @@ mod tests {
               --local                      Show local git diff against current HEAD (no GitHub PR fetch)
           -i, --issue [<ISSUE>]            Issue number. Shows issue detail directly if provided, issue list if flag only
               --git-ops                    Start in Git Ops view directly
+              --browse                     Start in the Repository Browser directly
               --auto-focus                 Auto-focus changed file when local diff updates (for local mode)
               --working-dir <WORKING_DIR>  Working directory for AI agents (default: current directory)
               --accept-local-overrides     Accept local .octorus/ overrides for AI settings in headless mode. Without this flag, headless AI Rally will refuse to run if the local config overrides security-sensitive AI keys or local prompt files are detected in .octorus/prompts/

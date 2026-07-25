@@ -169,6 +169,10 @@ pub enum AppState {
     GitOpsSplitTree,
     GitOpsSplitDiff,
     Cockpit,
+    /// Repository Browser, file tree pane focused.
+    RepoBrowseTree,
+    /// Repository Browser, file content pane focused.
+    RepoBrowseFile,
 }
 
 impl AppState {
@@ -187,7 +191,14 @@ impl AppState {
                 | Self::GitOpsSplitTree
                 | Self::GitOpsSplitDiff
                 | Self::Cockpit
+                | Self::RepoBrowseTree
+                | Self::RepoBrowseFile
         )
+    }
+
+    /// Whether this is a Repository Browser screen.
+    pub fn is_repo_browse(self) -> bool {
+        matches!(self, Self::RepoBrowseTree | Self::RepoBrowseFile)
     }
 
     /// Whether this is an Issue-related screen.
@@ -369,10 +380,17 @@ pub enum CockpitMenuItem {
     IssueList,
     LocalDiff,
     GitOps,
+    RepoBrowse,
 }
 
 impl CockpitMenuItem {
-    pub const ALL: [Self; 4] = [Self::PrList, Self::IssueList, Self::LocalDiff, Self::GitOps];
+    pub const ALL: [Self; 5] = [
+        Self::PrList,
+        Self::IssueList,
+        Self::LocalDiff,
+        Self::GitOps,
+        Self::RepoBrowse,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -396,6 +414,7 @@ impl CockpitMenuItem {
             Self::IssueList => "Issue List",
             Self::LocalDiff => "Local Diff",
             Self::GitOps => "Git Ops",
+            Self::RepoBrowse => "Repo Browse",
         }
     }
 
@@ -405,6 +424,7 @@ impl CockpitMenuItem {
             Self::IssueList => "Browse issues",
             Self::LocalDiff => "View local git diff",
             Self::GitOps => "Git operations (stage, commit, push)",
+            Self::RepoBrowse => "Browse the repository and jump by symbol",
         }
     }
 
@@ -1225,11 +1245,16 @@ mod tests {
             CockpitMenuItem::LocalDiff
         );
         assert_eq!(CockpitMenuItem::LocalDiff.next(), CockpitMenuItem::GitOps);
-        assert_eq!(CockpitMenuItem::GitOps.next(), CockpitMenuItem::GitOps);
+        assert_eq!(CockpitMenuItem::GitOps.next(), CockpitMenuItem::RepoBrowse);
+        assert_eq!(
+            CockpitMenuItem::RepoBrowse.next(),
+            CockpitMenuItem::RepoBrowse
+        );
     }
 
     #[test]
     fn cockpit_menu_item_prev_clamps_at_first() {
+        assert_eq!(CockpitMenuItem::RepoBrowse.prev(), CockpitMenuItem::GitOps);
         assert_eq!(CockpitMenuItem::GitOps.prev(), CockpitMenuItem::LocalDiff);
         assert_eq!(
             CockpitMenuItem::LocalDiff.prev(),
@@ -1243,7 +1268,11 @@ mod tests {
     fn cockpit_menu_item_from_index_clamps_overflow() {
         assert_eq!(CockpitMenuItem::from_index(0), CockpitMenuItem::PrList);
         assert_eq!(CockpitMenuItem::from_index(3), CockpitMenuItem::GitOps);
-        assert_eq!(CockpitMenuItem::from_index(100), CockpitMenuItem::GitOps);
+        assert_eq!(CockpitMenuItem::from_index(4), CockpitMenuItem::RepoBrowse);
+        assert_eq!(
+            CockpitMenuItem::from_index(100),
+            CockpitMenuItem::RepoBrowse
+        );
     }
 
     #[test]
@@ -1252,6 +1281,7 @@ mod tests {
         assert!(CockpitMenuItem::IssueList.requires_repo());
         assert!(!CockpitMenuItem::LocalDiff.requires_repo());
         assert!(!CockpitMenuItem::GitOps.requires_repo());
+        assert!(!CockpitMenuItem::RepoBrowse.requires_repo());
     }
 
     #[test]

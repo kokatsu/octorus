@@ -98,6 +98,10 @@ harness = false
 name = "symbol_search"
 harness = false
 
+[[bench]]
+name = "symbol_index"
+harness = false
+
 [profile.release]
 strip = true
 lto = "thin"

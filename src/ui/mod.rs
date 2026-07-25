@@ -1,4 +1,5 @@
 mod ai_rally;
+mod browse;
 mod checks_list;
 mod cockpit;
 mod comment_list;
@@ -110,6 +111,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         AppState::IssueCommentList => issue_comment_list::render(frame, app),
         AppState::GitOpsSplitTree | AppState::GitOpsSplitDiff => git_ops::render(frame, app),
         AppState::Cockpit => cockpit::render(frame, app),
+        AppState::RepoBrowseTree | AppState::RepoBrowseFile => browse::render(frame, app),
     }
 
     // GitOps シミュレーションモーダル

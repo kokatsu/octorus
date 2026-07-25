@@ -161,6 +161,10 @@ impl App {
                         self.handle_git_ops_diff_input(key);
                     }
                     AppState::Cockpit => self.handle_cockpit_input(key)?,
+                    AppState::RepoBrowseTree => self.handle_repo_browse_tree_input(key)?,
+                    AppState::RepoBrowseFile => {
+                        self.handle_repo_browse_file_input(key, terminal)?
+                    }
                 }
             }
         }
@@ -285,6 +289,11 @@ impl App {
 
         if self.matches_single_key(&key, &kb.git_ops) {
             self.open_git_ops();
+            return Ok(());
+        }
+
+        if self.matches_single_key(&key, &kb.repo_browse) {
+            self.open_repo_browse();
             return Ok(());
         }
 

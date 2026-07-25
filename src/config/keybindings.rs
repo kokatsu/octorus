@@ -70,6 +70,10 @@ pub struct KeybindingsConfig {
     pub tree_toggle: KeySequence,
     pub shell_command: KeySequence,
 
+    pub repo_browse: KeySequence,
+    pub symbol_outline: KeySequence,
+    pub symbol_search: KeySequence,
+
     pub filter_open: KeySequence,
     pub filter_closed: KeySequence,
     pub filter_all: KeySequence,
@@ -146,6 +150,10 @@ impl Default for KeybindingsConfig {
             mark_viewed_dir: KeySequence::single(KeyBinding::char('V')),
             tree_toggle: KeySequence::single(KeyBinding::char('t')),
             shell_command: KeySequence::single(KeyBinding::char('!')),
+
+            repo_browse: KeySequence::single(KeyBinding::char('b')),
+            symbol_outline: KeySequence::single(KeyBinding::char('o')),
+            symbol_search: KeySequence::single(KeyBinding::char('s')),
 
             filter_open: KeySequence::single(KeyBinding::char('o')),
             filter_closed: KeySequence::single(KeyBinding::char('c')),
@@ -224,6 +232,9 @@ impl KeybindingsConfig {
             ("mark_viewed", &self.mark_viewed),
             ("mark_viewed_dir", &self.mark_viewed_dir),
             ("tree_toggle", &self.tree_toggle),
+            ("repo_browse", &self.repo_browse),
+            ("symbol_outline", &self.symbol_outline),
+            ("symbol_search", &self.symbol_search),
             ("shell_command", &self.shell_command),
             ("filter_open", &self.filter_open),
             ("filter_closed", &self.filter_closed),
@@ -323,6 +334,10 @@ fn is_context_compatible(name1: &str, name2: &str) -> bool {
         "retry",
         "confirm_yes",
         "confirm_no",
+        // Repository Browser keys are only live on the browse screen.
+        "repo_browse",
+        "symbol_outline",
+        "symbol_search",
     ];
 
     let context_groups: &[&[&str]] = &[
@@ -430,6 +445,9 @@ impl Serialize for KeybindingsConfig {
         map.serialize_entry("mark_viewed", &seq_to_value(&self.mark_viewed))?;
         map.serialize_entry("mark_viewed_dir", &seq_to_value(&self.mark_viewed_dir))?;
         map.serialize_entry("tree_toggle", &seq_to_value(&self.tree_toggle))?;
+        map.serialize_entry("repo_browse", &seq_to_value(&self.repo_browse))?;
+        map.serialize_entry("symbol_outline", &seq_to_value(&self.symbol_outline))?;
+        map.serialize_entry("symbol_search", &seq_to_value(&self.symbol_search))?;
         map.serialize_entry("shell_command", &seq_to_value(&self.shell_command))?;
         map.serialize_entry("filter_open", &seq_to_value(&self.filter_open))?;
         map.serialize_entry("filter_closed", &seq_to_value(&self.filter_closed))?;
