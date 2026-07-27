@@ -1,3 +1,4 @@
+mod blame;
 mod client;
 pub mod comment;
 mod commit;
@@ -44,6 +45,10 @@ macro_rules! define_state_filter {
 mod issue;
 mod pr;
 
+pub use blame::{
+    blame_argv, blame_file, parse_porcelain, BlameError, BlameFile, BlameRef, MAX_BLAME_LINES,
+    MAX_BLAME_STDOUT_BYTES, UNCOMMITTED_SHA,
+};
 pub use client::{detect_repo, gh_command, DetectRepoError};
 pub use comment::{create_multiline_review_comment, create_reply_comment, create_review_comment};
 pub use commit::{

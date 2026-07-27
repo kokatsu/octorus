@@ -102,6 +102,10 @@ harness = false
 name = "symbol_index"
 harness = false
 
+[[bench]]
+name = "blame_parse"
+harness = false
+
 [profile.release]
 strip = true
 lto = "thin"
