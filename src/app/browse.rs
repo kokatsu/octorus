@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::diff_store::{DiffScrollState, ScrollMode};
 use crate::filter::ListFilter;
 use crate::github::{blame_file, BlameError, BlameFile, BlameRef};
 use crate::symbols::{CancelSignal, IndexBuild, Symbol, SymbolIndex, SymbolRef};
@@ -42,6 +43,25 @@ pub const MAX_VIEWABLE_FILE_LINES: usize = 100_000;
 
 /// Individual lines above 10,000 bytes are not cached, catching minified bundles.
 pub const MAX_VIEWABLE_LINE_BYTES: usize = 10_000;
+
+/// Admission limit for commit-diff caching and syntax highlighting.
+///
+/// This is not an output-read limit: `git` and `gh` stdout is read completely
+/// before this check. Oversized fetched text is dropped instead of being
+/// cached, highlighted, or retained by the browser state.
+pub const MAX_VIEWABLE_COMMIT_DIFF_BYTES: usize = 32 * 1024 * 1024;
+
+fn admit_commit_diff_for_cache(diff_text: String) -> Result<String, String> {
+    if diff_text.len() > MAX_VIEWABLE_COMMIT_DIFF_BYTES {
+        Err(format!(
+            "commit diff is {}, over the {} browser cache/highlight limit",
+            human_bytes(diff_text.len() as u64),
+            human_bytes(MAX_VIEWABLE_COMMIT_DIFF_BYTES as u64),
+        ))
+    } else {
+        Ok(diff_text)
+    }
+}
 
 /// Maximum rows shown in the symbol search overlay.
 pub const MAX_SYMBOL_SEARCH_RESULTS: usize = 200;
@@ -249,6 +269,62 @@ impl App {
             }
         }
 
+        if let Some(rx) = state.commit_diff_receiver.as_mut() {
+            match rx.try_recv() {
+                Ok(delivery) => {
+                    let matches_request = matches!(
+                        state.commit_diff,
+                        BrowseCommitDiffState::Loading {
+                            request_id,
+                            ref annotation,
+                            ..
+                        } if request_id == delivery.request_id
+                            && annotation.sha() == delivery.sha
+                    );
+                    if matches_request {
+                        state.commit_diff_receiver = None;
+                        let annotation = match &state.commit_diff {
+                            BrowseCommitDiffState::Loading { annotation, .. } => {
+                                Arc::clone(annotation)
+                            }
+                            _ => unreachable!("matching request must still be loading"),
+                        };
+                        state.commit_diff = match delivery.result {
+                            Ok(cache) => {
+                                let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+                                scroll.set_line_count(cache.lines.len());
+                                BrowseCommitDiffState::Ready {
+                                    annotation,
+                                    cache,
+                                    scroll,
+                                }
+                            }
+                            Err(message) => BrowseCommitDiffState::Failed {
+                                annotation,
+                                message,
+                            },
+                        };
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    state.commit_diff_receiver = None;
+                    let failed = match &state.commit_diff {
+                        BrowseCommitDiffState::Loading {
+                            annotation, cancel, ..
+                        } if !cancel.is_cancelled() => Some(Arc::clone(annotation)),
+                        _ => None,
+                    };
+                    if let Some(annotation) = failed {
+                        state.commit_diff = BrowseCommitDiffState::Failed {
+                            annotation,
+                            message: "commit diff task ended".to_string(),
+                        };
+                    }
+                }
+            }
+        }
+
         if let Some(rx) = state.highlight_receiver.as_mut() {
             match rx.try_recv() {
                 Ok((path, cache)) => {
@@ -343,6 +419,8 @@ impl App {
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
+        state.cancel_commit_diff_request();
+        state.commit_diff = BrowseCommitDiffState::Off;
 
         let pending_same_path = match state.open_load {
             OpenLoad::Pending {
@@ -491,6 +569,143 @@ impl App {
         });
     }
 
+    pub(crate) fn open_browse_blame_commit(&mut self) {
+        let toggle_blame = self.config.keybindings.toggle_blame.display();
+        let annotation = {
+            let Some(state) = self.browse_state.as_mut() else {
+                return;
+            };
+            if state.open_is_pending() {
+                state.status = Some("Still opening this file".to_string());
+                return;
+            }
+            let Some(open) = state.open.as_ref() else {
+                state.status = Some("No file is open".to_string());
+                return;
+            };
+
+            let gutter = match &state.blame {
+                BlameState::Waiting { .. } | BlameState::Loading { .. } => {
+                    state.status = Some("Blame is still loading".to_string());
+                    return;
+                }
+                BlameState::Ready { path, gutter } if path == &open.path => gutter,
+                BlameState::Off => {
+                    state.status = Some(format!("Blame is off — press {toggle_blame} to enable"));
+                    return;
+                }
+                BlameState::Failed => {
+                    state.status = Some("Blame failed for this file".to_string());
+                    return;
+                }
+                BlameState::Ready { .. } => {
+                    state.status = Some("Blame belongs to another file".to_string());
+                    return;
+                }
+            };
+            let Some(annotation) = gutter.annotation_at(state.cursor_line) else {
+                state.status = Some("Blame is unavailable for this line".to_string());
+                return;
+            };
+            if annotation.is_uncommitted() {
+                state.status = Some("Uncommitted line has no commit to open".to_string());
+                return;
+            }
+            Arc::clone(annotation)
+        };
+
+        self.browse_push_jump();
+        self.start_browse_commit_diff(annotation);
+    }
+
+    fn start_browse_commit_diff(&mut self, annotation: Arc<BlameAnnotation>) {
+        let use_local = self.local_mode || self.pr_number.is_none();
+        let working_dir = self.working_dir.clone();
+        let repo = self.repo.clone();
+        let theme = self.config.diff.theme.clone();
+        let tab_width = self.config.diff.tab_width;
+
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        state.cancel_commit_diff_request();
+        state.commit_diff_generation = state.commit_diff_generation.wrapping_add(1);
+        let request_id = state.commit_diff_generation;
+        let cancel = state.cancel_token.child_token();
+        state.commit_diff = BrowseCommitDiffState::Loading {
+            request_id,
+            annotation: Arc::clone(&annotation),
+            cancel: cancel.clone(),
+        };
+        state.status = None;
+
+        let (tx, rx) = mpsc::channel(1);
+        state.commit_diff_receiver = Some(rx);
+        let sha = annotation.sha().to_string();
+        tokio::spawn(async move {
+            let fetch = async {
+                if use_local {
+                    crate::github::fetch_local_commit_diff(working_dir.as_deref(), &sha).await
+                } else {
+                    crate::github::fetch_commit_diff(&repo, &sha).await
+                }
+            };
+            let fetched = tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = fetch => result.map_err(|error| error.to_string()),
+            };
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            let result = match fetched.and_then(admit_commit_diff_for_cache) {
+                Ok(diff_text) => {
+                    let build_cancel = cancel.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        if build_cancel.is_cancelled() {
+                            return None;
+                        }
+                        let mut parser_pool = ParserPool::new();
+                        let cache = crate::ui::diff_view::build_commit_diff_cache(
+                            &diff_text,
+                            &theme,
+                            &mut parser_pool,
+                            tab_width,
+                        );
+                        (!build_cancel.is_cancelled()).then_some(cache)
+                    })
+                    .await
+                    {
+                        Ok(Some(cache)) => Ok(cache),
+                        Ok(None) => return,
+                        Err(error) => Err(format!("commit diff cache task failed: {error}")),
+                    }
+                }
+                Err(message) => Err(message),
+            };
+
+            let delivery = CommitDiffLoadResult {
+                request_id,
+                sha,
+                result,
+            };
+            deliver_commit_diff_load(delivery, &cancel, &tx);
+        });
+    }
+
+    pub(crate) fn browse_commit_diff_is_active(&self) -> bool {
+        self.browse_state
+            .as_ref()
+            .is_some_and(|state| state.commit_diff.is_active())
+    }
+
+    pub(crate) fn return_from_browse_commit_diff(&mut self) -> bool {
+        if !self.browse_commit_diff_is_active() {
+            return false;
+        }
+        self.browse_jump_back()
+    }
+
     /// Upgrade the open file's immediate plain cache on a background thread.
     fn start_browse_highlight(&mut self) {
         let tab_width = self.config.diff.tab_width;
@@ -594,6 +809,8 @@ impl App {
         let Some(state) = self.browse_state.as_mut() else {
             return false;
         };
+        state.cancel_commit_diff_request();
+        state.commit_diff = BrowseCommitDiffState::Off;
         let Some(entry) = state.jump_stack.pop() else {
             return false;
         };
@@ -662,6 +879,32 @@ pub(crate) enum BlameState {
     Failed,
 }
 
+#[derive(Default)]
+pub(crate) enum BrowseCommitDiffState {
+    #[default]
+    Off,
+    Loading {
+        request_id: u64,
+        annotation: Arc<BlameAnnotation>,
+        cancel: CancellationToken,
+    },
+    Ready {
+        annotation: Arc<BlameAnnotation>,
+        cache: DiffCache,
+        scroll: DiffScrollState,
+    },
+    Failed {
+        annotation: Arc<BlameAnnotation>,
+        message: String,
+    },
+}
+
+impl BrowseCommitDiffState {
+    pub(crate) fn is_active(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BlameGutter {
     rows: Vec<BlameGutterRow>,
@@ -684,15 +927,40 @@ pub(crate) enum BlameCoverage {
 #[derive(Debug)]
 enum BlameGutterRow {
     Annotation(Arc<BlameAnnotation>),
-    Blank,
+    Blank(Arc<BlameAnnotation>),
     Missing,
 }
 
 #[derive(Debug)]
-struct BlameAnnotation {
+pub(crate) struct BlameAnnotation {
+    sha: Arc<str>,
+    author_name: Arc<str>,
+    summary: Arc<str>,
     full: Arc<str>,
     author: Arc<str>,
     identity: Arc<str>,
+}
+
+impl BlameAnnotation {
+    pub(crate) fn sha(&self) -> &str {
+        &self.sha
+    }
+
+    pub(crate) fn short_sha(&self) -> &str {
+        crate::github::short_sha(&self.sha)
+    }
+
+    pub(crate) fn author_name(&self) -> &str {
+        &self.author_name
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn is_uncommitted(&self) -> bool {
+        !self.sha.is_empty() && self.sha.bytes().all(|byte| byte == b'0')
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -739,16 +1007,15 @@ impl BlameGutter {
                 previous_sha = None;
                 continue;
             };
-            if previous_sha == Some(reference.sha) {
-                rows.push(BlameGutterRow::Blank);
-                continue;
-            }
-
             let annotation = annotations
                 .entry(reference.sha)
                 .or_insert_with(|| Arc::new(prepare_blame_annotation(reference)))
                 .clone();
-            rows.push(BlameGutterRow::Annotation(annotation));
+            if previous_sha == Some(reference.sha) {
+                rows.push(BlameGutterRow::Blank(annotation));
+            } else {
+                rows.push(BlameGutterRow::Annotation(annotation));
+            }
             previous_sha = Some(reference.sha);
         }
 
@@ -780,9 +1047,9 @@ impl BlameGutter {
             (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Identity) => {
                 &annotation.identity
             }
-            (Some(BlameGutterRow::Blank), BlameGutterWidth::Full) => BLAME_FULL_BLANK,
-            (Some(BlameGutterRow::Blank), BlameGutterWidth::Author) => BLAME_AUTHOR_BLANK,
-            (Some(BlameGutterRow::Blank), BlameGutterWidth::Identity) => BLAME_IDENTITY_BLANK,
+            (Some(BlameGutterRow::Blank(_)), BlameGutterWidth::Full) => BLAME_FULL_BLANK,
+            (Some(BlameGutterRow::Blank(_)), BlameGutterWidth::Author) => BLAME_AUTHOR_BLANK,
+            (Some(BlameGutterRow::Blank(_)), BlameGutterWidth::Identity) => BLAME_IDENTITY_BLANK,
             (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Full) => BLAME_FULL_MISSING,
             (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Author) => {
                 BLAME_AUTHOR_MISSING
@@ -792,11 +1059,23 @@ impl BlameGutter {
             }
         }
     }
+
+    pub(crate) fn annotation_at(&self, line: usize) -> Option<&Arc<BlameAnnotation>> {
+        match self.rows.get(line)? {
+            BlameGutterRow::Annotation(annotation) | BlameGutterRow::Blank(annotation) => {
+                Some(annotation)
+            }
+            BlameGutterRow::Missing => None,
+        }
+    }
 }
 
 fn prepare_blame_annotation(reference: BlameRef<'_>) -> BlameAnnotation {
     if reference.is_uncommitted() {
         return BlameAnnotation {
+            sha: Arc::from(reference.sha),
+            author_name: Arc::from(reference.author),
+            summary: Arc::from(reference.summary),
             full: Arc::from(pad_blame_text("Uncommitted".to_string(), BLAME_FULL_WIDTH)),
             author: Arc::from(pad_blame_text(
                 "Uncommitted".to_string(),
@@ -817,6 +1096,9 @@ fn prepare_blame_annotation(reference: BlameRef<'_>) -> BlameAnnotation {
     let author = truncate_with_width(reference.author, author_width);
 
     BlameAnnotation {
+        sha: Arc::from(reference.sha),
+        author_name: Arc::from(reference.author),
+        summary: Arc::from(reference.summary),
         full: Arc::from(pad_blame_text(
             format!("{sha} {full_author} {time}"),
             BLAME_FULL_WIDTH,
@@ -919,6 +1201,12 @@ pub(crate) struct BlameLoadResult {
     result: Result<BlameFile, BlameError>,
 }
 
+pub(crate) struct CommitDiffLoadResult {
+    request_id: u64,
+    sha: String,
+    result: Result<DiffCache, String>,
+}
+
 /// Outcome of one background file load.
 #[derive(Debug)]
 pub(crate) enum FileLoad {
@@ -969,6 +1257,16 @@ fn deliver_blame_load(
 ) {
     if !cancel.is_cancelled() {
         let _ = tx.blocking_send(BlameLoadResult { path, result });
+    }
+}
+
+fn deliver_commit_diff_load(
+    delivery: CommitDiffLoadResult,
+    cancel: &dyn CancelSignal,
+    tx: &mpsc::Sender<CommitDiffLoadResult>,
+) {
+    if !cancel.is_cancelled() {
+        let _ = tx.try_send(delivery);
     }
 }
 
@@ -1037,6 +1335,8 @@ pub struct BrowseState {
     pub open: Option<OpenFile>,
     pub open_load: OpenLoad,
     pub(crate) blame: BlameState,
+    pub(crate) commit_diff: BrowseCommitDiffState,
+    commit_diff_generation: u64,
     /// 0-based cursor line within the open file.
     pub cursor_line: usize,
     pub scroll_offset: usize,
@@ -1058,6 +1358,7 @@ pub struct BrowseState {
     pub(crate) index_receiver: Option<mpsc::Receiver<IndexDelivery>>,
     pub(crate) file_receiver: Option<mpsc::Receiver<FileLoadResult>>,
     pub(crate) blame_receiver: Option<mpsc::Receiver<BlameLoadResult>>,
+    pub(crate) commit_diff_receiver: Option<mpsc::Receiver<CommitDiffLoadResult>>,
     pub(crate) highlight_receiver: Option<mpsc::Receiver<(String, DiffCache)>>,
 }
 
@@ -1083,6 +1384,8 @@ impl BrowseState {
             open: None,
             open_load: OpenLoad::Idle,
             blame: BlameState::Off,
+            commit_diff: BrowseCommitDiffState::Off,
+            commit_diff_generation: 0,
             cursor_line: 0,
             scroll_offset: 0,
             index: IndexState::Idle,
@@ -1095,6 +1398,7 @@ impl BrowseState {
             index_receiver: None,
             file_receiver: None,
             blame_receiver: None,
+            commit_diff_receiver: None,
             highlight_receiver: None,
         }
     }
@@ -1104,6 +1408,13 @@ impl BrowseState {
             cancel.cancel();
         }
         self.blame_receiver = None;
+    }
+
+    fn cancel_commit_diff_request(&mut self) {
+        if let BrowseCommitDiffState::Loading { ref cancel, .. } = self.commit_diff {
+            cancel.cancel();
+        }
+        self.commit_diff_receiver = None;
     }
 
     /// Install a freshly listed set of tracked paths and rebuild the tree.
@@ -2141,6 +2452,42 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_blame_gutter_keeps_full_identity_for_continuation_rows_without_repeating_text() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 2\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary shared commit\n\
+             \tone\n\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n\
+             \ttwo\n";
+
+        let gutter = BlameGutter::from_file(parse_porcelain(PORCELAIN), 2);
+        let first = gutter.annotation_at(0).expect("first line identity");
+        let continuation = gutter.annotation_at(1).expect("continuation identity");
+
+        assert!(Arc::ptr_eq(first, continuation));
+        assert_eq!(first.sha(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(continuation.author_name(), "Alice");
+        assert_eq!(continuation.summary(), "shared commit");
+        assert_eq!(
+            gutter.text(1, BlameGutterWidth::Identity),
+            BLAME_IDENTITY_BLANK
+        );
+    }
+
+    #[test]
+    fn test_blame_annotation_short_sha_truncates_on_a_character_boundary() {
+        let annotation = prepare_blame_annotation(BlameRef {
+            sha: "日本語のテキストです",
+            author: "Alice",
+            summary: "multibyte identifier",
+            author_time: 1_700_000_000,
+        });
+
+        assert_eq!(annotation.short_sha(), "日本語のテキス");
+    }
+
     // ===== file loading =====
 
     #[test]
@@ -2455,6 +2802,89 @@ mod tests {
             rx.try_recv().is_err(),
             "a superseded blame fetch must not reach the UI channel"
         );
+    }
+
+    #[test]
+    fn test_cancelled_commit_diff_result_is_not_delivered() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        deliver_commit_diff_load(
+            CommitDiffLoadResult {
+                request_id: 1,
+                sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                result: Ok(crate::ui::diff_view::build_plain_diff_cache("", 4)),
+            },
+            &cancel,
+            &tx,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a superseded commit diff must not reach the UI channel"
+        );
+    }
+
+    #[test]
+    fn test_commit_diff_limit_is_cache_highlight_admission_after_fetch() {
+        let fetched = "x".repeat(MAX_VIEWABLE_COMMIT_DIFF_BYTES + 1);
+        assert_eq!(fetched.len(), MAX_VIEWABLE_COMMIT_DIFF_BYTES + 1);
+
+        let error = admit_commit_diff_for_cache(fetched).unwrap_err();
+
+        insta::assert_snapshot!(error, @"commit diff is 32.0 MiB, over the 32.0 MiB browser cache/highlight limit");
+    }
+
+    #[tokio::test]
+    async fn test_commit_diff_poll_rejects_an_old_generation_even_for_the_same_sha() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let gutter = BlameGutter::from_file(parse_porcelain(PORCELAIN), 1);
+        let annotation = Arc::clone(gutter.annotation_at(0).unwrap());
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(PathBuf::from("/repo"), AppState::FileList);
+        state.commit_diff = BrowseCommitDiffState::Loading {
+            request_id: 2,
+            annotation,
+            cancel: state.cancel_token.child_token(),
+        };
+        let (tx, rx) = mpsc::channel(2);
+        state.commit_diff_receiver = Some(rx);
+        app.browse_state = Some(state);
+
+        for request_id in [1, 2] {
+            tx.send(CommitDiffLoadResult {
+                request_id,
+                sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                result: Ok(crate::ui::diff_view::build_plain_diff_cache(
+                    &format!("+request {request_id}\n"),
+                    4,
+                )),
+            })
+            .await
+            .unwrap();
+        }
+
+        app.poll_browse_updates();
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.commit_diff,
+            BrowseCommitDiffState::Loading { request_id: 2, .. }
+        ));
+        assert!(state.commit_diff_receiver.is_some());
+
+        app.poll_browse_updates();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().commit_diff,
+            BrowseCommitDiffState::Ready { ref cache, .. }
+                if cache.lines.iter().any(|line| {
+                    line.spans.iter().any(|span| cache.resolve(span.content).contains("request 2"))
+                })
+        ));
     }
 
     #[tokio::test]

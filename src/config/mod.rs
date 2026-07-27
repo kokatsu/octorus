@@ -56,6 +56,7 @@ pub struct Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keybinding::{KeyBinding, KeySequence};
     use insta::assert_json_snapshot;
     use std::fs;
 
@@ -81,8 +82,106 @@ mod tests {
         // This fails the moment toggle_blame is put back into SCREEN_SPECIFIC_KEYS.
         let errors = config.keybindings.validate().unwrap_err();
         assert!(errors.iter().any(|error| {
-            error.contains("conflicts with sequence prefix") && error.contains("(g)")
+            error.contains("conflicts with sequence prefix")
+                && error.contains("toggle_blame")
+                && error.contains("(g)")
         }));
+    }
+
+    #[test]
+    fn test_a_single_g_binding_reports_every_default_sequence_prefix_owner() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            comment = "g"
+            "#,
+        )
+        .unwrap();
+
+        let errors = config.keybindings.validate().unwrap_err();
+        let prefix_conflicts: Vec<&str> = errors
+            .iter()
+            .filter(|error| {
+                error.contains("conflicts with sequence prefix") && error.contains("(g)")
+            })
+            .map(String::as_str)
+            .collect();
+
+        assert!(
+            prefix_conflicts
+                .iter()
+                .any(|error| error.contains("toggle_blame")),
+            "toggle_blame must remain a reported owner: {prefix_conflicts:?}"
+        );
+        assert!(
+            prefix_conflicts
+                .iter()
+                .any(|error| error.contains("open_blame_commit")),
+            "open_blame_commit must remain a reported owner: {prefix_conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn test_open_blame_commit_keeps_the_g_prefix_in_global_conflict_detection() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            comment = "g"
+            toggle_blame = ["z", "b"]
+            "#,
+        )
+        .unwrap();
+
+        let errors = config.keybindings.validate().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("conflicts with sequence prefix")
+                && error.contains("open_blame_commit")
+                && error.contains("(g)")
+        }));
+    }
+
+    #[test]
+    fn test_exact_sequence_conflicts_compare_the_third_owner_with_the_second() {
+        let shared = KeySequence::double(KeyBinding::char('x'), KeyBinding::char('y'));
+        let config = KeybindingsConfig {
+            move_right: shared.clone(),
+            toggle_local_mode: shared.clone(),
+            toggle_blame: shared,
+            ..KeybindingsConfig::default()
+        };
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("duplicate key sequence")
+                    && error.contains("toggle_blame")
+                    && error.contains("toggle_local_mode")
+            }),
+            "the incompatible second/third pair must be named: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_single_key_duplicate_emits_exactly_one_error() {
+        let config = KeybindingsConfig {
+            comment: KeySequence::single(KeyBinding::char('x')),
+            suggestion: KeySequence::single(KeyBinding::char('x')),
+            ..KeybindingsConfig::default()
+        };
+
+        let errors = config.validate().unwrap_err();
+        let matching: Vec<&str> = errors
+            .iter()
+            .filter(|error| error.contains("comment") && error.contains("suggestion"))
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            matching.len(),
+            1,
+            "one single-key conflict must produce one error: {matching:?}"
+        );
+        assert!(matching[0].contains("duplicate keybinding"));
     }
 
     #[test]
@@ -1033,6 +1132,45 @@ timeout_secs = 3600
         assert_eq!(custom.keybindings.toggle_blame.display(), "zb");
     }
 
+    #[test]
+    fn test_open_blame_commit_keybinding_default_custom_and_serialize_roundtrip() {
+        let config = KeybindingsConfig::default();
+        assert_eq!(config.open_blame_commit.display(), "gc");
+        assert!(config.validate().is_ok());
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("open_blame_commit"));
+        let parsed: KeybindingsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.open_blame_commit.display(), "gc");
+
+        let custom: Config = toml::from_str(
+            r#"
+            [keybindings]
+            open_blame_commit = "x"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(custom.keybindings.open_blame_commit.display(), "x");
+    }
+
+    #[test]
+    fn test_open_blame_commit_rejects_an_exact_browser_sequence_collision() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            open_blame_commit = ["g", "b"]
+            "#,
+        )
+        .unwrap();
+
+        let errors = config.keybindings.validate().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("duplicate key sequence")
+                && error.contains("open_blame_commit")
+                && error.contains("toggle_blame")
+        }));
+    }
+
     /// KeybindingsConfig の全フィールドが serialize に含まれることを検証。
     /// 新しいフィールドを追加した際に serialize_entry の追加を忘れるとここで落ちる。
     #[test]
@@ -1090,6 +1228,7 @@ timeout_secs = 3600
             "mark_viewed_dir",
             "tree_toggle",
             "toggle_blame",
+            "open_blame_commit",
         ];
 
         for field in &expected_fields {

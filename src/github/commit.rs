@@ -169,7 +169,7 @@ pub async fn fetch_local_commits(
     let skip = offset as usize;
     let max_count = (limit as usize).min(total.saturating_sub(skip));
 
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = git_command(working_dir);
     cmd.args([
         "log",
         "--format=%H%x00%s%x00%an%x00%aI",
@@ -177,23 +177,17 @@ pub async fn fetch_local_commits(
         &format!("--max-count={}", max_count),
         &range,
     ]);
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
     let output = cmd.output().await.context("Failed to run git log")?;
 
     if !output.status.success() {
         // range が無効の場合は HEAD のみでフォールバック
-        let mut cmd2 = tokio::process::Command::new("git");
+        let mut cmd2 = git_command(working_dir);
         cmd2.args([
             "log",
             "--format=%H%x00%s%x00%an%x00%aI",
             &format!("--skip={}", skip),
             &format!("--max-count={}", max_count),
         ]);
-        if let Some(dir) = working_dir {
-            cmd2.current_dir(dir);
-        }
         let output2 = cmd2
             .output()
             .await
@@ -210,13 +204,30 @@ pub async fn fetch_local_commits(
     Ok(CommitListPage { items, has_more })
 }
 
-/// range 内のコミット総数を取得（SHA カウントのみ、高速）
-async fn count_commits(working_dir: Option<&str>, range: &str) -> Result<usize> {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["rev-list", "--count", range]);
+/// Build a child process for a local repository query.
+///
+/// `kill_on_drop` is set here rather than at each call site so cancellation
+/// actually stops the work: dropping the fetch future must take the child with
+/// it, otherwise a cancelled fetch only discards the result while the process
+/// keeps running to completion.
+fn spawnable_command(program: &str, working_dir: Option<&str>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.kill_on_drop(true);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
+    cmd
+}
+
+/// Every local `git` invocation in this module goes through here.
+fn git_command(working_dir: Option<&str>) -> tokio::process::Command {
+    spawnable_command("git", working_dir)
+}
+
+/// range 内のコミット総数を取得（SHA カウントのみ、高速）
+async fn count_commits(working_dir: Option<&str>, range: &str) -> Result<usize> {
+    let mut cmd = git_command(working_dir);
+    cmd.args(["rev-list", "--count", range]);
     let output = cmd.output().await.context("Failed to count commits")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -229,11 +240,8 @@ async fn count_commits(working_dir: Option<&str>, range: &str) -> Result<usize> 
 /// デフォルトブランチ（origin/main or origin/master）を検出
 async fn detect_default_branch(working_dir: Option<&str>) -> Option<String> {
     for candidate in &["origin/main", "origin/master"] {
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = git_command(working_dir);
         cmd.args(["rev-parse", "--verify", candidate]);
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
         if let Ok(output) = cmd.output().await {
             if output.status.success() {
                 return Some(candidate.to_string());
@@ -278,11 +286,14 @@ fn parse_git_log_page(stdout: &[u8], offset: u32, limit: u32) -> Result<CommitLi
 
 /// ローカル git show でコミットの unified diff を取得
 pub async fn fetch_local_commit_diff(working_dir: Option<&str>, sha: &str) -> Result<String> {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["show", "--format=", "--patch", sha]);
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
+    let mut cmd = git_command(working_dir);
+    cmd.args([
+        "show",
+        "--format=",
+        "--patch",
+        "--diff-merges=first-parent",
+        sha,
+    ]);
     let output = cmd.output().await.context("Failed to run git show")?;
 
     if !output.status.success() {
@@ -403,6 +414,44 @@ mod tests {
             date: String::new(),
         };
         assert_eq!(commit.short_sha(), "abc1234");
+    }
+
+    /// Dropping a fetch must take the child process with it.
+    ///
+    /// Exercises the builder every local `git` fetch in this module is
+    /// constructed by, with a stand-in program so the test needs no `git` and
+    /// changes no process-wide state. Mutating `PATH` here would make every
+    /// concurrently running test that shells out to `git` resolve this test's
+    /// stand-in instead of the real binary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_dropped_fetch_kills_the_child_it_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let completed = dir.path().join("completed");
+        let script = format!(
+            ": > {started}; sleep 1; : > {completed}",
+            started = started.display(),
+            completed = completed.display(),
+        );
+
+        let mut command = spawnable_command("/bin/sh", None);
+        command.args(["-c", &script]);
+        let fetch = command.output();
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        drop(fetch);
+        tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+
+        // Without this the test would pass vacuously by never starting a child.
+        assert!(
+            started.exists(),
+            "the stand-in child must have been spawned before the drop"
+        );
+        assert!(
+            !completed.exists(),
+            "a dropped fetch must not leave its child running to completion"
+        );
     }
 
     /// 50件のコミットデータを生成し、ページ境界が重複しないことを検証

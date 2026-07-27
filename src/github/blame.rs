@@ -8,8 +8,15 @@ pub const UNCOMMITTED_SHA: &str = "0000000000000000000000000000000000000000";
 pub const MAX_BLAME_STDOUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_BLAME_LINES: usize = 8_000_000;
 
-/// Characters kept by [`BlameRef::short_sha`].
+/// Characters kept by [`short_sha`].
 const SHORT_SHA_CHARS: usize = 7;
+
+pub(crate) fn short_sha(value: &str) -> &str {
+    match value.char_indices().nth(SHORT_SHA_CHARS) {
+        Some((end, _)) => &value[..end],
+        None => value,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span(u32, u32);
@@ -97,10 +104,7 @@ impl BlameRef<'_> {
     /// caller can construct one holding a non-hex string; byte slicing would
     /// panic on it.
     pub fn short_sha(&self) -> &str {
-        match self.sha.char_indices().nth(SHORT_SHA_CHARS) {
-            Some((end, _)) => &self.sha[..end],
-            None => self.sha,
-        }
+        short_sha(self.sha)
     }
 }
 

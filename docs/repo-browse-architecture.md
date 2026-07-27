@@ -27,7 +27,7 @@ wc -l src/app/browse.rs src/symbols.rs src/ui/browse.rs src/app/input_browse.rs
 - `src/app/mod.rs` — `browse` / `input_browse` のモジュール宣言、`browse_state: Option<BrowseState>` フィールド、`poll_browse_updates()` を polling ループへ
 - `src/app/input.rs` — dispatch 2 アーム、file list に `b` の分岐
 - `src/ui/mod.rs` — モジュール宣言と dispatch 1 行
-- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `toggle_blame`
+- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `toggle_blame` / `open_blame_commit`
 - `src/main.rs` — `--browse` フラグ
 - `src/ui/help.rs` — ヘルプ項目
 - `src/app/cockpit.rs` / `src/ui/cockpit.rs` — ブラウザを開く Cockpit メニュー項目
@@ -89,6 +89,11 @@ blame:     BlameState
            Off → Waiting { path } → Loading { path, cancel }
                → Ready { path, gutter } | Failed
 
+commit:    BrowseCommitDiffState
+           Off → Loading { request_id, annotation, cancel }
+               → Ready { annotation, cache, scroll }
+               | Failed { annotation, message }
+
 overlay:   BrowseOverlay
            None | Outline { selected } | SymbolSearch { query, selected }
 
@@ -125,6 +130,17 @@ placeholder なので、それを見て「シンボルがない」「定義が�
 `Waiting` は blame 表示中に別ファイルを開き、そのファイルが viewable か判明するまでの
 状態である。失敗理由は `IndexState::Failed` と同様にバリアントへ持たせず、フッタ用の
 `BrowseState::status` へ入れる。
+
+`BrowseCommitDiffState` は新しい画面ではなく、ファイル内容ペインが現在何を表示するかを表す
+ブラウザ内 mode である。`AppState` は `RepoBrowseFile` のままなので tree、open file、
+cursor、blame を退避せず、`Off` へ戻すだけで元の行を再描画できる。
+
+Git Ops の `AppState::GitOpsSplitDiff` は commit diff 専用画面ではない。Git Ops split
+view の右ペイン focus であり、左の tree が選択されていれば working tree diff を表示する。
+commit diff を表示する場合も `CommitLogState.commits[selected]` と `pending_diff_sha` が
+前提で、paginated list の選択に従う。blame 由来の任意 SHA はその list に存在する保証が
+ないため、C-2 はこの state model を再利用せず、fetch 関数と
+`build_commit_diff_cache()` だけを再利用する。
 
 ## 3. データフロー
 
@@ -212,6 +228,30 @@ blame 表示中に別ファイルを開くと、古い取得を cancel して `W
 完了後に `OpenFile::viewable` を検査してから取得を始めるため、バイナリ・上限超過ファイルへ
 `git blame` を起動しない。取得結果と現在の open path が違う場合も poll 側で捨てる。
 
+blame 行から commit diff を開くとき:
+
+```
+open_browse_blame_commit() (`gc`)
+   │
+   ├─ cursor 行の共有 BlameAnnotation から full SHA を取得
+   ├─ browse_push_jump() で path / line / scroll を保存
+   ├─ BrowseCommitDiffState::Loading { request_id, annotation, cancel }
+   └─ tokio task: fetch_local_commit_diff / fetch_commit_diff
+          └─ spawn_blocking: build_commit_diff_cache()
+                    │ commit_diff_receiver
+                    ▼
+            poll_browse_updates()
+               ├─ request_id または SHA 不一致 → receiver を残して stale result を捨てる
+               ├─ Err → Failed { annotation, message }
+               └─ Ok  → Ready { annotation, cache, scroll }
+```
+
+取得元の選択は Git Ops と同じで、local mode または PR 未選択なら local git、それ以外は
+GitHub commit diff API を使う。fetch と cache build はどちらも draw loop の外で行う。
+32 MiB を超える diff は cache を構築せず `Failed` にし、error と戻り方を内容ペインと
+footer の両方へ出す。cancel は外部 process の完走そのものを保証しないが、request 固有の
+token、receiver 交換、request id の3段で古い結果の install を防ぐ。
+
 `build_plain_diff_cache()` は `expand_tabs` → `classify_line` → 文字列 interning の 1 パス
 だけで、`ParserPool` を受け取らない。ハイライトを待たずにファイルを表示できるのはこのため
 で、`build_diff_cache()` による差し替えは後追いで届く。
@@ -249,8 +289,8 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 同じ手が既に `build_pr_description_patch()` で使われていたので、それに倣った形。
 
 `paths_receiver` / `index_receiver` / `file_receiver` / `highlight_receiver` /
-`blame_receiver` はすべて `poll_browse_updates()` で `try_recv()` する。描画ループを
-ブロックしない。
+`blame_receiver` / `commit_diff_receiver` はすべて `poll_browse_updates()` で
+`try_recv()` する。描画ループをブロックしない。
 
 ## 4. キー処理の階層
 
@@ -258,10 +298,11 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 
 ```
 1. オーバーレイ（Outline / SymbolSearch）  ← モーダル。開いていれば全部ここで消費
-2. フィルタ入力バー（ツリーのみ）           ← 開いていれば文字入力を全部消費
-3. 両ペイン共通（s / ? / Z / Ctrl-o）
-4. シーケンス（ツリー: Space / と gg ／ ファイル: gb, gd, gf, gg）
-5. 単一キー
+2. commit diff mode（file のみ）             ← source 用 action を遮断
+3. フィルタ入力バー（ツリーのみ）           ← 開いていれば文字入力を全部消費
+4. 両ペイン共通（s / ? / Z / Ctrl-o）
+5. シーケンス（ツリー: Space / と gg ／ ファイル: gb, gc, gd, gf, gg）
+6. 単一キー
 ```
 
 **シーケンス層が必要な理由**: `filter` の既定値は `Space /` という 2 キーシーケンス
@@ -274,8 +315,8 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 
 ## 5. キーバインド登録の注意
 
-`KeybindingsConfig::validate()` は単一キーの重複を検出するが、loader は stderr へ
-`Warning:` を出して起動を続ける。
+`KeybindingsConfig::validate()` は単一キーと sequence の完全重複、および単一キーと
+sequence prefix の衝突を検出するが、loader は stderr へ `Warning:` を出して起動を続ける。
 新しい既定キーは既存と衝突しやすい:
 
 - `b` … `rally_background` と衝突
@@ -296,6 +337,8 @@ blame gutter は file pane の既存シーケンス層へ `toggle_blame = ["g", 
 `validate()` はシーケンスの先頭キーだけを `sequence_prefixes` に入れるため、
 `toggle_blame` を `SCREEN_SPECIFIC_KEYS` に登録してはいけない。登録すると `g` prefix
 全体との単一キー衝突が context compatible として抑制される。
+`open_blame_commit = ["g", "c"]` も同じ理由で登録しない。validator は完全に同じ sequence
+同士も検出するため、`gb` など既存 action と同じ設定は拒否される。
 
 ## 6. 描画
 
@@ -319,6 +362,9 @@ blame gutter は file pane の既存シーケンス層へ `toggle_blame = ["g", 
   `Exact` でないときはフッタに `blame covers N lines, this file shows M — reopen the file to
   refresh` を出す（`status` より下の優先度）。**黙って切り詰めない**のが要点で、
   切り詰めると「履歴のないファイル」と「表示がずれているファイル」が同じ見た目になる
+- `BrowseCommitDiffState` が `Off` 以外なら内容ペインだけを commit diff に置き換える。
+  loading / empty / error は明示的な本文を持ち、ready は cached line の viewport 周辺だけを
+  borrow して描画する。`j/k`、page、`gg/G` は commit diff の `DiffScrollState` だけを動かす
 - 擬似 patch 由来の `LineType::Header` 行（`@@ ... @@`）は描画前に除外する。
   `content_window()` はヘッダが前置プレフィックスであることを使って連続スライスを
   借りるだけなので、走査量はビューポート幅で決まる。**ファイルの N 行目はキャッシュの

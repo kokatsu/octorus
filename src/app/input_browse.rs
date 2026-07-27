@@ -12,7 +12,7 @@ use std::io::Stdout;
 use crate::filter::ListFilter;
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
-use super::browse::{BrowseOverlay, IndexState};
+use super::browse::{BrowseCommitDiffState, BrowseOverlay, IndexState};
 use super::{App, AppState};
 
 /// Rows moved by a page key when the real viewport height is unknown.
@@ -98,14 +98,22 @@ impl App {
         if self.handle_browse_overlay_input(key) {
             return Ok(());
         }
+        if self.browse_commit_diff_is_active() {
+            self.handle_browse_commit_diff_input(&key);
+            return Ok(());
+        }
+
+        let kb = self.config.keybindings.clone();
+        if self.matches_single_key(&key, &kb.open_blame_commit) {
+            self.open_browse_blame_commit();
+            return Ok(());
+        }
         if self.handle_browse_shared_input(&key) {
             return Ok(());
         }
         if self.handle_browse_sequence_input(&key, terminal)? {
             return Ok(());
         }
-
-        let kb = self.config.keybindings.clone();
 
         if self.matches_single_key(&key, &kb.symbol_outline) {
             self.open_browse_outline();
@@ -240,6 +248,11 @@ impl App {
                 self.toggle_browse_blame();
                 return Ok(true);
             }
+            if self.try_match_sequence(&kb.open_blame_commit) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                self.open_browse_blame_commit();
+                return Ok(true);
+            }
             if self.try_match_sequence(&kb.go_to_definition) == SequenceMatch::Full {
                 self.clear_pending_keys();
                 self.browse_run_go_to_definition();
@@ -263,6 +276,7 @@ impl App {
         }
 
         let starts_sequence = self.key_could_match_sequence(key, &kb.toggle_blame)
+            || self.key_could_match_sequence(key, &kb.open_blame_commit)
             || self.key_could_match_sequence(key, &kb.go_to_definition)
             || self.key_could_match_sequence(key, &kb.go_to_file)
             || self.key_could_match_sequence(key, &kb.jump_to_first);
@@ -272,6 +286,101 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    fn handle_browse_commit_diff_input(&mut self, key: &event::KeyEvent) {
+        let kb = self.config.keybindings.clone();
+
+        if self.matches_single_key(key, &kb.open_blame_commit)
+            || self.matches_single_key(key, &kb.jump_back)
+            || self.matches_single_key(key, &kb.quit)
+            || self.matches_single_key(key, &kb.move_left)
+        {
+            self.clear_pending_keys();
+            if !self.return_from_browse_commit_diff() {
+                self.set_browse_status("No position to jump back to");
+            }
+            return;
+        }
+        if self.matches_single_key(key, &kb.help) {
+            self.clear_pending_keys();
+            self.previous_state = self.state;
+            self.state = AppState::Help;
+            return;
+        }
+        if self.matches_single_key(key, &kb.toggle_zen_mode) {
+            self.clear_pending_keys();
+            self.toggle_zen_mode();
+            return;
+        }
+        if self.handle_browse_commit_diff_sequence_input(key) {
+            return;
+        }
+
+        let page_down =
+            self.matches_single_key(key, &kb.page_down) || key.code == KeyCode::PageDown;
+        let page_up = self.matches_single_key(key, &kb.page_up) || key.code == KeyCode::PageUp;
+        let move_down = self.matches_single_key(key, &kb.move_down);
+        let move_up = self.matches_single_key(key, &kb.move_up);
+        let jump_last = self.matches_single_key(key, &kb.jump_to_last);
+
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let BrowseCommitDiffState::Ready { scroll, .. } = &mut state.commit_diff else {
+            return;
+        };
+        if move_down {
+            scroll.move_down();
+        } else if move_up {
+            scroll.move_up();
+        } else if page_down {
+            scroll.page_down(PAGE_STEP);
+        } else if page_up {
+            scroll.page_up(PAGE_STEP);
+        } else if jump_last {
+            scroll.jump_to_last();
+        }
+    }
+
+    fn handle_browse_commit_diff_sequence_input(&mut self, key: &event::KeyEvent) -> bool {
+        self.check_sequence_timeout();
+
+        let kb = self.config.keybindings.clone();
+        let Some(binding) = event_to_keybinding(key) else {
+            return false;
+        };
+
+        if !self.pending_keys.is_empty() {
+            self.push_pending_key(binding);
+            if self.try_match_sequence(&kb.open_blame_commit) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                if !self.return_from_browse_commit_diff() {
+                    self.set_browse_status("No position to jump back to");
+                }
+                return true;
+            }
+            if self.try_match_sequence(&kb.jump_to_first) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                if let Some(state) = self.browse_state.as_mut() {
+                    if let BrowseCommitDiffState::Ready { scroll, .. } = &mut state.commit_diff {
+                        scroll.jump_to_first();
+                    }
+                }
+                return true;
+            }
+
+            self.clear_pending_keys();
+            return false;
+        }
+
+        let starts_sequence = self.key_could_match_sequence(key, &kb.open_blame_commit)
+            || self.key_could_match_sequence(key, &kb.jump_to_first);
+        if starts_sequence {
+            self.push_pending_key(binding);
+            return true;
+        }
+        false
     }
 
     /// Jump to the definition under the cursor, reporting why when it cannot.
@@ -566,9 +675,15 @@ impl super::browse::BrowseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::browse::{build_file_patch, BlameState, BrowseState, OpenFile, OpenLoad};
+    use crate::app::browse::{
+        build_file_patch, BlameGutter, BlameState, BrowseState, OpenFile, OpenLoad,
+    };
+    use crate::diff_store::{DiffScrollState, ScrollMode};
+    use crate::github::parse_porcelain;
+    use crate::keybinding::{KeyBinding, KeySequence};
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+    use ratatui::backend::TestBackend;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -613,6 +728,41 @@ mod tests {
             notice: None,
         });
         state.sync_tree_to_open_file();
+    }
+
+    fn attach_blame(app: &mut App, path: &str, porcelain: &str) {
+        let state = app.browse_state.as_mut().expect("browse state");
+        let buffer_lines = state.open.as_ref().map_or(0, OpenFile::line_count);
+        state.blame = BlameState::Ready {
+            path: path.to_string(),
+            gutter: BlameGutter::from_file(parse_porcelain(porcelain), buffer_lines),
+        };
+    }
+
+    fn press_open_blame_commit(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('c')), terminal)
+            .unwrap();
+    }
+
+    fn render_browser(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn attach_index(app: &mut App, files: Vec<FileSymbols>) {
@@ -687,6 +837,20 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("blame load never settled");
+    }
+
+    async fn settle_commit_diff(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if matches!(
+                app.browse_state.as_ref().map(|state| &state.commit_diff),
+                Some(BrowseCommitDiffState::Ready { .. } | BrowseCommitDiffState::Failed { .. })
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("commit diff load never settled");
     }
 
     // ===== scenario: navigate the tree and leave =====
@@ -794,6 +958,529 @@ mod tests {
         let state = app.browse_state.as_ref().unwrap();
         assert!(matches!(state.blame, BlameState::Off));
         assert!(state.blame_receiver.is_none());
+    }
+
+    #[test]
+    fn test_scenario_open_blame_commit_explains_every_unavailable_cursor_state() {
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        const UNCOMMITTED: &str = "0000000000000000000000000000000000000000 1 1 1\n\
+             author Not Committed Yet\n\
+             author-time 0\n\
+             summary working tree\n\
+             \tone\n";
+
+        let mut terminal = test_terminal();
+        let mut messages = Vec::new();
+
+        let mut no_file = browsing_app(&["a.rs"]);
+        no_file.state = AppState::RepoBrowseFile;
+        press_open_blame_commit(&mut no_file, &mut terminal);
+        assert_eq!(
+            no_file.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("No file is open")
+        );
+        messages.push(
+            no_file
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut opening = browsing_app(&["a.rs"]);
+        attach_open_file(&mut opening, "a.rs", "one\n", Vec::new());
+        opening.state = AppState::RepoBrowseFile;
+        opening.browse_state.as_mut().unwrap().open_load = OpenLoad::Pending {
+            path: "a.rs".to_string(),
+            line: 0,
+            scroll: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        press_open_blame_commit(&mut opening, &mut terminal);
+        assert_eq!(
+            opening.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Still opening this file")
+        );
+        messages.push(
+            opening
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut blame_off = browsing_app(&["a.rs"]);
+        attach_open_file(&mut blame_off, "a.rs", "one\n", Vec::new());
+        blame_off.state = AppState::RepoBrowseFile;
+        press_open_blame_commit(&mut blame_off, &mut terminal);
+        assert_eq!(
+            blame_off.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Blame is off — press gb to enable")
+        );
+        messages.push(
+            blame_off
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut blame_loading = browsing_app(&["a.rs"]);
+        attach_open_file(&mut blame_loading, "a.rs", "one\n", Vec::new());
+        blame_loading.state = AppState::RepoBrowseFile;
+        let state = blame_loading.browse_state.as_mut().unwrap();
+        state.blame = BlameState::Loading {
+            path: "a.rs".to_string(),
+            cancel: state.cancel_token.child_token(),
+        };
+        press_open_blame_commit(&mut blame_loading, &mut terminal);
+        assert_eq!(
+            blame_loading
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Blame is still loading")
+        );
+        messages.push(
+            blame_loading
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut blame_failed = browsing_app(&["a.rs"]);
+        attach_open_file(&mut blame_failed, "a.rs", "one\n", Vec::new());
+        blame_failed.state = AppState::RepoBrowseFile;
+        blame_failed.browse_state.as_mut().unwrap().blame = BlameState::Failed;
+        press_open_blame_commit(&mut blame_failed, &mut terminal);
+        assert_eq!(
+            blame_failed
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Blame failed for this file")
+        );
+        messages.push(
+            blame_failed
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut wrong_path = browsing_app(&["a.rs", "b.rs"]);
+        attach_open_file(&mut wrong_path, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut wrong_path, "b.rs", COMMITTED);
+        wrong_path.state = AppState::RepoBrowseFile;
+        press_open_blame_commit(&mut wrong_path, &mut terminal);
+        assert_eq!(
+            wrong_path.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Blame belongs to another file")
+        );
+        messages.push(
+            wrong_path
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut missing_line = browsing_app(&["a.rs"]);
+        attach_open_file(&mut missing_line, "a.rs", "one\ntwo\n", Vec::new());
+        attach_blame(&mut missing_line, "a.rs", COMMITTED);
+        missing_line.state = AppState::RepoBrowseFile;
+        missing_line.browse_state.as_mut().unwrap().cursor_line = 1;
+        press_open_blame_commit(&mut missing_line, &mut terminal);
+        assert_eq!(
+            missing_line
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Blame is unavailable for this line")
+        );
+        messages.push(
+            missing_line
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let mut uncommitted = browsing_app(&["a.rs"]);
+        attach_open_file(&mut uncommitted, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut uncommitted, "a.rs", UNCOMMITTED);
+        uncommitted.state = AppState::RepoBrowseFile;
+        press_open_blame_commit(&mut uncommitted, &mut terminal);
+        assert_eq!(
+            uncommitted.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Uncommitted line has no commit to open")
+        );
+        messages.push(
+            uncommitted
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+                .unwrap(),
+        );
+
+        let unique: std::collections::HashSet<&str> = messages.iter().map(String::as_str).collect();
+        assert_eq!(unique.len(), messages.len(), "{messages:?}");
+    }
+
+    #[test]
+    fn test_scenario_custom_single_key_opens_the_blame_commit_action() {
+        let mut app = browsing_app(&["a.rs"]);
+        attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        app.config.keybindings.open_blame_commit = KeySequence::single(KeyBinding::char('x'));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('x')), &mut test_terminal())
+            .unwrap();
+
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Blame is off — press gb to enable")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scenario_pressing_open_blame_commit_twice_cancels_and_returns_without_respawn() {
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let mut app = browsing_app(&["a.rs"]);
+        attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut app, "a.rs", COMMITTED);
+        app.set_local_mode(true);
+        app.state = AppState::RepoBrowseFile;
+        let mut terminal = test_terminal();
+
+        press_open_blame_commit(&mut app, &mut terminal);
+        let first_cancel = match &app.browse_state.as_ref().unwrap().commit_diff {
+            BrowseCommitDiffState::Loading { cancel, .. } => cancel.clone(),
+            _ => panic!("first key did not start the commit diff"),
+        };
+
+        press_open_blame_commit(&mut app, &mut terminal);
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(first_cancel.is_cancelled());
+        assert!(matches!(state.commit_diff, BrowseCommitDiffState::Off));
+        assert!(state.commit_diff_receiver.is_none());
+        assert!(state.jump_stack.is_empty());
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+    }
+
+    #[test]
+    fn test_scenario_leaving_commit_diff_clears_a_half_typed_source_sequence() {
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let mut app = browsing_app(&["a.rs"]);
+        attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut app, "a.rs", COMMITTED);
+        app.state = AppState::RepoBrowseFile;
+        app.browse_push_jump();
+
+        let annotation = match &app.browse_state.as_ref().unwrap().blame {
+            BlameState::Ready { gutter, .. } => Arc::clone(gutter.annotation_at(0).unwrap()),
+            _ => panic!("blame fixture must be ready"),
+        };
+        let cache = crate::ui::diff_view::build_plain_diff_cache("+changed\n", 4);
+        let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+        scroll.set_line_count(cache.lines.len());
+        app.browse_state.as_mut().unwrap().commit_diff = BrowseCommitDiffState::Ready {
+            annotation,
+            cache,
+            scroll,
+        };
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('q')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('b')), &mut terminal)
+            .unwrap();
+
+        assert!(app.pending_keys.is_empty());
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().commit_diff,
+            BrowseCommitDiffState::Off
+        ));
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Ready { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scenario_open_continuation_blame_commit_scroll_then_return_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Scenario Author",
+                    "-c",
+                    "user.email=scenario@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init"]);
+        std::fs::write(dir.path().join("main.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-m", "baseline"]);
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let mut app =
+            browsing_app_on_disk(dir.path(), &[("main.rs", "fn one() {}\nfn two() {}\n")]);
+        app.set_working_dir(Some(dir.path().to_string_lossy().into_owned()));
+        app.set_local_mode(true);
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('b')), &mut terminal)
+            .unwrap();
+        settle_blame(&mut app).await;
+
+        {
+            let state = app.browse_state.as_mut().unwrap();
+            state.cursor_line = 1;
+            state.scroll_offset = 1;
+        }
+        press_open_blame_commit(&mut app, &mut terminal);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().commit_diff,
+            BrowseCommitDiffState::Loading {
+                ref annotation, ..
+            } if annotation.sha() == head
+        ));
+
+        settle_commit_diff(&mut app).await;
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.commit_diff,
+            BrowseCommitDiffState::Ready {
+                ref annotation,
+                ref cache,
+                ..
+            } if annotation.sha() == head && !cache.lines.is_empty()
+        ));
+        assert!(matches!(state.blame, BlameState::Ready { .. }));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut terminal)
+            .unwrap();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().commit_diff,
+            BrowseCommitDiffState::Ready { ref scroll, .. } if scroll.selected_line == 1
+        ));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('q')), &mut terminal)
+            .unwrap();
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.commit_diff, BrowseCommitDiffState::Off));
+        assert_eq!(state.cursor_line, 1);
+        assert_eq!(state.scroll_offset, 1);
+        assert!(matches!(state.blame, BlameState::Ready { .. }));
+        assert!(state.jump_stack.is_empty());
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+    }
+
+    #[tokio::test]
+    async fn test_scenario_merge_blame_commit_renders_a_first_parent_diff_in_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Scenario Author",
+                    "-c",
+                    "user.email=scenario@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+
+        git(&["init"]);
+        std::fs::write(dir.path().join("main.rs"), "base\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-m", "baseline"]);
+
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.path().join("feature.rs"), "feature\n").unwrap();
+        git(&["add", "feature.rs"]);
+        git(&["commit", "-m", "feature"]);
+
+        git(&["checkout", "main"]);
+        std::fs::write(dir.path().join("main-only.rs"), "main\n").unwrap();
+        git(&["add", "main-only.rs"]);
+        git(&["commit", "-m", "main"]);
+
+        git(&["merge", "--no-ff", "-m", "merge feature", "feature"]);
+        let merge_sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let mut app = browsing_app_on_disk(dir.path(), &[("main.rs", "base\n")]);
+        app.set_working_dir(Some(dir.path().to_string_lossy().into_owned()));
+        app.set_local_mode(true);
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('b')), &mut terminal)
+            .unwrap();
+        settle_blame(&mut app).await;
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Ready { .. }
+        ));
+        let merge_porcelain = format!(
+            "{merge_sha} 1 1 1\n\
+             author Scenario Author\n\
+             author-time 1700000000\n\
+             summary merge feature\n\
+             \tbase\n"
+        );
+        attach_blame(&mut app, "main.rs", &merge_porcelain);
+
+        press_open_blame_commit(&mut app, &mut terminal);
+        settle_commit_diff(&mut app).await;
+
+        let rendered = render_browser(&mut app, 120, 14);
+        assert!(
+            rendered.contains("+feature"),
+            "merge commit diff must be visible in the browser:\n{rendered}"
+        );
+        assert!(!rendered.contains("This commit has no diff."));
+    }
+
+    #[tokio::test]
+    async fn test_scenario_missing_blame_commit_surfaces_git_error_and_still_returns() {
+        const MISSING_SHA: &str = "ffffffffffffffffffffffffffffffffffffffff";
+        const PORCELAIN: &str = "ffffffffffffffffffffffffffffffffffffffff 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary vanished commit\n\
+             \tone\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init"])
+            .current_dir(dir.path())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::env::var_os("CI").is_none() =>
+            {
+                return;
+            }
+            Ok(output) => panic!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => panic!("git init failed: {error}"),
+        }
+
+        let mut app = browsing_app_on_disk(dir.path(), &[("main.rs", "one\n")]);
+        attach_open_file(&mut app, "main.rs", "one\n", Vec::new());
+        attach_blame(&mut app, "main.rs", PORCELAIN);
+        app.set_working_dir(Some(dir.path().to_string_lossy().into_owned()));
+        app.set_local_mode(true);
+        app.state = AppState::RepoBrowseFile;
+
+        let mut terminal = test_terminal();
+        press_open_blame_commit(&mut app, &mut terminal);
+        settle_commit_diff(&mut app).await;
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.commit_diff,
+            BrowseCommitDiffState::Failed {
+                ref annotation,
+                ref message,
+            } if annotation.sha() == MISSING_SHA && message.contains("git show failed")
+        ));
+        assert_eq!(state.jump_stack.len(), 1);
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('q')), &mut terminal)
+            .unwrap();
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.commit_diff, BrowseCommitDiffState::Off));
+        assert!(matches!(state.blame, BlameState::Ready { .. }));
+        assert!(state.jump_stack.is_empty());
     }
 
     #[test]
@@ -1117,8 +1804,13 @@ mod tests {
             .len();
         assert_eq!(drawn, crate::app::browse::MAX_SYMBOL_SEARCH_RESULTS);
 
+        // One terminal for the whole run. `test_terminal()` opens a real handle
+        // on stdout, and stdout is a pipe under `cargo test`; building one per
+        // keypress meant hundreds alive at once and intermittently failed with
+        // `WouldBlock`. The keypresses are what this test is about.
+        let mut terminal = test_terminal();
         for _ in 0..drawn + 20 {
-            app.handle_repo_browse_file_input(press(KeyCode::Down), &mut test_terminal())
+            app.handle_repo_browse_file_input(press(KeyCode::Down), &mut terminal)
                 .unwrap();
         }
 

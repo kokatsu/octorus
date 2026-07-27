@@ -1021,6 +1021,10 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             fmt_key(&kb.toggle_blame.display(), key_width)
         )),
         Line::from(format!(
+            "{}  Open commit diff for the blamed line",
+            fmt_key(&kb.open_blame_commit.display(), key_width)
+        )),
+        Line::from(format!(
             "{}  Go to definition (tree-sitter index)",
             fmt_key(&kb.go_to_definition.display(), key_width)
         )),
@@ -1503,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_help_lines_lists_blame_toggle_binding() {
+    fn test_build_help_lines_lists_both_blame_bindings() {
         let lines = build_help_lines(&KeybindingsConfig::default());
         let joined = lines
             .iter()
@@ -1513,6 +1517,8 @@ mod tests {
 
         assert!(joined.contains("gb"));
         assert!(joined.contains("Toggle blame gutter"));
+        assert!(joined.contains("gc"));
+        assert!(joined.contains("Open commit diff for the blamed line"));
     }
 
     #[test]

@@ -45,6 +45,7 @@ macro_rules! define_state_filter {
 mod issue;
 mod pr;
 
+pub(crate) use blame::short_sha;
 pub use blame::{
     blame_argv, blame_file, parse_porcelain, BlameError, BlameFile, BlameRef, MAX_BLAME_LINES,
     MAX_BLAME_STDOUT_BYTES, UNCOMMITTED_SHA,

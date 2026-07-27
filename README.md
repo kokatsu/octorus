@@ -112,6 +112,7 @@ octorus is not only a review tool — `or --browse` (or `b` from the file list, 
 - **Browse every file**, not just the ones a PR touched. The tree comes from `git ls-files -z --cached --others --exclude-standard`: ignored files stay out, a submodule is the single entry Git reports rather than its whole working tree, and a file an AI agent wrote thirty seconds ago is there before it is ever committed. The NUL-delimited form keeps paths containing spaces or newlines intact; a path whose bytes are not valid UTF-8 is left out and counted in the status line, since a lossily decoded name would no longer open the file Git named.
 - **Same highlighting as the diff view** — tree-sitter for 24 languages, your configured theme, injections for Vue/Svelte/Markdown. File content is rendered through the exact same cache the diff view uses, so there is no second rendering path to drift.
 - **Loading never blocks the UI.** Listing the repository, reading a file, and highlighting it are all background work: the pane shows `Loading…` until the content arrives, and selecting another file cancels the read still in flight. Highlighting is a second pass over the file that is already on screen, so a large file is readable before it is coloured.
+- **Blame links back to history.** Toggle the blame gutter with `gb`, place the cursor on a blamed line, and press `gc` to show that commit's diff in the browser content pane. The full commit SHA comes from the cursor line even when a repeated gutter row is visually blank. `q`, `Esc`, `h`, or `Ctrl-o` returns to the exact source line with blame still enabled. Uncommitted lines and unavailable/loading blame explain why no diff can be opened in the footer.
 - **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your editor (`editor` config → `$VISUAL` → `$EDITOR` → `vi`) at the cursor line when you actually want to change something.
 - **Files it will not render say why.** Over 8 MiB, over 100,000 lines, or a single line over 10,000 bytes each get a notice quoting the file's own figure against the limit that stopped it; binary content says `Binary file — no text preview.` — no wall of garbage either way. An empty file says `Empty file.`, and a path Git listed that is not on disk — a sparse checkout leaves index entries like that behind — shows the read error in place of the content.
 - **Empty and failed states are screens too.** A repository with no files says so. If `git ls-files` fails at all — including in a directory that is not a git repository — the browser still opens and shows what Git said, wrapped, in the preview pane.
@@ -167,6 +168,8 @@ Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Rub
 | `gg` / `G` | Jump to first / last line |
 | `o` | File outline |
 | `s` | Repository symbol search |
+| `gb` | Toggle blame gutter |
+| `gc` | Open the blamed line's commit diff inside the browser |
 | `gd` | Go to definition |
 | `gf` | Open file in your editor at the cursor line |
 | `Ctrl-o` | Jump back |
@@ -1019,6 +1022,7 @@ go_to_definition = ["g", "d"]
 | `symbol_outline` | `o` | File outline (browser only) |
 | `symbol_search` | `s` | Repository symbol search (browser only) |
 | `toggle_blame` | `gb` | Toggle blame gutter (browser file pane only) |
+| `open_blame_commit` | `gc` | Open the blamed line's commit diff (browser file pane only) |
 | `toggle_zen_mode` | `Z` | Toggle zen mode (fullscreen diff) |
 | **Git Ops** |||
 | `git_ops_stage` | `Space` | Stage/unstage file or directory |

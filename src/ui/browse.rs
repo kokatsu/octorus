@@ -1,5 +1,7 @@
 //! Repository Browser rendering: file tree, file content, and overlays.
 
+use std::collections::HashSet;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -14,8 +16,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::browse::{
-    BlameCoverage, BlameGutter, BlameGutterWidth, BlameState, BrowseOverlay, BrowseState,
-    BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
+    BlameCoverage, BlameGutter, BlameGutterWidth, BlameState, BrowseCommitDiffState, BrowseOverlay,
+    BrowseState, BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
 };
 use crate::app::{App, AppState, CachedDiffLine, DiffCache, LoadState, TreeRow};
 use crate::diff::LineType;
@@ -238,6 +240,11 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         Style::default()
     };
 
+    if state.commit_diff.is_active() {
+        render_commit_diff(frame, state, area, border_style, bg_color, &spinner);
+        return;
+    }
+
     let Some(open) = state.open.as_ref() else {
         let paragraph = Paragraph::new(Line::from(Span::styled(
             "  Select a file to view it.",
@@ -304,6 +311,123 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     if total > inner_height {
         let max_scroll = total.saturating_sub(inner_height);
         let mut scrollbar_state = ScrollbarState::new(max_scroll).position(state.scroll_offset);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
+fn render_commit_diff(
+    frame: &mut Frame,
+    state: &mut BrowseState,
+    area: Rect,
+    border_style: Style,
+    bg_color: bool,
+    spinner: &str,
+) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let (title, lines, adjusted_scroll, scrollbar) = match &mut state.commit_diff {
+        BrowseCommitDiffState::Off => return,
+        BrowseCommitDiffState::Loading { annotation, .. } => (
+            format!(
+                "{} {} — {}",
+                annotation.short_sha(),
+                annotation.summary(),
+                annotation.author_name()
+            ),
+            vec![Line::from(Span::styled(
+                format!("  {spinner} Loading commit diff…"),
+                Style::default().fg(Color::Yellow),
+            ))],
+            0,
+            None,
+        ),
+        BrowseCommitDiffState::Failed {
+            annotation,
+            message,
+        } => (
+            format!(
+                "{} {} — {}",
+                annotation.short_sha(),
+                annotation.summary(),
+                annotation.author_name()
+            ),
+            vec![Line::from(Span::styled(
+                format!("  Commit diff unavailable: {message}"),
+                Style::default().fg(Color::Red),
+            ))],
+            0,
+            None,
+        ),
+        BrowseCommitDiffState::Ready {
+            annotation,
+            cache,
+            scroll,
+        } => {
+            scroll.set_visible_lines(inner_height);
+            let title = format!(
+                "{} {} — {}",
+                annotation.short_sha(),
+                annotation.summary(),
+                annotation.author_name()
+            );
+            if cache.lines.is_empty() {
+                (
+                    title,
+                    vec![Line::from(Span::styled(
+                        "  This commit has no diff.",
+                        Style::default().fg(Color::DarkGray),
+                    ))],
+                    0,
+                    None,
+                )
+            } else {
+                let visible_start = scroll
+                    .scroll_offset
+                    .saturating_sub(2)
+                    .min(cache.lines.len());
+                let visible_end = (scroll.scroll_offset + inner_height + 5).min(cache.lines.len());
+                let lines = crate::ui::diff_view::render_cached_lines(
+                    cache,
+                    visible_start..visible_end,
+                    scroll.selected_line,
+                    &HashSet::new(),
+                    bg_color,
+                    None,
+                    area.width.saturating_sub(2),
+                );
+                let adjusted_scroll = scroll.scroll_offset.saturating_sub(visible_start) as u16;
+                let max_scroll = cache.lines.len().saturating_sub(inner_height);
+                (
+                    title,
+                    lines,
+                    adjusted_scroll,
+                    (max_scroll > 0).then_some((max_scroll, scroll.scroll_offset.min(max_scroll))),
+                )
+            }
+        }
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((adjusted_scroll, 0));
+    frame.render_widget(paragraph, area);
+
+    if let Some((max_scroll, position)) = scrollbar {
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(position);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -449,6 +573,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let kb = &app.config.keybindings;
     let state = app.browse_state.as_ref();
     let status = state.and_then(|state| state.status.as_deref());
+    let commit_diff = state.map(|state| &state.commit_diff);
     let coverage = if app.state == AppState::RepoBrowseFile {
         state.and_then(|state| match (&state.open, &state.blame) {
             (Some(open), BlameState::Ready { path, gutter }) if open.path == *path => {
@@ -460,7 +585,27 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         None
     };
 
-    let text: std::borrow::Cow<'_, str> = match status {
+    let text: std::borrow::Cow<'_, str> = match commit_diff {
+        Some(BrowseCommitDiffState::Loading { .. }) => std::borrow::Cow::Owned(format!(
+            " {} Loading commit diff… | {} back",
+            app.spinner_char(),
+            kb.quit.display()
+        )),
+        Some(BrowseCommitDiffState::Ready { .. }) => std::borrow::Cow::Owned(format!(
+            " {}/{} scroll | {}/{} page | {}/{} first/last | {} back",
+            kb.move_down.display(),
+            kb.move_up.display(),
+            kb.page_down.display(),
+            kb.page_up.display(),
+            kb.jump_to_first.display(),
+            kb.jump_to_last.display(),
+            kb.quit.display(),
+        )),
+        Some(BrowseCommitDiffState::Failed { message, .. }) => std::borrow::Cow::Owned(format!(
+            " Commit diff unavailable: {message} | {} back",
+            kb.quit.display()
+        )),
+        Some(BrowseCommitDiffState::Off) | None => match status {
         Some(message) => std::borrow::Cow::Borrowed(message),
         None if app.state == AppState::RepoBrowseTree => std::borrow::Cow::Owned(format!(
             " {} open | {} filter | {} symbol search | {} back",
@@ -483,14 +628,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " blame covers {blame_lines} lines, this file shows {buffer_lines} — reopen the file to refresh"
             )),
             Some(BlameCoverage::Exact) | None => std::borrow::Cow::Owned(format!(
-                " {} outline | {} symbol search | {} blame | {} definition | {} editor | {} back",
+                " {} outline | {} search | {} blame | {} diff | {} def | {} edit | {} back",
                 kb.symbol_outline.display(),
                 kb.symbol_search.display(),
                 kb.toggle_blame.display(),
+                kb.open_blame_commit.display(),
                 kb.go_to_definition.display(),
                 kb.go_to_file.display(),
                 kb.quit.display(),
             )),
+        },
         },
     };
 
@@ -693,12 +840,14 @@ fn overlay_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::app::browse::{
-        build_file_patch, BrowseState, IndexState, OpenFile, MAX_SYMBOL_SEARCH_RESULTS,
-        MAX_VIEWABLE_FILE_LINES,
+        build_file_patch, BlameAnnotation, BrowseCommitDiffState, BrowseState, IndexState,
+        OpenFile, MAX_SYMBOL_SEARCH_RESULTS, MAX_VIEWABLE_FILE_LINES,
     };
     use crate::config::Config;
+    use crate::diff_store::{DiffScrollState, ScrollMode};
     use crate::filter::ListFilter;
     use crate::github::parse_porcelain;
+    use crate::keybinding::{KeyBinding, KeySequence};
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use insta::assert_snapshot;
@@ -777,6 +926,11 @@ mod tests {
         };
     }
 
+    fn blame_annotation(porcelain: &str) -> Arc<BlameAnnotation> {
+        let gutter = BlameGutter::from_file(parse_porcelain(porcelain), 1);
+        Arc::clone(gutter.annotation_at(0).expect("blame annotation"))
+    }
+
     #[test]
     fn test_render_tree_while_listing() {
         let mut app = App::new_for_test();
@@ -834,12 +988,231 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         "#);
     }
 
     #[test]
-    fn test_file_pane_footer_includes_blame_within_the_eighty_column_budget() {
+    fn test_commit_diff_loading_ready_empty_and_failed_render_inside_the_browser() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        const DIFF: &str = "diff --git a/main.rs b/main.rs\n\
+             index 1111111..2222222 100644\n\
+             --- a/main.rs\n\
+             +++ b/main.rs\n\
+             @@ -1 +1 @@\n\
+             -fn old() {}\n\
+             +fn new() {}\n";
+
+        let annotation = blame_annotation(PORCELAIN);
+        let mut renders = Vec::new();
+
+        let mut loading = app_with_browse(&["main.rs"]);
+        if let Some(state) = loading.browse_state.as_mut() {
+            open_file(state, "main.rs", "fn new() {}\n");
+            state.commit_diff = BrowseCommitDiffState::Loading {
+                request_id: 1,
+                annotation: Arc::clone(&annotation),
+                cancel: state.cancel_token.child_token(),
+            };
+        }
+        loading.state = AppState::RepoBrowseFile;
+        renders.push(format!(
+            "--- loading ---\n{}",
+            render_at(&mut loading, 100, 10)
+        ));
+
+        let mut ready = app_with_browse(&["main.rs"]);
+        if let Some(state) = ready.browse_state.as_mut() {
+            open_file(state, "main.rs", "fn new() {}\n");
+            let mut pool = crate::syntax::ParserPool::new();
+            let cache = crate::ui::diff_view::build_commit_diff_cache(
+                DIFF,
+                "base16-ocean.dark",
+                &mut pool,
+                4,
+            );
+            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            scroll.set_line_count(cache.lines.len());
+            state.commit_diff = BrowseCommitDiffState::Ready {
+                annotation: Arc::clone(&annotation),
+                cache,
+                scroll,
+            };
+        }
+        ready.state = AppState::RepoBrowseFile;
+        renders.push(format!("--- ready ---\n{}", render_at(&mut ready, 100, 12)));
+
+        let mut empty = app_with_browse(&["main.rs"]);
+        if let Some(state) = empty.browse_state.as_mut() {
+            open_file(state, "main.rs", "fn new() {}\n");
+            let mut pool = crate::syntax::ParserPool::new();
+            let cache = crate::ui::diff_view::build_commit_diff_cache(
+                "",
+                "base16-ocean.dark",
+                &mut pool,
+                4,
+            );
+            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            scroll.set_line_count(cache.lines.len());
+            state.commit_diff = BrowseCommitDiffState::Ready {
+                annotation: Arc::clone(&annotation),
+                cache,
+                scroll,
+            };
+        }
+        empty.state = AppState::RepoBrowseFile;
+        renders.push(format!("--- empty ---\n{}", render_at(&mut empty, 100, 9)));
+
+        let mut failed = app_with_browse(&["main.rs"]);
+        if let Some(state) = failed.browse_state.as_mut() {
+            open_file(state, "main.rs", "fn new() {}\n");
+            state.commit_diff = BrowseCommitDiffState::Failed {
+                annotation,
+                message: "git show failed: bad object aaaaaaa".to_string(),
+            };
+        }
+        failed.state = AppState::RepoBrowseFile;
+        renders.push(format!(
+            "--- failed ---\n{}",
+            render_at(&mut failed, 100, 10)
+        ));
+
+        assert_snapshot!(renders.join("\n"), @"
+        --- loading ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌aaaaaaa baseline — Alice───────────────────────────────────────┐
+        │  main.rs                        ││  ⠋ Loading commit diff…                                       │
+        │                                 ││                                                               │
+        │                                 ││                                                               │
+        │                                 ││                                                               │
+        └─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
+         ⠋ Loading commit diff… | q/Esc back
+        --- ready ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌aaaaaaa baseline — Alice───────────────────────────────────────┐
+        │  main.rs                        ││diff --git a/main.rs b/main.rs                                 █
+        │                                 ││index 1111111..2222222 100644                                  █
+        │                                 ││--- a/main.rs                                                  █
+        │                                 ││+++ b/main.rs                                                  █
+        │                                 ││@@ -1 +1 @@                                                    █
+        │                                 ││-fn old() {}                                                   █
+        └─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
+         j/Down/k/Up scroll | Ctrl-d/Ctrl-u page | gg/G first/last | q/Esc back
+        --- empty ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌aaaaaaa baseline — Alice───────────────────────────────────────┐
+        │  main.rs                        ││  This commit has no diff.                                     │
+        │                                 ││                                                               │
+        │                                 ││                                                               │
+        └─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
+         j/Down/k/Up scroll | Ctrl-d/Ctrl-u page | gg/G first/last | q/Esc back
+        --- failed ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌aaaaaaa baseline — Alice───────────────────────────────────────┐
+        │  main.rs                        ││  Commit diff unavailable: git show failed: bad object aaaaaaa │
+        │                                 ││                                                               │
+        │                                 ││                                                               │
+        │                                 ││                                                               │
+        └─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
+         Commit diff unavailable: git show failed: bad object aaaaaaa | q/Esc back
+        ");
+    }
+
+    #[test]
+    fn test_large_commit_diff_renders_only_the_deep_visible_window() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary large change\n\
+             \tone\n";
+        let annotation = blame_annotation(PORCELAIN);
+        let mut diff = String::from(
+            "diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -0,0 +1,5000 @@\n",
+        );
+        for line in 1..=5_000 {
+            diff.push_str(&format!("+line {line}\n"));
+        }
+
+        let mut app = app_with_browse(&["large.txt"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "large.txt", "source\n");
+            let cache = crate::ui::diff_view::build_plain_diff_cache(&diff, 4);
+            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            scroll.set_line_count(cache.lines.len());
+            scroll.selected_line = cache.lines.len().saturating_sub(2);
+            scroll.scroll_offset = cache.lines.len().saturating_sub(5);
+            state.commit_diff = BrowseCommitDiffState::Ready {
+                annotation,
+                cache,
+                scroll,
+            };
+        }
+        app.state = AppState::RepoBrowseFile;
+
+        assert_snapshot!(render_at(&mut app, 80, 10), @"
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                       │
+        └──────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────────────────┐┌aaaaaaa large change — Alice──────────────────────┐
+        │  large.txt               ││+line 4996                                        ║
+        │                          ││+line 4997                                        ║
+        │                          ││+line 4998                                        ║
+        │                          ││+line 4999                                        █
+        └──────────────────────────┘└──────────────────────────────────────────────────┘
+         j/Down/k/Up scroll | Ctrl-d/Ctrl-u page | gg/G first/last | q/Esc back
+        ");
+    }
+
+    #[test]
+    fn test_commit_diff_footer_uses_configured_first_and_last_bindings() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let mut app = app_with_browse(&["main.rs"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "main.rs", "fn main() {}\n");
+            let cache = crate::ui::diff_view::build_plain_diff_cache("+changed\n", 4);
+            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            scroll.set_line_count(cache.lines.len());
+            state.commit_diff = BrowseCommitDiffState::Ready {
+                annotation: blame_annotation(PORCELAIN),
+                cache,
+                scroll,
+            };
+        }
+        app.state = AppState::RepoBrowseFile;
+        app.config.keybindings.jump_to_first =
+            KeySequence::double(KeyBinding::char('z'), KeyBinding::char('z'));
+        app.config.keybindings.jump_to_last = KeySequence::single(KeyBinding::char('X'));
+
+        let footer = render_at(&mut app, 100, 8)
+            .lines()
+            .last()
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert_snapshot!(
+            footer,
+            @" j/Down/k/Up scroll | Ctrl-d/Ctrl-u page | zz/X first/last | q/Esc back"
+        );
+    }
+
+    #[test]
+    fn test_file_pane_footer_includes_blame_commit_and_back_within_eighty_columns() {
         let mut app = app_with_browse(&["src/app.rs"]);
         if let Some(state) = app.browse_state.as_mut() {
             open_file(state, "src/app.rs", "fn main() {}\n");
@@ -861,8 +1234,8 @@ mod tests {
                 footer_at(&mut app, 60)
             ),
             @"
-        80:  o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
-        60:  o outline | s symbol search | gb blame | gd definition | gf
+        80:  o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+        60:  o outline | s search | gb blame | gc diff | gd def | gf edi
         "
         );
     }
@@ -887,7 +1260,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         ");
     }
 
@@ -929,7 +1302,7 @@ mod tests {
         │  main.rs                               ││aaaaaaa Alice Example 2h ago        1 fn main() {}                          │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         --- no time (90) ---
         ┌────────────────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                                                 │
@@ -938,7 +1311,7 @@ mod tests {
         │  main.rs                     ││aaaaaaa Alice Example      1 fn main() {}               │
         │                              ││                                                        │
         └──────────────────────────────┘└────────────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         --- identity (70) ---
         ┌────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                             │
@@ -947,7 +1320,7 @@ mod tests {
         │  main.rs              ││aaaaaaa         1 fn main() {}             │
         │                       ││                                           │
         └───────────────────────┘└───────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor |
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc
         --- hidden (50) ---
         ┌────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -         │
@@ -956,7 +1329,7 @@ mod tests {
         │  main.rs       ││    1 fn main() {}            │
         │                ││                              │
         └────────────────┘└──────────────────────────────┘
-         o outline | s symbol search | gb blame | gd defin
+         o outline | s search | gb blame | gc diff | gd de
         ");
     }
 
@@ -994,7 +1367,7 @@ mod tests {
         │                                        ││Uncommitted                         3 third                                 │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         ");
     }
 
@@ -1086,7 +1459,7 @@ mod tests {
         │  empty.rs                ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         ");
     }
 
@@ -1111,7 +1484,7 @@ mod tests {
         │                          ││   28 line 28                                     ║
         │                          ││   29 line 29                                     █
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
         ");
     }
 
