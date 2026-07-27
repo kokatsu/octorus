@@ -109,10 +109,13 @@ Running `or` with no flags opens the Cockpit — a dashboard that serves as the 
 
 octorus is not only a review tool — `or --browse` (or `b` from the file list, or **Repo Browse** in the Cockpit) opens the whole repository read-only.
 
-- **Browse every file**, not just the ones a PR touched. The tree is built from `git ls-files --cached --others --exclude-standard`, so `.gitignore`, submodules, and sparse checkouts are honoured — and files an AI agent created seconds ago are visible before they are ever committed.
+- **Browse every file**, not just the ones a PR touched. The tree comes from `git ls-files -z --cached --others --exclude-standard`: ignored files stay out, a submodule is the single entry Git reports rather than its whole working tree, and a file an AI agent wrote thirty seconds ago is there before it is ever committed. The NUL-delimited form keeps paths containing spaces or newlines intact; a path whose bytes are not valid UTF-8 is left out and counted in the status line, since a lossily decoded name would no longer open the file Git named.
 - **Same highlighting as the diff view** — tree-sitter for 24 languages, your configured theme, injections for Vue/Svelte/Markdown. File content is rendered through the exact same cache the diff view uses, so there is no second rendering path to drift.
-- **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your `$EDITOR` at the cursor line when you actually want to change something.
-- **Binary and oversized files** render an explanatory notice instead of garbage.
+- **Loading never blocks the UI.** Listing the repository, reading a file, and highlighting it are all background work: the pane shows `Loading…` until the content arrives, and selecting another file cancels the read still in flight. Highlighting is a second pass over the file that is already on screen, so a large file is readable before it is coloured.
+- **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your editor (`editor` config → `$VISUAL` → `$EDITOR` → `vi`) at the cursor line when you actually want to change something.
+- **Files it will not render say why.** Over 8 MiB, over 100,000 lines, or a single line over 10,000 bytes each get a notice quoting the file's own figure against the limit that stopped it; binary content says `Binary file — no text preview.` — no wall of garbage either way. An empty file says `Empty file.`, and a path Git listed that is not on disk — a sparse checkout leaves index entries like that behind — shows the read error in place of the content.
+- **Empty and failed states are screens too.** A repository with no files says so. If `git ls-files` fails at all — including in a directory that is not a git repository — the browser still opens and shows what Git said, wrapped, in the preview pane.
+- **No GitHub repository required.** Without `--repo`, start-up asks `gh` which repository this is — but for `--browse` a failed answer is tolerated rather than fatal, so a repository with no GitHub remote opens the browser just the same. Only the PR- and issue-backed screens need that answer.
 
 ```bash
 or --browse
@@ -120,16 +123,20 @@ or --browse
 
 #### Symbol Intelligence
 
-When the browser opens, octorus builds a repository-wide symbol index in the background using tree-sitter `tags.scm` queries — the same queries GitHub uses for its own code navigation. There is **no language server to install and nothing to configure**; the grammars are compiled into the binary.
+As soon as the file list arrives, octorus indexes exactly those files in the background using tree-sitter `tags.scm` queries — the same queries GitHub uses for its own code navigation. There is **no language server to install and nothing to configure**; the grammars are compiled into the binary.
 
-The header shows `symbols: indexing` while it builds and `symbols: ready` when done. Every other part of the browser stays usable meanwhile — the index is an accelerator, never a prerequisite.
+The header shows `symbols: indexing` while it builds, `symbols: ready` when it is done, and `symbols: unavailable` if it failed. Reading the repository never waits for it: the tree, the file pane, the keyword filter, `gf` and `Ctrl-o` all work throughout. The three features that do consult the index — `o`, `s` and `gd` — say `Symbol index is still building` in the footer until it is complete, rather than replying from a half-built one.
+
+There is a second message ahead of that one. `o` and `gd` answer questions about *the open file*, so they check the file first: while its content is still being read they say `Still opening this file`, whatever the index is doing. Otherwise a file that has not been read yet would be reported as having no symbols and no definitions. `s` searches the whole repository and does not depend on the open file, so it never shows that message. If indexing fails outright, the header turns red with `symbols: unavailable` but the footer still says `Symbol index is still building` — a known rough edge.
 
 | Feature | Key | Description |
 |---------|-----|-------------|
-| File outline | `o` | Symbols of the open file, nested, with the cursor's enclosing symbol pre-selected |
-| Symbol search | `s` | Fuzzy search across every symbol in the repository; `Enter` opens the file at the definition |
-| Go to definition | `gd` | Resolve the identifier under the cursor via the index — a CST match, not a grep for `fn <name>` |
+| File outline | `o` | Symbols of the open file, indented by nesting depth, with the cursor's enclosing symbol pre-selected. Nesting follows the tags query: a Python method inside a class indents, a Rust method inside `impl` does not, because an `impl` block is not itself a tagged definition |
+| Symbol search | `s` | Fuzzy search across every symbol in the repository, best 200 matches listed; `Enter` opens the file at the definition |
+| Go to definition | `gd` | Resolve the cursor **line** against the index — a CST match, not a grep for `fn <name>` |
 | Jump back | `Ctrl-o` | Return to the position before the last jump |
+
+`gd` in the browser works at line granularity: the browser has a line cursor and no column cursor, so it reads the identifiers on the cursor line left to right and jumps to the first one the index knows. On `Config::helper()` that is `Config`. To land on `helper` instead, use `s` and search for it by name — and either way `Ctrl-o` puts you back, so a jump you did not mean costs one keystroke. (The diff view's `gd` does have a column-free candidate popup; the browser deliberately does not, because `s` already covers "not that one, the other one" across the whole repository rather than one line.)
 
 Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Ruby, C, C++, Java, C#, Lua, PHP, Swift, Bash, Zig, Haskell, MoonBit, and Markdown (headings become the outline of a README).
 
@@ -161,7 +168,7 @@ Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Rub
 | `o` | File outline |
 | `s` | Repository symbol search |
 | `gd` | Go to definition |
-| `gf` | Open file in `$EDITOR` at the cursor line |
+| `gf` | Open file in your editor at the cursor line |
 | `Ctrl-o` | Jump back |
 | `h` / `←` / `q` / `Esc` | Back to the tree |
 
@@ -171,6 +178,7 @@ Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Rub
 |-----|--------|
 | `j` / `k` | Move selection (outline only — in symbol search, letters type into the query) |
 | `↑` / `↓`, `Ctrl-p` / `Ctrl-n` | Move selection (symbol search) |
+| `Backspace` | Delete the last character of the query (symbol search) |
 | `Ctrl-u` | Clear the query |
 | `Enter` | Jump to the symbol |
 | `Esc` | Close |
@@ -272,6 +280,7 @@ or update-local-comment --reopen 3
 - Discard, undo, soft-reset with Y/n confirmation showing the exact git command
 - Push to origin
 - Infinite scroll commit history
+- Starts without a GitHub remote — `or --git-ops` reads status and commit history from the local repository alone
 
 ### Zen mode
 
@@ -1039,15 +1048,15 @@ Press `Space /` in the PR list or file list to activate keyword filtering. Type 
 
 ## Design Docs
 
-Working notes on the Repository Viewer direction live in [`docs/`](docs/):
+Two technical reference documents for the Repository Browser and its symbol
+engine live in [`docs/`](docs/):
 
 | Document | What it holds |
 |----------|---------------|
-| [docs/repository-viewer.md](docs/repository-viewer.md) | Why Viewer instead of Editor, the competitive research, and the three-pillar plan |
-| [docs/symbol-index.md](docs/symbol-index.md) | Technical reference for the tree-sitter tags symbol engine — language matrix, per-grammar quirks, how to add a language |
-| [docs/repo-browse-architecture.md](docs/repo-browse-architecture.md) | Architecture of the Repository Browser — state machine, background tasks, extension points |
-| [docs/roadmap/code-archaeology.md](docs/roadmap/code-archaeology.md) | Design for line → commit → PR → review-discussion navigation |
-| [docs/session-log.md](docs/session-log.md) | Decisions, dead ends, and measurements from building the browser |
+| [docs/symbol-index.md](docs/symbol-index.md) | Technical reference for the tree-sitter tags symbol engine — language matrix, per-grammar quirks, how to add a language, measured cost |
+| [docs/repo-browse-architecture.md](docs/repo-browse-architecture.md) | Architecture of the Repository Browser — state machine, module map, background tasks, extension points, known limitations |
+
+[`docs/README.md`](docs/README.md) indexes the same two documents from inside the directory.
 
 ## License
 

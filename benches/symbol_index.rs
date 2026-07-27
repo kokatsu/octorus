@@ -154,9 +154,33 @@ fn bench_index_queries(c: &mut Criterion) {
         b.iter(|| black_box(index.definitions(black_box("no_such_symbol_anywhere"))));
     });
 
+    // `search` memoises the last (needle, limit) pair, so repeating one query
+    // measures rebuilding `SymbolRef`s from the cache — not the scan. Both
+    // paths matter and the names must say which is which: the overlay redraws
+    // through the cached path on every frame, and takes the cold path once per
+    // keystroke.
     for query in ["h", "handle", "handle_request_2500", "hrq"] {
-        group.bench_with_input(BenchmarkId::new("search", query), query, |b, query| {
-            b.iter(|| black_box(index.search(black_box(query), 200)));
+        group.bench_with_input(
+            BenchmarkId::new("search_cached", query),
+            query,
+            |b, query| {
+                // Warm the memo so the first iteration is not the odd one out.
+                let _ = index.search(query, 200);
+                b.iter(|| black_box(index.search(black_box(query), 200)));
+            },
+        );
+    }
+
+    // Alternating the limit misses the memo every time without changing the
+    // matched set's size, so this is the same query's full scoring pass.
+    for query in ["h", "handle", "handle_request_2500", "hrq"] {
+        group.bench_with_input(BenchmarkId::new("search_cold", query), query, |b, query| {
+            let widen = std::cell::Cell::new(false);
+            b.iter(|| {
+                widen.set(!widen.get());
+                let limit = if widen.get() { 201 } else { 200 };
+                black_box(index.search(black_box(query), limit))
+            });
         });
     }
 

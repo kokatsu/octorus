@@ -87,6 +87,24 @@ struct Args {
     output: Option<String>,
 }
 
+fn is_no_args(args: &Args) -> bool {
+    args.pr.is_none()
+        && !args.local
+        && args.issue.is_none()
+        && !args.git_ops
+        && !args.browse
+        && !args.ai_rally
+}
+
+/// Repo detection is allowed to degrade to a repo-less session for local,
+/// Git Ops, Repository Browser, and no-entry-point sessions.
+///
+/// Consulted only when `--repo` is absent — an explicit repository is taken as
+/// given and never detected, so this predicate ignores [`Args::repo`].
+fn tolerates_missing_repo(args: &Args) -> bool {
+    args.local || args.git_ops || args.browse || is_no_args(args)
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize configuration files and prompt templates
@@ -330,17 +348,12 @@ async fn main() -> Result<()> {
         };
     }
 
-    let is_no_args = args.pr.is_none()
-        && !args.local
-        && args.issue.is_none()
-        && !args.git_ops
-        && !args.browse
-        && !args.ai_rally;
+    let is_no_args = is_no_args(&args);
 
     let (repo, repo_available) = match args.repo.clone() {
         Some(r) => (r, true),
         None => {
-            if args.local || is_no_args {
+            if tolerates_missing_repo(&args) {
                 match github::detect_repo().await {
                     Ok(r) => (r, true),
                     Err(_) => ("local".to_string(), false),
@@ -933,6 +946,74 @@ mod tests {
 
         assert!(config.ai.review_only);
         assert!(!config.local_overrides.contains("ai.review_only"));
+    }
+
+    #[test]
+    fn test_no_args_tolerates_missing_repo() {
+        let args = Args::parse_from(["or"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    /// Every entry-point flag must exclude itself from `is_no_args`.
+    ///
+    /// `is_no_args` has a second consumer besides `tolerates_missing_repo`: the
+    /// Cockpit dispatch. Testing it only through `tolerates_missing_repo` cannot
+    /// see a broken conjunct, because `--local`, `--git-ops` and `--browse` each
+    /// have their own disjunct there that keeps the answer `true` either way —
+    /// so the flag would silently open Cockpit instead of its own screen while
+    /// every existing test stayed green.
+    ///
+    /// The end-to-end tests cannot close this either: `or --browse` writes the
+    /// alternate-screen escape and then fails on a non-tty before drawing a
+    /// single frame, so stdout never names the screen that opened.
+    #[test]
+    fn test_every_entry_point_flag_excludes_itself_from_is_no_args() {
+        assert!(is_no_args(&Args::parse_from(["or"])), "the baseline");
+
+        for argv in [
+            vec!["or", "--pr", "1"],
+            vec!["or", "--local"],
+            vec!["or", "--issue", "1"],
+            vec!["or", "--git-ops"],
+            vec!["or", "--browse"],
+            vec!["or", "--ai-rally"],
+        ] {
+            let flag = argv[1];
+            assert!(
+                !is_no_args(&Args::parse_from(argv.clone())),
+                "`or {flag}` is an entry point, so it is not a no-args session; \
+                 treating it as one dispatches Cockpit instead of its own screen"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browse_tolerates_missing_repo() {
+        let args = Args::parse_from(["or", "--browse"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_local_tolerates_missing_repo() {
+        let args = Args::parse_from(["or", "--local"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_pr_without_explicit_repo_does_not_tolerate_missing_repo() {
+        let args = Args::parse_from(["or", "--pr", "1"]);
+
+        assert!(!tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_git_ops_tolerates_missing_repo() {
+        let args = Args::parse_from(["or", "--git-ops"]);
+
+        assert!(tolerates_missing_repo(&args));
     }
 
     #[test]

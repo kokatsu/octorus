@@ -12,7 +12,7 @@ use std::io::Stdout;
 use crate::filter::ListFilter;
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
-use super::browse::{BrowseOverlay, IndexState, MAX_SYMBOL_SEARCH_RESULTS};
+use super::browse::{BrowseOverlay, IndexState};
 use super::{App, AppState};
 
 /// Rows moved by a page key when the real viewport height is unknown.
@@ -270,6 +270,17 @@ impl App {
 
     /// Jump to the definition under the cursor, reporting why when it cannot.
     fn browse_run_go_to_definition(&mut self) {
+        // Checked before the index, because a pending load means we have not
+        // read the cursor's line yet — there is no identifier to resolve, and
+        // "No definition found" would be a claim about a file we have not seen.
+        let pending = self
+            .browse_state
+            .as_ref()
+            .is_some_and(|state| state.open_is_pending());
+        if pending {
+            self.set_browse_status("Still opening this file");
+            return;
+        }
         let indexing = self
             .browse_state
             .as_ref()
@@ -482,9 +493,17 @@ impl App {
             return;
         };
         if state.outline_symbols().is_empty() {
-            let message = match state.index {
-                IndexState::Ready(_) => "No symbols in this file",
-                _ => "Symbol index is still building",
+            // The pending check must come first. During a background load
+            // `open` is a placeholder with no symbols, so reporting on the
+            // index alone would claim the file has none when it has not been
+            // read yet.
+            let message = if state.open_is_pending() {
+                "Still opening this file"
+            } else {
+                match state.index {
+                    IndexState::Ready(_) => "No symbols in this file",
+                    _ => "Symbol index is still building",
+                }
             };
             state.status = Some(message.to_string());
             return;
@@ -525,12 +544,10 @@ impl App {
 impl super::browse::BrowseState {
     /// Keep the highlighted row inside the current result set.
     pub fn clamp_symbol_search_selection(&mut self) {
-        let count = self.index.ready().map_or(0, |index| {
-            let BrowseOverlay::SymbolSearch { ref query, .. } = self.overlay else {
-                return 0;
-            };
-            index.search(query, MAX_SYMBOL_SEARCH_RESULTS).len()
-        });
+        let count = match self.overlay {
+            BrowseOverlay::SymbolSearch { ref query, .. } => self.symbol_search_hits(query).len(),
+            _ => return,
+        };
         if let BrowseOverlay::SymbolSearch {
             ref mut selected, ..
         } = self.overlay
@@ -543,7 +560,7 @@ impl super::browse::BrowseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::browse::{build_file_patch, BrowseState, OpenFile};
+    use crate::app::browse::{build_file_patch, BrowseState, OpenFile, OpenLoad};
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
     use std::path::PathBuf;
@@ -596,6 +613,60 @@ mod tests {
         let state = app.browse_state.as_mut().expect("browse state");
         state.index = IndexState::Ready(Arc::new(SymbolIndex::from_files(files)));
         state.refresh_open_file_symbols();
+    }
+
+    /// A browser rooted at a real directory holding `files`.
+    ///
+    /// Jumps that land in a *different* file go through `browse_open_path`,
+    /// which reads from disk — the in-memory `attach_open_file` fixture cannot
+    /// reach that branch.
+    fn browsing_app_on_disk(root: &std::path::Path, files: &[(&str, &str)]) -> App {
+        for (path, source) in files {
+            let absolute = root.join(path);
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent).expect("fixture directory");
+            }
+            std::fs::write(&absolute, source).expect("fixture file");
+        }
+
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(root.to_path_buf(), AppState::FileList);
+        state.set_paths(files.iter().map(|(path, _)| (*path).to_string()).collect());
+        app.browse_state = Some(state);
+        app.state = AppState::RepoBrowseTree;
+        app
+    }
+
+    fn symbol(name: &str, kind: SymbolKind, line: usize) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind,
+            line,
+            column: 0,
+            depth: 0,
+        }
+    }
+
+    fn open_path(app: &App) -> &str {
+        app.browse_state
+            .as_ref()
+            .and_then(|state| state.open.as_ref())
+            .map_or("", |open| open.path.as_str())
+    }
+
+    /// Drive the browse background channels until the pending load lands.
+    async fn settle_browse(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if matches!(
+                app.browse_state.as_ref().map(|state| &state.open_load),
+                None | Some(OpenLoad::Idle | OpenLoad::Failed { .. })
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("browse load never settled");
     }
 
     // ===== scenario: navigate the tree and leave =====
@@ -795,7 +866,13 @@ mod tests {
     #[test]
     fn test_outline_opens_on_the_symbol_under_the_cursor() {
         let mut app = app_with_outline();
-        app.browse_state.as_mut().unwrap().cursor_line = 2;
+        // Walk the cursor onto `fn run` rather than assigning `cursor_line`,
+        // so the pre-selection is reached the way a reader reaches it.
+        for _ in 0..2 {
+            app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut test_terminal())
+                .unwrap();
+        }
+        assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 2);
 
         app.handle_repo_browse_file_input(press(KeyCode::Char('o')), &mut test_terminal())
             .unwrap();
@@ -901,6 +978,64 @@ mod tests {
         );
     }
 
+    /// The clamp bounds the cursor by the same set the overlay draws.
+    ///
+    /// With fewer matches than the cap the two are indistinguishable, which is
+    /// what the sibling test above exercises. Only a query that overflows the
+    /// cap can tell them apart: a clamp with a cap of its own would stop the
+    /// cursor short of rows the user can plainly see and never let them open
+    /// one.
+    #[test]
+    fn test_the_selection_clamp_reaches_every_row_the_overlay_draws() {
+        let mut app = app_with_outline();
+        attach_index(
+            &mut app,
+            vec![FileSymbols {
+                path: "src/a.rs".to_string(),
+                symbols: (0..crate::app::browse::MAX_SYMBOL_SEARCH_RESULTS + 50)
+                    .map(|n| Symbol {
+                        name: format!("many_{n:04}"),
+                        kind: SymbolKind::Function,
+                        line: n + 1,
+                        column: 0,
+                        depth: 0,
+                    })
+                    .collect(),
+            }],
+        );
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('s')), &mut test_terminal())
+            .unwrap();
+        for c in "many".chars() {
+            app.handle_repo_browse_file_input(press(KeyCode::Char(c)), &mut test_terminal())
+                .unwrap();
+        }
+        let drawn = app
+            .browse_state
+            .as_ref()
+            .unwrap()
+            .symbol_search_hits("many")
+            .len();
+        assert_eq!(drawn, crate::app::browse::MAX_SYMBOL_SEARCH_RESULTS);
+
+        for _ in 0..drawn + 20 {
+            app.handle_repo_browse_file_input(press(KeyCode::Down), &mut test_terminal())
+                .unwrap();
+        }
+
+        let BrowseOverlay::SymbolSearch { selected, .. } =
+            app.browse_state.as_ref().unwrap().overlay
+        else {
+            panic!("the overlay must still be symbol search");
+        };
+        assert_eq!(
+            selected,
+            drawn - 1,
+            "the cursor stopped short of rows the overlay draws, so they can be \
+             seen but never opened"
+        );
+    }
+
     #[test]
     fn test_symbol_search_refuses_to_open_before_the_index_is_ready() {
         let mut app = browsing_app(&["src/a.rs"]);
@@ -931,6 +1066,87 @@ mod tests {
             app.browse_state.as_ref().unwrap().status.as_deref(),
             Some("Symbol index is still building")
         );
+    }
+
+    /// A pending load leaves `open` holding a placeholder with no content and
+    /// no symbols. Both `o` and `gd` answer questions about the open file, so
+    /// both must say the file is still opening rather than reporting on the
+    /// placeholder as if it were the file.
+    #[test]
+    fn test_outline_and_definition_do_not_report_on_a_file_still_being_read() {
+        for key in ['o', 'd'] {
+            let mut app = app_with_outline();
+            attach_index(
+                &mut app,
+                vec![FileSymbols {
+                    path: "src/a.rs".to_string(),
+                    symbols: Vec::new(),
+                }],
+            );
+            let state = app.browse_state.as_mut().unwrap();
+            state.open_load = OpenLoad::Pending {
+                path: "src/a.rs".to_string(),
+                line: 0,
+                scroll: None,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            };
+            state.open = None;
+            state.status = None;
+            app.state = AppState::RepoBrowseFile;
+
+            if key == 'd' {
+                app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut test_terminal())
+                    .unwrap();
+            }
+            app.handle_repo_browse_file_input(press(KeyCode::Char(key)), &mut test_terminal())
+                .unwrap();
+
+            assert_eq!(
+                app.browse_state.as_ref().unwrap().status.as_deref(),
+                Some("Still opening this file"),
+                "key {key} reported on a placeholder instead of the pending load"
+            );
+        }
+    }
+
+    /// The pending check must sit *above* the index check, not merely exist.
+    ///
+    /// With a ready index both orderings answer the same thing, so the sibling
+    /// test above cannot see the order. Here both conditions hold at once —
+    /// the file is still being read *and* the index is not ready — and only the
+    /// documented order produces the pending message.
+    #[test]
+    fn test_pending_load_outranks_an_unbuilt_index_for_both_keys() {
+        for key in ['o', 'd'] {
+            let mut app = browsing_app(&["src/a.rs"]);
+            let state = app.browse_state.as_mut().unwrap();
+            assert!(
+                state.index.ready().is_none(),
+                "this test is only meaningful while the index is unbuilt"
+            );
+            state.open_load = OpenLoad::Pending {
+                path: "src/a.rs".to_string(),
+                line: 0,
+                scroll: None,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            };
+            state.open = None;
+            state.status = None;
+            app.state = AppState::RepoBrowseFile;
+
+            if key == 'd' {
+                app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut test_terminal())
+                    .unwrap();
+            }
+            app.handle_repo_browse_file_input(press(KeyCode::Char(key)), &mut test_terminal())
+                .unwrap();
+
+            assert_eq!(
+                app.browse_state.as_ref().unwrap().status.as_deref(),
+                Some("Still opening this file"),
+                "key {key} let the index check answer for a file it has not read"
+            );
+        }
     }
 
     #[test]
@@ -983,6 +1199,169 @@ mod tests {
         assert!(state.jump_stack.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_scenario_go_to_definition_crosses_files_and_ctrl_o_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[
+                ("src/lib.rs", "pub struct Config;\n\npub fn helper() {}\n"),
+                ("src/main.rs", "fn main() {\n    helper();\n}\n"),
+            ],
+        );
+        attach_index(
+            &mut app,
+            vec![FileSymbols {
+                path: "src/lib.rs".to_string(),
+                symbols: vec![
+                    symbol("Config", SymbolKind::Class, 1),
+                    symbol("helper", SymbolKind::Function, 3),
+                ],
+            }],
+        );
+
+        // Row 0 is `src/`, row 1 `lib.rs`, row 2 `main.rs`.
+        app.handle_repo_browse_tree_input(press(KeyCode::Char('j')))
+            .unwrap();
+        app.handle_repo_browse_tree_input(press(KeyCode::Char('j')))
+            .unwrap();
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(open_path(&app), "src/main.rs");
+        settle_browse(&mut app).await;
+
+        // Put the cursor on `    helper();`.
+        app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut test_terminal())
+            .unwrap();
+        assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 1);
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut test_terminal())
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('d')), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        let state = app.browse_state.as_ref().unwrap();
+        let open = state.open.as_ref().unwrap();
+        assert_eq!(open.path, "src/lib.rs", "jumped into the other file");
+        assert_eq!(
+            open.lines,
+            vec!["pub struct Config;", "", "pub fn helper() {}"],
+            "the target was read from disk, not reused from the caller"
+        );
+        assert_eq!(state.cursor_line, 2, "`pub fn helper` is line 3, 0-based 2");
+        assert_eq!(state.status, None, "a successful jump reports nothing");
+        assert_eq!(state.jump_stack.len(), 1, "the jump is undoable");
+        assert_eq!(state.tree.selected_row, 1, "the tree followed the jump");
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+
+        app.handle_repo_browse_file_input(ctrl('o'), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+        let state = app.browse_state.as_ref().unwrap();
+        assert_eq!(open_path(&app), "src/main.rs", "Ctrl-o reopened the caller");
+        assert_eq!(state.cursor_line, 1, "back on the call site");
+        assert!(state.jump_stack.is_empty());
+    }
+
+    /// Pins the granularity the README documents: `gd` is a *line* operation.
+    ///
+    /// `BrowseState` tracks `cursor_line` and no column, so a line naming two
+    /// indexed symbols resolves in reading order — `Config` here, never
+    /// `helper`. Changing that without changing the README is a regression.
+    #[tokio::test]
+    async fn test_go_to_definition_resolves_the_first_indexed_identifier_on_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[
+                ("src/lib.rs", "pub struct Config;\n\npub fn helper() {}\n"),
+                ("src/main.rs", "fn main() {\n    Config::helper();\n}\n"),
+            ],
+        );
+        attach_index(
+            &mut app,
+            vec![FileSymbols {
+                path: "src/lib.rs".to_string(),
+                symbols: vec![
+                    symbol("Config", SymbolKind::Class, 1),
+                    symbol("helper", SymbolKind::Function, 3),
+                ],
+            }],
+        );
+
+        // Row 0 is `src/`, row 1 `lib.rs`, row 2 `main.rs`.
+        for _ in 0..2 {
+            app.handle_repo_browse_tree_input(press(KeyCode::Char('j')))
+                .unwrap();
+        }
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+        // Put the cursor on `    Config::helper();`.
+        app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut test_terminal())
+            .unwrap();
+        assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 1);
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut test_terminal())
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('d')), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        assert_eq!(open_path(&app), "src/lib.rs");
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().cursor_line,
+            0,
+            "`Config` comes first on the line, so `helper` is never tried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scenario_symbol_search_jumps_into_a_file_that_is_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[
+                ("src/lib.rs", "pub struct Config;\n\npub fn helper() {}\n"),
+                ("src/main.rs", "fn main() {\n    helper();\n}\n"),
+            ],
+        );
+        attach_index(
+            &mut app,
+            vec![FileSymbols {
+                path: "src/lib.rs".to_string(),
+                symbols: vec![
+                    symbol("Config", SymbolKind::Class, 1),
+                    symbol("helper", SymbolKind::Function, 3),
+                ],
+            }],
+        );
+        app.browse_open_path("src/main.rs", 0);
+        settle_browse(&mut app).await;
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('s')), &mut test_terminal())
+            .unwrap();
+        for c in "helper".chars() {
+            app.handle_repo_browse_file_input(press(KeyCode::Char(c)), &mut test_terminal())
+                .unwrap();
+        }
+        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert_eq!(state.overlay, BrowseOverlay::None);
+        assert_eq!(open_path(&app), "src/lib.rs", "left the file it started in");
+        assert_eq!(state.cursor_line, 2);
+        assert_eq!(state.jump_stack.len(), 1);
+        assert_eq!(
+            state.tree.selected_row, 1,
+            "the tree follows the file the overlay opened"
+        );
+    }
+
     #[test]
     fn test_jump_back_with_empty_stack_reports() {
         let mut app = app_with_outline();
@@ -1015,26 +1394,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.state, AppState::RepoBrowseFile);
+        let placeholder = app.browse_state.as_ref().unwrap().open.as_ref().unwrap();
+        assert_eq!(placeholder.path, "src/a.rs");
+        assert!(!placeholder.viewable);
+        assert!(placeholder
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Loading")));
+
+        settle_browse(&mut app).await;
+
         let open = app.browse_state.as_ref().unwrap().open.as_ref().unwrap();
-        assert_eq!(open.path, "src/a.rs");
+        assert!(open.viewable);
         assert_eq!(open.lines, vec!["pub fn alpha() {}"]);
     }
 
-    #[test]
-    fn test_opening_a_deleted_file_reports_instead_of_panicking() {
+    #[tokio::test]
+    async fn test_missing_file_stays_on_failure_pane_then_returns_to_a_usable_tree() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("live.rs"), "pub fn live() {}\n").unwrap();
         let mut app = App::new_for_test();
         let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
-        state.set_paths(vec!["gone.rs".to_string()]);
+        state.set_paths(vec!["gone.rs".to_string(), "live.rs".to_string()]);
         app.browse_state = Some(state);
         app.state = AppState::RepoBrowseTree;
 
         app.handle_repo_browse_tree_input(press(KeyCode::Enter))
             .unwrap();
+        settle_browse(&mut app).await;
 
-        assert_eq!(app.state, AppState::RepoBrowseTree);
-        let status = app.browse_state.as_ref().unwrap().status.clone().unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        let state = app.browse_state.as_ref().unwrap();
+        let status = state.status.as_deref().unwrap();
         assert!(status.starts_with("gone.rs:"), "{status}");
+        let open = state.open.as_ref().expect("failure pane");
+        assert_eq!(open.path, "gone.rs");
+        assert!(!open.viewable);
+        let notice = open.notice.as_deref().expect("failure notice");
+        assert!(notice.contains("gone.rs:"), "{notice}");
+
+        app.handle_repo_browse_file_input(press(KeyCode::Esc), &mut test_terminal())
+            .unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseTree);
+
+        app.handle_repo_browse_tree_input(press(KeyCode::Char('j')))
+            .unwrap();
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(state.open.as_ref().unwrap().path, "live.rs");
+        assert_eq!(
+            state.open.as_ref().unwrap().lines,
+            vec!["pub fn live() {}"],
+            "the tree remained usable after leaving the failure pane"
+        );
     }
 
     /// A throwaway terminal for handlers that take one but do not draw.

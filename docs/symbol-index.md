@@ -149,7 +149,11 @@ CJK 識別子や、行頭に日本語コメントがあるケースで実際に�
 
 ## 4. 検索スコアリング
 
-`fuzzy_score(name, needle)` — `needle` は小文字化済み前提。
+`fuzzy_score_lowered(lowered_name, needle)`。**private** で、**両引数とも小文字化済みが
+前提**である。`needle` 側は `LoweredNeedle` が構築時に保証し、名前側は `from_files()` が
+`lowered_names` として事前計算したものを渡す（キーストロークごとにシンボル 1 個ずつ
+小文字化を走らせないため）。公開 API から単体のスコアを取る手段はなく、`search()` の
+返却順として観測する。
 
 | 層 | スコア | 例（needle = `parse`） |
 |----|--------|----------------------|
@@ -157,11 +161,21 @@ CJK 識別子や、行頭に日本語コメントがあるケースで実際に�
 | 前方一致 | 8,000 − 長さ | `parse_line` |
 | 単語境界の後の部分一致 | 6,000 − 位置 − 長さ | `do_parse`（`_` `-` `.` `:` の直後） |
 | 部分一致 | 4,000 − 位置 − 長さ | `reparsed` |
-| 部分列 | 2,000 − ギャップ − 長さ | `please_advance_rest_of_set` |
+| 部分列 | 2,000 − min(ギャップ, 1,000) − 長さ | `please_advance_rest_of_set` |
 
-層の間隔を広く取ってあるので、長い部分列マッチが短い完全一致を追い抜くことはない。
-同点は「名前が短い順 → パス順 → 行番号順」で決着させる（描画順が実行ごとに変わらない
-ようにするため）。
+「長さ」は `chars().count()`（バイト数ではない）。部分列層のギャップに 1,000 の上限が
+あるのが層の分離を成立させている要で、これがないと散らばった部分列マッチが下の層まで
+落ちうる。同点は「名前が短い順 → パス順 → 行番号順」で決着させる（描画順が実行ごとに
+変わらないようにするため）。
+
+`search(query, limit)` は全件をスコアリングしたあと、**全体ソートではなく
+`select_nth_unstable_by` による top-N 部分選択**で `limit` 件まで切ってから並べ替える
+（判断の根拠となる実測値は関数内のコメントに残してある）。さらに直近の
+`(needle, limit)` 1 組の結果をメモ化しているので、同じクエリを同じ limit で呼び直しても
+再スキャンは起きない。**limit が違えばメモは効かない** — 呼び口を複数持つと再計算に
+なるだけでなく、返る集合そのものが食い違う。UI 側の唯一の呼び口は
+`BrowseState::symbol_search_hits()` で、描画・選択クランプ・Enter 解決の 3 者がここを
+通る。
 
 `definitions()` の並びは別で、「どれにジャンプしたいか」の優先度:
 型（Class/Interface/Type） → 呼べるもの（Function/Method/Macro） →
@@ -170,13 +184,37 @@ Constant/Module → Field/Property/Heading。
 ## 5. インデックス構築
 
 ```rust
-SymbolIndex::build(repo_root, &paths) -> SymbolIndex
+SymbolIndex::build_cancellable(
+    repo_root: &Path,
+    paths: &[String],
+    cancel: &dyn CancelSignal,
+) -> IndexBuild
 ```
 
+キャンセル不可の `build` は存在しない。戻り値も `SymbolIndex` ではなく `IndexBuild` で、
+呼び手が 3 通りを描き分けられるようにしてある。
+
+| バリアント | 意味 | 画面 |
+|---|---|---|
+| `Completed(SymbolIndex)` | 索引対象のパスを全部歩いた | `IndexState::Ready` |
+| `Cancelled { scanned_files }` | 途中で signal が立った（新しい build に追い越された） | 何も描かない。チャネルへ何も送らない |
+| `Failed { message }` | そもそも走れなかった。repo root が消えた／ワーカーが panic した | エラーバナー |
+
+`Failed` を持つのが要点で、ワーカーの panic を握り潰して「シンボルが少ないインデックス」
+として成功扱いすることを避けている。
+
+`cancel` が `tokio_util::sync::CancellationToken` ではなく `&dyn CancelSignal` なのは、
+**ポーリングの粒度をテストできるようにするため**である。「N 回ポーリングされたら立つ」
+テスト用シグナルを渡せば、キャンセルされた build が何ファイル触るかを実時間に依存せず
+確定できる。`CancellationToken` にはこのトレイトの実装が用意してある。
+
 - ブロッキング CPU バウンド。**必ず `spawn_blocking` から呼ぶ**（描画ループから呼ばない）
-- 対象は `supports_symbols()` が真で、2 MiB 以下の通常ファイルのみ
-- `std::thread::scope` で `min(8, 論理コア数)` ワーカーに分割。ワーカーごとに
-  `ParserPool` を 1 つ持つ（パーサとコンパイル済みクエリの再利用のため）
+- 対象は `supports_symbols()` が真で、`MAX_INDEXED_FILE_BYTES = 2 MiB` 以下の通常ファイルのみ
+- ポーリング地点は 2 つ。metadata prefilter が `PREFILTER_CANCEL_POLL_INTERVAL` ごとに、
+  各ワーカーが `index_chunk` の中で。前者で止まると `scanned_files` は 0
+- ワーカー数は `available_parallelism().clamp(1, 8)` をさらに索引対象ファイル数で
+  抑えた値。`std::thread::scope` で分割し、ワーカーごとに `ParserPool` を 1 つ持つ
+  （パーサとコンパイル済みクエリの再利用のため）
 - チャンクの完了順は不定なのでパス順にソートし直す。スナップショットと検索結果を
   決定的にするため
 
@@ -184,14 +222,53 @@ rayon などの並列ランタイムは追加していない。`thread::scope` �
 
 ## 6. 実測値
 
-octorus 自身（162 ファイル、約 70k LOC、release ビルド、この環境で計測）:
+**この表に載せるのは `benches/symbol_index.rs` で再現できる値だけにすること。** 以前は
+「octorus 自身を 1 回計測した」アドホックな数値が載っていたが、再現手順がないまま
+`search` の実装が全ソートから top-N 部分選択 + メモ化へ変わり、誰も追随できなかった。
+
+合成インデックス（5,000 ファイル × 20 シンボル = 100,000 シンボル、release ビルド、
+この環境で `--warm-up-time 1 --measurement-time 3` で計測。Criterion の中央推定）:
 
 | 操作 | 実測 |
 |------|------|
-| `SymbolIndex::build`（121 ファイル / 3,439 シンボル） | 約 250 ms |
-| `search("browse")` → 44 hits | 約 0.40 ms |
-| `search("sym")` → 180 hits | 約 0.37 ms |
-| `definitions("BrowseState")` | 約 1 µs |
+| `from_files`（5,000 ファイル / 100,000 シンボル） | 8.48 ms |
+| `definitions` ヒット | 39.6 ns |
+| `definitions` ミス | 27.0 ns |
+| `search_cached`（`h` / `handle` / `hrq`） | 462 / 462 / 465 ns |
+| `search_cached`（`handle_request_2500`） | 290 ns |
+| `search_cold`（`h` / `handle` / `hrq`） | 1.66 / 1.73 / 3.17 ms |
+| `search_cold`（`handle_request_2500`） | 6.99 ms |
+
+**`search_cached` と `search_cold` は別物なので混同しないこと。** メモ化は
+`(needle, limit)` で効くので、同じクエリを繰り返す `b.iter` はスキャンではなく
+「キャッシュ済み 200 件を `SymbolRef` へ復元するコスト」を測る。両方に意味がある —
+オーバーレイは毎フレーム cached 経路を通り、cold 経路はキーストロークごとに 1 回だけ
+通る。差は 3,500 倍あるので、名前を取り違えると回帰を丸ごと見落とす。`search_cold` は
+limit を 1 ずつ交互に振ってメモを外している。
+
+`handle_request_2500` が cold で最も遅いのは、needle が長いぶん 10 万シンボル全部に
+対する `find` と部分列走査が重くなるためで、ヒット数の少なさでは埋め合わない。
+
+### 自動ゲートで守られていない性質
+
+- **`lowered_names` の事前計算**: `from_files()` が小文字名をキャッシュしているのは、
+  `fuzzy_score_lowered` の中で毎回小文字化し直すと**候補 1 件につき String を 1 個確保**する
+  ためである。10 万シンボルのインデックスならキーストロークごとに 10 万アロケーションになる。
+  ところが**結果は完全に同一**なので、キャッシュを外してもテストは 1 本も落ちない
+  （revert 掃討で実測）。大小無視のマッチ自体は
+  `test_search_is_case_insensitive_in_both_directions` 系が固定しているが、守っているのは
+  正しさであってコストではない（`test_search_is_case_insensitive_for_queries` が見ているのは
+  マッチ結果である）。回帰を見るには `search_cold` ベンチを回すこと。
+
+- **ワーカー panic がキャンセルより優先されること**: `build_cancellable` は `outcomes` を
+  走査する途中で join エラーを見つけた時点で `IndexBuild::Failed` を `return` し、
+  `stopped_early` の判定はループを抜けたあとにしかない。したがって panic は構造上つねに
+  キャンセルに勝つ。この順序を入れ替えると、キャンセルを伴う panic が `Cancelled` として
+  報告され、呼び手（`start_symbol_index_build` の空アーム）が捨てるためバナーが出ず
+  panic が完全に握り潰される。**この順序を固定するテストはない** — 決定的に再現するには
+  1 つのワーカーを panic させながら別のワーカーだけをキャンセルさせる必要があり、
+  どちらのワーカーがどの poll を消費するかがスレッド順序依存になるため。
+  並べ替えるときは自分で確かめること。
 
 `benches/symbol_index.rs` に Criterion ベンチがある:
 
@@ -203,7 +280,7 @@ cargo bench --bench symbol_index
 - `extract_symbols_rust/{10,50,200,1000}` — ファイルサイズ別のスループット
 - `extract_symbols_language/{rust,typescript,markdown}` — 言語別
 - `from_files/{100,1000,5000}` — インデックス構築（100k シンボルまで）
-- `query/{definitions_hit,definitions_miss,search/*}` — クエリ遅延
+- `query/{definitions_hit,definitions_miss,search_cached/*,search_cold/*}` — クエリ遅延
 
 CI（`.github/workflows/benchmark.yml`）は現状 `ui_rendering` と `diff_parsing` しか
 回していない。`symbol_index` を回帰監視に載せるならここに足す。

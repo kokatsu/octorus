@@ -2,6 +2,7 @@
 //!
 //! ## Production benchmarks (matches actual production execution)
 //! - `diff_cache/` – cache building with/without syntax highlighting
+//! - `browse_render/` – Repository Browser rendering at fixed viewport size
 //! - `visible_range/visible_borrowed` – visible range processing (production)
 //! - `highlighter/tree_sitter_rust` – Rust highlighting
 //! - `highlighter/tree_sitter_haskell` – Haskell highlighting (complex syntax)
@@ -19,13 +20,175 @@
 mod common;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use ratatui::backend::TestBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::Terminal;
 
 use common::{generate_diff_patch, generate_haskell_diff_patch, generate_vue_diff_patch};
+use octorus::app::browse::{build_file_patch, BrowseState, OpenFile};
+use octorus::app::{App, AppState};
+use octorus::config::Config;
+use octorus::ui::diff_view::build_plain_diff_cache;
 use octorus::{build_diff_cache, render_cached_lines, ParserPool};
+
+const BROWSE_WIDTH: u16 = 80;
+const BROWSE_HEIGHT: u16 = 24;
+const BROWSE_SCROLL: usize = 100;
+
+fn browse_fixture(file_lines: usize) -> (usize, App, Terminal<TestBackend>) {
+    let source: String = (1..=file_lines)
+        .map(|line| format!("line {line}\n"))
+        .collect();
+    let patch = build_file_patch(&source);
+    let cache = build_plain_diff_cache(&patch, 4);
+
+    let mut browse_state = BrowseState::new(PathBuf::from("/tmp/demo"), AppState::FileList);
+    browse_state.set_paths(vec!["src/huge.rs".to_string()]);
+    browse_state.open = Some(OpenFile {
+        path: "src/huge.rs".to_string(),
+        patch,
+        cache,
+        lines: source.lines().map(str::to_string).collect(),
+        symbols: Vec::new(),
+        viewable: true,
+        notice: None,
+    });
+    browse_state.cursor_line = BROWSE_SCROLL;
+    browse_state.scroll_offset = BROWSE_SCROLL;
+
+    let mut app = App::new_for_test();
+    app.config = Config::default();
+    app.state = AppState::RepoBrowseFile;
+    app.browse_state = Some(browse_state);
+
+    let terminal = Terminal::new(TestBackend::new(BROWSE_WIDTH, BROWSE_HEIGHT)).unwrap();
+    (file_lines, app, terminal)
+}
+
+fn rendered_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..BROWSE_HEIGHT)
+        .map(|y| (0..BROWSE_WIDTH).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn visible_file_lines(rows: &[String]) -> Vec<usize> {
+    rows.iter()
+        .filter_map(|row| {
+            let (_, source) = row.split_once("line ")?;
+            source.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
+}
+
+fn right_pane_title(row: &str) -> Option<&str> {
+    let right_pane_start = row.match_indices('┌').nth(1)?.0 + '┌'.len_utf8();
+    let title_end = row[right_pane_start..].find('─')? + right_pane_start;
+    Some(&row[right_pane_start..title_end])
+}
+
+fn assert_browse_frames_are_comparable(small: &[String], huge: &[String]) {
+    let small_lines = visible_file_lines(small);
+    let huge_lines = visible_file_lines(huge);
+    assert_eq!(small_lines, huge_lines);
+    assert_eq!(small_lines.len(), 18);
+    assert_eq!(small_lines.first(), Some(&101));
+    assert_eq!(small_lines.last(), Some(&118));
+
+    let small_title_row = small
+        .iter()
+        .position(|row| row.contains("src/huge.rs (101/200)"))
+        .expect("small frame must contain the browse pane title");
+    let huge_title_row = huge
+        .iter()
+        .position(|row| row.contains("src/huge.rs (101/30000)"))
+        .expect("huge frame must contain the browse pane title");
+    assert_eq!(small_title_row, huge_title_row);
+    assert_eq!(&small[..small_title_row], &huge[..huge_title_row]);
+
+    for row in 1..=small_lines.len() {
+        // The rightmost cell is the scrollbar, whose thumb position necessarily
+        // reflects the different totals. The content pane text must still match.
+        assert_eq!(
+            small[small_title_row + row]
+                .chars()
+                .take(BROWSE_WIDTH.saturating_sub(1) as usize)
+                .collect::<String>(),
+            huge[huge_title_row + row]
+                .chars()
+                .take(BROWSE_WIDTH.saturating_sub(1) as usize)
+                .collect::<String>()
+        );
+    }
+    assert_eq!(
+        &small[small_title_row + small_lines.len() + 1..],
+        &huge[huge_title_row + huge_lines.len() + 1..]
+    );
+
+    let small_right_start = small[small_title_row]
+        .match_indices('┌')
+        .nth(1)
+        .expect("small frame must contain a right pane")
+        .0;
+    let huge_right_start = huge[huge_title_row]
+        .match_indices('┌')
+        .nth(1)
+        .expect("huge frame must contain a right pane")
+        .0;
+    assert_eq!(
+        &small[small_title_row][..small_right_start],
+        &huge[huge_title_row][..huge_right_start]
+    );
+    assert_eq!(
+        right_pane_title(&small[small_title_row]),
+        Some("src/huge.rs (101/200)")
+    );
+    assert_eq!(
+        right_pane_title(&huge[huge_title_row]),
+        Some("src/huge.rs (101/30000)")
+    );
+}
+
+/// Benchmark Repository Browser rendering at a fixed 80x24 viewport.
+///
+/// Rendering is O(viewport), so 200 lines and 30,000 lines must cost the same.
+/// If the 30,000-line case pulls away from the 200-line case, rendering has
+/// become O(file) and the 150% benchmark alert fires on the large case only.
+fn bench_browse_render(c: &mut Criterion) {
+    let mut fixtures: Vec<_> = [200, 30_000].into_iter().map(browse_fixture).collect();
+
+    let frames: Vec<_> = fixtures
+        .iter_mut()
+        .map(|(_, app, terminal)| {
+            terminal
+                .draw(|frame| octorus::ui::render(frame, app))
+                .unwrap();
+            rendered_rows(terminal)
+        })
+        .collect();
+
+    // This proves the cases render the same viewport and that their only textual
+    // difference is the title's total (the total-dependent scrollbar is chrome).
+    // It does not sample timing or prove the O(viewport) cost.
+    assert_browse_frames_are_comparable(&frames[0], &frames[1]);
+
+    let mut group = c.benchmark_group("browse_render");
+    for (file_lines, mut app, mut terminal) in fixtures {
+        group.bench_function(BenchmarkId::from_parameter(file_lines), move |b| {
+            b.iter(|| {
+                let frame = terminal
+                    .draw(|frame| octorus::ui::render(frame, &mut app))
+                    .unwrap();
+                black_box(frame);
+            });
+        });
+    }
+    group.finish();
+}
 
 /// Benchmark diff cache building with syntax highlighting.
 ///
@@ -508,6 +671,7 @@ fn bench_archive_visible_range(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_browse_render,
     bench_build_diff_cache,
     bench_build_diff_cache_no_highlight,
     bench_selected_line_rendering,
