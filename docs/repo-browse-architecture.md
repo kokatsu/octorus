@@ -312,6 +312,13 @@ blame gutter は file pane の既存シーケンス層へ `toggle_blame = ["g", 
   切り詰めて準備し、同一 commit の連続行は空欄にする。描画時は準備済み `&str` を参照する
   だけで、狭くなる順に full → time なし → identity → 非表示へ落とす。未コミット行は
   zero SHA と epoch 0 を出さず `Uncommitted` と表示する
+- **blame の行数とバッファの行数は食い違いうる**（ブラウザが開いたあとにディスク上の
+  ファイルが変わった場合）。`BlameGutter::from_file` は常にバッファの行数ぶんだけ行を作り、
+  食い違いを `BlameCoverage`（`Exact` / `ShorterThanBuffer` / `LongerThanBuffer`）に記録する。
+  blame の無い行は同一 commit の連続を表す空欄と区別して `[not blamed]` と出し、
+  `Exact` でないときはフッタに `blame covers N lines, this file shows M — reopen the file to
+  refresh` を出す（`status` より下の優先度）。**黙って切り詰めない**のが要点で、
+  切り詰めると「履歴のないファイル」と「表示がずれているファイル」が同じ見た目になる
 - 擬似 patch 由来の `LineType::Header` 行（`@@ ... @@`）は描画前に除外する。
   `content_window()` はヘッダが前置プレフィックスであることを使って連続スライスを
   借りるだけなので、走査量はビューポート幅で決まる。**ファイルの N 行目はキャッシュの
