@@ -69,6 +69,23 @@ mod tests {
     }
 
     #[test]
+    fn test_a_single_g_binding_is_still_rejected_against_the_browser_sequence_prefix() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            comment = "g"
+            "#,
+        )
+        .unwrap();
+
+        // This fails the moment toggle_blame is put back into SCREEN_SPECIFIC_KEYS.
+        let errors = config.keybindings.validate().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("conflicts with sequence prefix") && error.contains("(g)")
+        }));
+    }
+
+    #[test]
     fn test_default_diff_page_keybindings() {
         let config = KeybindingsConfig::default();
         assert_eq!(config.diff_page_down.display(), "PageDown");
@@ -624,6 +641,24 @@ tab_width = 0
     }
 
     #[test]
+    fn test_load_from_paths_warns_and_continues_on_keybinding_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let local = dir.path().join("local.toml");
+        fs::write(
+            &global,
+            r#"
+            [keybindings]
+            comment = "g"
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_paths(&global, &local, dir.path().to_path_buf()).unwrap();
+        assert_eq!(config.keybindings.comment.display(), "g");
+    }
+
+    #[test]
     fn test_load_from_paths_sets_project_root() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global.toml");
@@ -977,6 +1012,27 @@ timeout_secs = 3600
         assert_eq!(parsed.issue_list.display(), "I");
     }
 
+    #[test]
+    fn test_blame_keybinding_default_custom_and_serialize_roundtrip() {
+        let config = KeybindingsConfig::default();
+        assert_eq!(config.toggle_blame.display(), "gb");
+        assert!(config.validate().is_ok());
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("toggle_blame"));
+        let parsed: KeybindingsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.toggle_blame.display(), "gb");
+
+        let custom: Config = toml::from_str(
+            r#"
+            [keybindings]
+            toggle_blame = ["z", "b"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(custom.keybindings.toggle_blame.display(), "zb");
+    }
+
     /// KeybindingsConfig の全フィールドが serialize に含まれることを検証。
     /// 新しいフィールドを追加した際に serialize_entry の追加を忘れるとここで落ちる。
     #[test]
@@ -1033,6 +1089,7 @@ timeout_secs = 3600
             "mark_viewed",
             "mark_viewed_dir",
             "tree_toggle",
+            "toggle_blame",
         ];
 
         for field in &expected_fields {

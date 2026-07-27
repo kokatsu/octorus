@@ -73,6 +73,7 @@ pub struct KeybindingsConfig {
     pub repo_browse: KeySequence,
     pub symbol_outline: KeySequence,
     pub symbol_search: KeySequence,
+    pub toggle_blame: KeySequence,
 
     pub filter_open: KeySequence,
     pub filter_closed: KeySequence,
@@ -154,6 +155,7 @@ impl Default for KeybindingsConfig {
             repo_browse: KeySequence::single(KeyBinding::char('b')),
             symbol_outline: KeySequence::single(KeyBinding::char('o')),
             symbol_search: KeySequence::single(KeyBinding::char('s')),
+            toggle_blame: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('b')),
 
             filter_open: KeySequence::single(KeyBinding::char('o')),
             filter_closed: KeySequence::single(KeyBinding::char('c')),
@@ -235,6 +237,7 @@ impl KeybindingsConfig {
             ("repo_browse", &self.repo_browse),
             ("symbol_outline", &self.symbol_outline),
             ("symbol_search", &self.symbol_search),
+            ("toggle_blame", &self.toggle_blame),
             ("shell_command", &self.shell_command),
             ("filter_open", &self.filter_open),
             ("filter_closed", &self.filter_closed),
@@ -448,6 +451,7 @@ impl Serialize for KeybindingsConfig {
         map.serialize_entry("repo_browse", &seq_to_value(&self.repo_browse))?;
         map.serialize_entry("symbol_outline", &seq_to_value(&self.symbol_outline))?;
         map.serialize_entry("symbol_search", &seq_to_value(&self.symbol_search))?;
+        map.serialize_entry("toggle_blame", &seq_to_value(&self.toggle_blame))?;
         map.serialize_entry("shell_command", &seq_to_value(&self.shell_command))?;
         map.serialize_entry("filter_open", &seq_to_value(&self.filter_open))?;
         map.serialize_entry("filter_closed", &seq_to_value(&self.filter_closed))?;

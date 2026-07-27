@@ -219,7 +219,7 @@ impl App {
         false
     }
 
-    /// Resolve `gg` / `gd` / `gf`. Returns `true` when the key was consumed.
+    /// Resolve `gg` / `gb` / `gd` / `gf`. Returns `true` when the key was consumed.
     fn handle_browse_sequence_input(
         &mut self,
         key: &event::KeyEvent,
@@ -235,6 +235,11 @@ impl App {
         if !self.pending_keys.is_empty() {
             self.push_pending_key(binding);
 
+            if self.try_match_sequence(&kb.toggle_blame) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                self.toggle_browse_blame();
+                return Ok(true);
+            }
             if self.try_match_sequence(&kb.go_to_definition) == SequenceMatch::Full {
                 self.clear_pending_keys();
                 self.browse_run_go_to_definition();
@@ -257,7 +262,8 @@ impl App {
             return Ok(false);
         }
 
-        let starts_sequence = self.key_could_match_sequence(key, &kb.go_to_definition)
+        let starts_sequence = self.key_could_match_sequence(key, &kb.toggle_blame)
+            || self.key_could_match_sequence(key, &kb.go_to_definition)
             || self.key_could_match_sequence(key, &kb.go_to_file)
             || self.key_could_match_sequence(key, &kb.jump_to_first);
         if starts_sequence {
@@ -560,7 +566,7 @@ impl super::browse::BrowseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::browse::{build_file_patch, BrowseState, OpenFile, OpenLoad};
+    use crate::app::browse::{build_file_patch, BlameState, BrowseState, OpenFile, OpenLoad};
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
     use std::path::PathBuf;
@@ -669,6 +675,20 @@ mod tests {
         panic!("browse load never settled");
     }
 
+    async fn settle_blame(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if matches!(
+                app.browse_state.as_ref().map(|state| &state.blame),
+                Some(BlameState::Ready { .. } | BlameState::Failed)
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("blame load never settled");
+    }
+
     // ===== scenario: navigate the tree and leave =====
 
     #[test]
@@ -695,6 +715,85 @@ mod tests {
             .unwrap();
         assert_eq!(app.state, AppState::FileList);
         assert!(app.browse_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scenario_open_file_toggle_blame_on_poll_then_toggle_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Scenario Author",
+                    "-c",
+                    "user.email=scenario@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .output();
+            match output {
+                Ok(output) if output.status.success() => true,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::env::var_os("CI").is_none() =>
+                {
+                    false
+                }
+                Ok(output) => panic!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(error) => panic!("git {} failed: {error}", args.join(" ")),
+            }
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(git(&["add", "main.rs"]));
+        assert!(git(&["commit", "-m", "baseline"]));
+
+        let mut app = browsing_app_on_disk(dir.path(), &[("main.rs", "fn main() {}\n")]);
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Off
+        ));
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('b')), &mut terminal)
+            .unwrap();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Loading { .. }
+        ));
+
+        settle_blame(&mut app).await;
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.blame,
+            BlameState::Ready {
+                ref path,
+                ref gutter
+            } if path == "main.rs" && gutter.len() == 1
+        ));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('b')), &mut terminal)
+            .unwrap();
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.blame, BlameState::Off));
+        assert!(state.blame_receiver.is_none());
     }
 
     #[test]

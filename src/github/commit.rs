@@ -301,8 +301,19 @@ pub fn format_relative_time(iso_date: &str) -> String {
         return iso_date.to_string();
     };
 
-    let now = Utc::now();
-    let duration = now.signed_duration_since(dt.with_timezone(&Utc));
+    format_relative_time_at(dt.with_timezone(&Utc), Utc::now())
+}
+
+pub(crate) fn format_relative_time_from_epoch(epoch_seconds: i64) -> String {
+    let Some(dt) = DateTime::<Utc>::from_timestamp(epoch_seconds, 0) else {
+        return "unknown".to_string();
+    };
+
+    format_relative_time_at(dt, Utc::now())
+}
+
+fn format_relative_time_at(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let duration = now.signed_duration_since(dt);
 
     let seconds = duration.num_seconds();
     if seconds < 0 {
@@ -368,6 +379,18 @@ mod tests {
     fn test_format_relative_time_invalid() {
         let result = format_relative_time("not-a-date");
         assert_eq!(result, "not-a-date");
+    }
+
+    #[test]
+    fn test_rfc3339_and_epoch_relative_time_entry_points_agree() {
+        let instant = Utc::now() - chrono::Duration::hours(6);
+        let iso = instant.to_rfc3339();
+
+        assert_eq!(
+            format_relative_time(&iso),
+            format_relative_time_from_epoch(instant.timestamp())
+        );
+        assert_eq!(format_relative_time_from_epoch(i64::MAX), "unknown");
     }
 
     #[test]

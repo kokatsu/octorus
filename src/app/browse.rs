@@ -11,16 +11,19 @@
 //! part of the screen stays usable — an index is an accelerator, never a
 //! prerequisite.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::filter::ListFilter;
+use crate::github::{blame_file, BlameError, BlameFile, BlameRef};
 use crate::symbols::{CancelSignal, IndexBuild, Symbol, SymbolIndex, SymbolRef};
 use crate::syntax::ParserPool;
+use crate::ui::common::truncate_with_width;
 
 use super::types::*;
 use super::{App, AppState};
@@ -42,6 +45,10 @@ pub const MAX_VIEWABLE_LINE_BYTES: usize = 10_000;
 
 /// Maximum rows shown in the symbol search overlay.
 pub const MAX_SYMBOL_SEARCH_RESULTS: usize = 200;
+
+pub(crate) const BLAME_FULL_WIDTH: usize = 32;
+pub(crate) const BLAME_AUTHOR_WIDTH: usize = 23;
+pub(crate) const BLAME_IDENTITY_WIDTH: usize = 12;
 
 impl App {
     /// Open the Repository Browser, loading the tracked file list in the background.
@@ -198,6 +205,50 @@ impl App {
             }
         }
 
+        if let Some(rx) = state.blame_receiver.as_mut() {
+            match rx.try_recv() {
+                Ok(delivery) => {
+                    let matches_request = matches!(
+                        state.blame,
+                        BlameState::Loading { ref path, .. } if path == &delivery.path
+                    );
+                    if matches_request {
+                        match delivery.result {
+                            Ok(blame) => {
+                                if state.apply_blame_result(&delivery.path, blame) {
+                                    state.blame_receiver = None;
+                                    state.status = state.listing_status.clone();
+                                }
+                            }
+                            Err(error) => {
+                                let matches_open = state
+                                    .open
+                                    .as_ref()
+                                    .is_some_and(|open| open.path == delivery.path);
+                                if matches_open {
+                                    state.blame_receiver = None;
+                                    state.blame = BlameState::Failed;
+                                    state.status = Some(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    state.blame_receiver = None;
+                    let cancelled = match state.blame {
+                        BlameState::Loading { ref cancel, .. } => cancel.is_cancelled(),
+                        _ => true,
+                    };
+                    if !cancelled {
+                        state.blame = BlameState::Failed;
+                        state.status = Some("blame task ended".to_string());
+                    }
+                }
+            }
+        }
+
         if let Some(rx) = state.highlight_receiver.as_mut() {
             match rx.try_recv() {
                 Ok((path, cache)) => {
@@ -216,6 +267,7 @@ impl App {
         }
         if file_ready {
             self.start_browse_highlight();
+            self.start_browse_blame();
         }
         // A listing error is most useful with its wide, scrollable detail pane
         // focused, but an asynchronous completion must not steal focus from
@@ -325,6 +377,14 @@ impl App {
             return;
         }
 
+        let blame_active = !matches!(state.blame, BlameState::Off);
+        state.cancel_blame_request();
+        if blame_active {
+            state.blame = BlameState::Waiting {
+                path: path.to_string(),
+            };
+        }
+
         if let OpenLoad::Pending { ref cancel, .. } = state.open_load {
             cancel.cancel();
         }
@@ -357,6 +417,78 @@ impl App {
         });
 
         self.state = AppState::RepoBrowseFile;
+    }
+
+    pub(crate) fn toggle_browse_blame(&mut self) {
+        {
+            let Some(state) = self.browse_state.as_mut() else {
+                return;
+            };
+
+            if matches!(
+                state.blame,
+                BlameState::Waiting { .. } | BlameState::Loading { .. } | BlameState::Ready { .. }
+            ) {
+                state.cancel_blame_request();
+                state.blame = BlameState::Off;
+                return;
+            }
+
+            let Some(open) = state.open.as_ref() else {
+                state.blame = BlameState::Off;
+                state.status = Some("Blame is unavailable for this file".to_string());
+                return;
+            };
+            if state.open_is_pending() {
+                state.blame = BlameState::Off;
+                state.status = Some("Still opening this file".to_string());
+                return;
+            }
+            if !open.viewable {
+                state.blame = BlameState::Off;
+                state.status = Some("Blame is unavailable for this file".to_string());
+                return;
+            }
+
+            state.status = None;
+            state.blame = BlameState::Waiting {
+                path: open.path.clone(),
+            };
+        }
+        self.start_browse_blame();
+    }
+
+    fn start_browse_blame(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let BlameState::Waiting { path } = &state.blame else {
+            return;
+        };
+        let path = path.clone();
+        let can_blame = state
+            .open
+            .as_ref()
+            .is_some_and(|open| open.path == path && open.viewable);
+        if !can_blame {
+            state.blame = BlameState::Off;
+            state.status = Some("Blame is unavailable for this file".to_string());
+            return;
+        }
+
+        state.cancel_blame_request();
+        let cancel = state.cancel_token.child_token();
+        state.blame = BlameState::Loading {
+            path: path.clone(),
+            cancel: cancel.clone(),
+        };
+        let (tx, rx) = mpsc::channel(1);
+        state.blame_receiver = Some(rx);
+        let repo_root = state.repo_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = blame_file(&repo_root, &path);
+            deliver_blame_load(result, path, &cancel, &tx);
+        });
     }
 
     /// Upgrade the open file's immediate plain cache on a background thread.
@@ -510,6 +642,200 @@ impl IndexState {
     }
 }
 
+/// Lifecycle of the blame annotation for the open browser file.
+#[derive(Debug, Default)]
+pub(crate) enum BlameState {
+    #[default]
+    Off,
+    Waiting {
+        path: String,
+    },
+    Loading {
+        path: String,
+        cancel: CancellationToken,
+    },
+    Ready {
+        path: String,
+        gutter: BlameGutter,
+    },
+    // The user-facing failure is kept in `BrowseState::status`.
+    Failed,
+}
+
+#[derive(Debug)]
+pub(crate) struct BlameGutter {
+    rows: Vec<BlameGutterRow>,
+    coverage: BlameCoverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlameCoverage {
+    Exact,
+    ShorterThanBuffer {
+        blame_lines: usize,
+        buffer_lines: usize,
+    },
+    LongerThanBuffer {
+        blame_lines: usize,
+        buffer_lines: usize,
+    },
+}
+
+#[derive(Debug)]
+enum BlameGutterRow {
+    Annotation(Arc<BlameAnnotation>),
+    Blank,
+    Missing,
+}
+
+#[derive(Debug)]
+struct BlameAnnotation {
+    full: Arc<str>,
+    author: Arc<str>,
+    identity: Arc<str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BlameGutterWidth {
+    Full,
+    Author,
+    Identity,
+}
+
+const BLAME_FULL_BLANK: &str = "                                ";
+const BLAME_AUTHOR_BLANK: &str = "                       ";
+const BLAME_IDENTITY_BLANK: &str = "            ";
+const BLAME_FULL_MISSING: &str = "[not blamed]                    ";
+const BLAME_AUTHOR_MISSING: &str = "[not blamed]           ";
+const BLAME_IDENTITY_MISSING: &str = "[not blamed]";
+
+impl BlameGutter {
+    pub(crate) fn from_file(blame: BlameFile, buffer_lines: usize) -> Self {
+        debug_assert_eq!(BLAME_FULL_BLANK.width(), BLAME_FULL_WIDTH);
+        debug_assert_eq!(BLAME_AUTHOR_BLANK.width(), BLAME_AUTHOR_WIDTH);
+        debug_assert_eq!(BLAME_IDENTITY_BLANK.width(), BLAME_IDENTITY_WIDTH);
+
+        let blame_lines = blame.line_count();
+        let coverage = if blame_lines < buffer_lines {
+            BlameCoverage::ShorterThanBuffer {
+                blame_lines,
+                buffer_lines,
+            }
+        } else if blame_lines > buffer_lines {
+            BlameCoverage::LongerThanBuffer {
+                blame_lines,
+                buffer_lines,
+            }
+        } else {
+            BlameCoverage::Exact
+        };
+        let mut annotations = HashMap::<&str, Arc<BlameAnnotation>>::new();
+        let mut rows = Vec::with_capacity(buffer_lines);
+        let mut previous_sha = None;
+
+        for line in 0..buffer_lines {
+            let Some(reference) = blame.at(line) else {
+                rows.push(BlameGutterRow::Missing);
+                previous_sha = None;
+                continue;
+            };
+            if previous_sha == Some(reference.sha) {
+                rows.push(BlameGutterRow::Blank);
+                continue;
+            }
+
+            let annotation = annotations
+                .entry(reference.sha)
+                .or_insert_with(|| Arc::new(prepare_blame_annotation(reference)))
+                .clone();
+            rows.push(BlameGutterRow::Annotation(annotation));
+            previous_sha = Some(reference.sha);
+        }
+
+        Self { rows, coverage }
+    }
+
+    pub(crate) fn coverage(&self) -> BlameCoverage {
+        self.coverage
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(crate) fn text(&self, line: usize, width: BlameGutterWidth) -> &str {
+        match (self.rows.get(line), width) {
+            (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Full) => {
+                &annotation.full
+            }
+            (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Author) => {
+                &annotation.author
+            }
+            (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Identity) => {
+                &annotation.identity
+            }
+            (Some(BlameGutterRow::Blank), BlameGutterWidth::Full) => BLAME_FULL_BLANK,
+            (Some(BlameGutterRow::Blank), BlameGutterWidth::Author) => BLAME_AUTHOR_BLANK,
+            (Some(BlameGutterRow::Blank), BlameGutterWidth::Identity) => BLAME_IDENTITY_BLANK,
+            (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Full) => BLAME_FULL_MISSING,
+            (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Author) => {
+                BLAME_AUTHOR_MISSING
+            }
+            (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Identity) => {
+                BLAME_IDENTITY_MISSING
+            }
+        }
+    }
+}
+
+fn prepare_blame_annotation(reference: BlameRef<'_>) -> BlameAnnotation {
+    if reference.is_uncommitted() {
+        return BlameAnnotation {
+            full: Arc::from(pad_blame_text("Uncommitted".to_string(), BLAME_FULL_WIDTH)),
+            author: Arc::from(pad_blame_text(
+                "Uncommitted".to_string(),
+                BLAME_AUTHOR_WIDTH,
+            )),
+            identity: Arc::from(pad_blame_text(
+                "Uncommitted".to_string(),
+                BLAME_IDENTITY_WIDTH,
+            )),
+        };
+    }
+
+    let sha = reference.short_sha();
+    let time = crate::github::format_relative_time_from_epoch(reference.author_time);
+    let full_author_width = BLAME_FULL_WIDTH.saturating_sub(sha.width() + time.width() + 3);
+    let author_width = BLAME_AUTHOR_WIDTH.saturating_sub(sha.width() + 2);
+    let full_author = truncate_with_width(reference.author, full_author_width);
+    let author = truncate_with_width(reference.author, author_width);
+
+    BlameAnnotation {
+        full: Arc::from(pad_blame_text(
+            format!("{sha} {full_author} {time}"),
+            BLAME_FULL_WIDTH,
+        )),
+        author: Arc::from(pad_blame_text(
+            format!("{sha} {author}"),
+            BLAME_AUTHOR_WIDTH,
+        )),
+        identity: Arc::from(pad_blame_text(sha.to_string(), BLAME_IDENTITY_WIDTH)),
+    }
+}
+
+fn pad_blame_text(mut text: String, width: usize) -> String {
+    let padding = width.saturating_sub(text.width());
+    text.reserve(padding);
+    text.extend(std::iter::repeat_n(' ', padding));
+    text
+}
+
 /// A file opened in the browser.
 pub struct OpenFile {
     /// Repository-relative path.
@@ -588,6 +914,11 @@ pub(crate) struct FileLoadResult {
     result: Result<OpenFile, String>,
 }
 
+pub(crate) struct BlameLoadResult {
+    path: String,
+    result: Result<BlameFile, BlameError>,
+}
+
 /// Outcome of one background file load.
 #[derive(Debug)]
 pub(crate) enum FileLoad {
@@ -627,6 +958,17 @@ fn deliver_file_load(
                 result: Err(message),
             });
         }
+    }
+}
+
+fn deliver_blame_load(
+    result: Result<BlameFile, BlameError>,
+    path: String,
+    cancel: &dyn CancelSignal,
+    tx: &mpsc::Sender<BlameLoadResult>,
+) {
+    if !cancel.is_cancelled() {
+        let _ = tx.blocking_send(BlameLoadResult { path, result });
     }
 }
 
@@ -694,6 +1036,7 @@ pub struct BrowseState {
     pub filter: Option<ListFilter>,
     pub open: Option<OpenFile>,
     pub open_load: OpenLoad,
+    pub(crate) blame: BlameState,
     /// 0-based cursor line within the open file.
     pub cursor_line: usize,
     pub scroll_offset: usize,
@@ -714,6 +1057,7 @@ pub struct BrowseState {
     pub(crate) paths_receiver: Option<mpsc::Receiver<Result<RepositoryFiles, String>>>,
     pub(crate) index_receiver: Option<mpsc::Receiver<IndexDelivery>>,
     pub(crate) file_receiver: Option<mpsc::Receiver<FileLoadResult>>,
+    pub(crate) blame_receiver: Option<mpsc::Receiver<BlameLoadResult>>,
     pub(crate) highlight_receiver: Option<mpsc::Receiver<(String, DiffCache)>>,
 }
 
@@ -738,6 +1082,7 @@ impl BrowseState {
             filter: None,
             open: None,
             open_load: OpenLoad::Idle,
+            blame: BlameState::Off,
             cursor_line: 0,
             scroll_offset: 0,
             index: IndexState::Idle,
@@ -749,8 +1094,16 @@ impl BrowseState {
             paths_receiver: None,
             index_receiver: None,
             file_receiver: None,
+            blame_receiver: None,
             highlight_receiver: None,
         }
+    }
+
+    fn cancel_blame_request(&mut self) {
+        if let BlameState::Loading { ref cancel, .. } = self.blame {
+            cancel.cancel();
+        }
+        self.blame_receiver = None;
     }
 
     /// Install a freshly listed set of tracked paths and rebuild the tree.
@@ -896,6 +1249,23 @@ impl BrowseState {
                 open.cache = cache;
             }
         }
+    }
+
+    /// Mirrors `apply_highlighted_cache`: the path check is a plain runtime
+    /// `if`, not a `debug_assert!`, so release builds cannot install blame for
+    /// a different open file.
+    pub(crate) fn apply_blame_result(&mut self, path: &str, blame: BlameFile) -> bool {
+        if let Some(open) = self.open.as_ref() {
+            if open.path == path {
+                let buffer_lines = open.line_count();
+                self.blame = BlameState::Ready {
+                    path: path.to_string(),
+                    gutter: BlameGutter::from_file(blame, buffer_lines),
+                };
+                return true;
+            }
+        }
+        false
     }
 
     /// Symbol rows for the outline overlay.
@@ -1154,6 +1524,17 @@ fn install_file_load_failure(
     message: String,
     tab_width: u8,
 ) {
+    if matches!(
+        state.blame,
+        BlameState::Waiting { path: ref blame_path }
+            | BlameState::Loading {
+                path: ref blame_path,
+                ..
+            } if blame_path == &path
+    ) {
+        state.cancel_blame_request();
+        state.blame = BlameState::Failed;
+    }
     state.open = Some(unviewable(&path, message.clone(), tab_width));
     state.status = Some(message.clone());
     state.open_load = OpenLoad::Failed { path, message };
@@ -1281,6 +1662,7 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::{parse_porcelain, BlameError};
     use crate::symbols::{FileSymbols, SymbolKind};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1409,6 +1791,20 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("symbol index never settled");
+    }
+
+    async fn settle_blame(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if matches!(
+                app.browse_state.as_ref().map(|state| &state.blame),
+                Some(BlameState::Ready { .. } | BlameState::Failed)
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("blame load never settled");
     }
 
     fn state_with_pending_load(path: &str) -> BrowseState {
@@ -1680,6 +2076,69 @@ mod tests {
         assert_eq!(ready_index().label(), "symbols: ready");
         assert_eq!(IndexState::Failed.label(), "symbols: unavailable");
         assert!(IndexState::Building.ready().is_none());
+    }
+
+    #[test]
+    fn test_apply_blame_result_requires_the_current_open_path() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tline 0\n";
+        let mut state = state_with_open_file(1);
+        state.blame = BlameState::Loading {
+            path: "src/a.rs".to_string(),
+            cancel: state.cancel_token.child_token(),
+        };
+
+        assert!(!state.apply_blame_result("src/other.rs", parse_porcelain(PORCELAIN)));
+        assert!(matches!(
+            state.blame,
+            BlameState::Loading { ref path, .. } if path == "src/a.rs"
+        ));
+
+        assert!(state.apply_blame_result("src/a.rs", parse_porcelain(PORCELAIN)));
+        assert!(matches!(
+            state.blame,
+            BlameState::Ready {
+                ref path,
+                ref gutter
+            } if path == "src/a.rs" && gutter.len() == 1
+        ));
+    }
+
+    #[test]
+    fn test_blame_gutter_rows_and_coverage_follow_the_open_buffer() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary first\n\
+             \tone\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2 2 1\n\
+             author Bob\n\
+             author-time 1700000001\n\
+             summary second\n\
+             \ttwo\n";
+
+        let shorter = BlameGutter::from_file(parse_porcelain(PORCELAIN), 4);
+        assert_eq!(shorter.len(), 4);
+        assert!(matches!(
+            shorter.coverage(),
+            BlameCoverage::ShorterThanBuffer {
+                blame_lines: 2,
+                buffer_lines: 4
+            }
+        ));
+
+        let longer = BlameGutter::from_file(parse_porcelain(PORCELAIN), 1);
+        assert_eq!(longer.len(), 1);
+        assert!(matches!(
+            longer.coverage(),
+            BlameCoverage::LongerThanBuffer {
+                blame_lines: 2,
+                buffer_lines: 1
+            }
+        ));
     }
 
     // ===== file loading =====
@@ -1982,6 +2441,290 @@ mod tests {
             rx.try_recv().is_ok(),
             "a live request must still be delivered"
         );
+    }
+
+    #[test]
+    fn test_cancelled_blame_result_is_not_delivered() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        deliver_blame_load(Ok(parse_porcelain("")), "a.rs".to_string(), &cancel, &tx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a superseded blame fetch must not reach the UI channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blame_poll_discards_a_path_mismatch_without_shifting_the_current_file() {
+        let mut app = App::new_for_test();
+        let mut state = state_with_pending_load("current.rs");
+        state.open_load = OpenLoad::Idle;
+        state.blame = BlameState::Loading {
+            path: "current.rs".to_string(),
+            cancel: state.cancel_token.child_token(),
+        };
+        let (tx, rx) = mpsc::channel(2);
+        state.blame_receiver = Some(rx);
+        app.browse_state = Some(state);
+
+        tx.send(BlameLoadResult {
+            path: "stale.rs".to_string(),
+            result: Ok(parse_porcelain("")),
+        })
+        .await
+        .unwrap();
+        tx.send(BlameLoadResult {
+            path: "current.rs".to_string(),
+            result: Ok(parse_porcelain("")),
+        })
+        .await
+        .unwrap();
+
+        app.poll_browse_updates();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Loading { ref path, .. } if path == "current.rs"
+        ));
+        assert!(app.browse_state.as_ref().unwrap().blame_receiver.is_some());
+
+        app.poll_browse_updates();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Ready { ref path, .. } if path == "current.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_opening_another_file_cancels_and_replaces_active_blame() {
+        let dir = tempfile::tempdir().unwrap();
+        if !run_git_fixture("replace-blame", dir.path(), &["init"]) {
+            return;
+        }
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        assert!(run_git_fixture(
+            "replace-blame",
+            dir.path(),
+            &["add", "a.rs", "b.rs"]
+        ));
+        assert!(run_git_fixture(
+            "replace-blame",
+            dir.path(),
+            &["commit", "-m", "baseline"]
+        ));
+
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
+        state.open = Some(load_file_for_test(&dir.path().join("a.rs"), "a.rs", 4).unwrap());
+        state.blame = BlameState::Loading {
+            path: "a.rs".to_string(),
+            cancel: state.cancel_token.child_token(),
+        };
+        let old_cancel = match &state.blame {
+            BlameState::Loading { cancel, .. } => cancel.clone(),
+            _ => unreachable!(),
+        };
+        let (_tx, rx) = mpsc::channel(1);
+        state.blame_receiver = Some(rx);
+        app.browse_state = Some(state);
+
+        app.browse_open_path("b.rs", 0);
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(old_cancel.is_cancelled());
+        assert!(matches!(
+            state.blame,
+            BlameState::Waiting { ref path } if path == "b.rs"
+        ));
+        assert!(state.blame_receiver.is_none());
+
+        settle_browse(&mut app).await;
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Loading { ref path, .. } if path == "b.rs"
+        ));
+        assert!(app.browse_state.as_ref().unwrap().blame_receiver.is_some());
+
+        settle_blame(&mut app).await;
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Ready { ref path, .. } if path == "b.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_retoggle_cancels_the_old_blame_request_before_starting_another() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
+        state.open = Some(load_file_for_test(&dir.path().join("a.rs"), "a.rs", 4).unwrap());
+        app.browse_state = Some(state);
+
+        app.toggle_browse_blame();
+        let first = match &app.browse_state.as_ref().unwrap().blame {
+            BlameState::Loading { cancel, .. } => cancel.clone(),
+            _ => panic!("first toggle did not start blame"),
+        };
+
+        app.toggle_browse_blame();
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(first.is_cancelled());
+        assert!(matches!(state.blame, BlameState::Off));
+        assert!(state.blame_receiver.is_none());
+
+        app.toggle_browse_blame();
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.blame,
+            BlameState::Loading { ref cancel, .. } if !cancel.is_cancelled()
+        ));
+        assert!(state.blame_receiver.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_binary_and_oversized_files_never_start_background_blame() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("binary.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        let oversized = std::fs::File::create(dir.path().join("oversized.dat")).unwrap();
+        oversized.set_len(MAX_VIEWABLE_FILE_BYTES + 1).unwrap();
+
+        for path in ["binary.dat", "oversized.dat"] {
+            let mut app = App::new_for_test();
+            let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
+            state.blame = BlameState::Waiting {
+                path: path.to_string(),
+            };
+            app.browse_state = Some(state);
+            app.browse_open_path(path, 0);
+            settle_browse(&mut app).await;
+
+            let state = app.browse_state.as_ref().unwrap();
+            assert!(matches!(state.blame, BlameState::Off), "{path}");
+            assert!(state.blame_receiver.is_none(), "{path}");
+            assert_eq!(
+                state.status.as_deref(),
+                Some("Blame is unavailable for this file"),
+                "{path}"
+            );
+
+            app.browse_state.as_mut().unwrap().status = None;
+            app.toggle_browse_blame();
+            let state = app.browse_state.as_ref().unwrap();
+            assert!(matches!(state.blame, BlameState::Off), "{path}");
+            assert!(state.blame_receiver.is_none(), "{path}");
+            assert_eq!(
+                state.status.as_deref(),
+                Some("Blame is unavailable for this file"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_blame_toggle_explains_missing_and_still_loading_files() {
+        let mut no_open_app = App::new_for_test();
+        no_open_app.browse_state =
+            Some(BrowseState::new(PathBuf::from("/repo"), AppState::FileList));
+
+        no_open_app.toggle_browse_blame();
+
+        let state = no_open_app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.blame, BlameState::Off));
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Blame is unavailable for this file")
+        );
+
+        let mut app = App::new_for_test();
+        app.browse_state = Some(state_with_pending_load("slow.rs"));
+
+        app.toggle_browse_blame();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.blame, BlameState::Off));
+        assert_eq!(state.status.as_deref(), Some("Still opening this file"));
+    }
+
+    #[tokio::test]
+    async fn test_untracked_and_no_commit_blame_errors_enter_failed_with_user_message() {
+        for (name, initialize_with_commit, expected) in [
+            (
+                "untracked",
+                true,
+                BlameError::NotTracked {
+                    path: "new.rs".to_string(),
+                },
+            ),
+            ("no-commits", false, BlameError::NoCommitsYet),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if !run_git_fixture(name, dir.path(), &["init"]) {
+                return;
+            }
+            if initialize_with_commit {
+                std::fs::write(dir.path().join("baseline.txt"), "baseline\n").unwrap();
+                assert!(run_git_fixture(name, dir.path(), &["add", "baseline.txt"]));
+                assert!(run_git_fixture(
+                    name,
+                    dir.path(),
+                    &["commit", "-m", "baseline"]
+                ));
+            }
+            std::fs::write(dir.path().join("new.rs"), "fn new_work() {}\n").unwrap();
+
+            let mut app = App::new_for_test();
+            app.browse_state = Some(BrowseState::new(
+                dir.path().to_path_buf(),
+                AppState::FileList,
+            ));
+            app.browse_open_path("new.rs", 0);
+            settle_browse(&mut app).await;
+            app.toggle_browse_blame();
+            settle_blame(&mut app).await;
+
+            let state = app.browse_state.as_ref().unwrap();
+            assert!(matches!(state.blame, BlameState::Failed), "{name}");
+            assert_eq!(state.status.as_deref(), Some(expected.to_string().as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_tracked_file_produces_an_empty_ready_gutter() {
+        let dir = tempfile::tempdir().unwrap();
+        if !run_git_fixture("empty-blame", dir.path(), &["init"]) {
+            return;
+        }
+        std::fs::write(dir.path().join("empty.rs"), "").unwrap();
+        assert!(run_git_fixture(
+            "empty-blame",
+            dir.path(),
+            &["add", "empty.rs"]
+        ));
+        assert!(run_git_fixture(
+            "empty-blame",
+            dir.path(),
+            &["commit", "-m", "empty"]
+        ));
+
+        let mut app = App::new_for_test();
+        app.browse_state = Some(BrowseState::new(
+            dir.path().to_path_buf(),
+            AppState::FileList,
+        ));
+        app.browse_open_path("empty.rs", 0);
+        settle_browse(&mut app).await;
+        app.toggle_browse_blame();
+        settle_blame(&mut app).await;
+
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().blame,
+            BlameState::Ready { ref gutter, .. } if gutter.is_empty()
+        ));
     }
 
     fn plain_cache(source: &str) -> DiffCache {

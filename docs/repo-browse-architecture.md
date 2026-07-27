@@ -27,7 +27,7 @@ wc -l src/app/browse.rs src/symbols.rs src/ui/browse.rs src/app/input_browse.rs
 - `src/app/mod.rs` — `browse` / `input_browse` のモジュール宣言、`browse_state: Option<BrowseState>` フィールド、`poll_browse_updates()` を polling ループへ
 - `src/app/input.rs` — dispatch 2 アーム、file list に `b` の分岐
 - `src/ui/mod.rs` — モジュール宣言と dispatch 1 行
-- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search`
+- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `toggle_blame`
 - `src/main.rs` — `--browse` フラグ
 - `src/ui/help.rs` — ヘルプ項目
 - `src/app/cockpit.rs` / `src/ui/cockpit.rs` — ブラウザを開く Cockpit メニュー項目
@@ -85,6 +85,10 @@ index:     IndexState
 open_load: OpenLoad
            Idle → Pending { path, line, scroll, cancel } → Idle | Failed { path, message }
 
+blame:     BlameState
+           Off → Waiting { path } → Loading { path, cancel }
+               → Ready { path, gutter } | Failed
+
 overlay:   BrowseOverlay
            None | Outline { selected } | SymbolSearch { query, selected }
 
@@ -116,6 +120,11 @@ placeholder なので、それを見て「シンボルがない」「定義が�
 
 `OpenLoad` はファイルを開く途中の唯一の権威で、「読み込み中か」「どの path の結果を
 待っているか」「どこへカーソルを置くか」を 1 箇所に持つ。
+
+`BlameState` も同じ原則で、表示の有無・取得中・準備完了・失敗を 1 つの列挙型に持つ。
+`Waiting` は blame 表示中に別ファイルを開き、そのファイルが viewable か判明するまでの
+状態である。失敗理由は `IndexState::Failed` と同様にバリアントへ持たせず、フッタ用の
+`BrowseState::status` へ入れる。
 
 ## 3. データフロー
 
@@ -178,6 +187,31 @@ browse_open_path(path, line)
                                ← パスが一致するときだけ差し替え
 ```
 
+blame gutter を有効にするとき:
+
+```
+toggle_browse_blame() (`gb`)
+   │
+   ├─ 先行リクエストの cancel token を cancel、blame_receiver を破棄
+   ├─ BlameState::Waiting { path }
+   │
+   └─ viewable な OpenFile だけ BlameState::Loading { path, cancel }
+          └ spawn_blocking: crate::github::blame_file()
+                    │
+              deliver_blame_load()  ← cancel 済みなら送らない
+                    │ blame_receiver
+                    ▼
+            poll_browse_updates()
+               ├ path 不一致 → receiver を残して待機を継続
+               ├ Err → BlameState::Failed + status
+               └ Ok  → 行ごとの表示文字列を 1 回だけ準備
+                        → BlameState::Ready { path, gutter }
+```
+
+blame 表示中に別ファイルを開くと、古い取得を cancel して `Waiting` へ移る。ファイル読み込み
+完了後に `OpenFile::viewable` を検査してから取得を始めるため、バイナリ・上限超過ファイルへ
+`git blame` を起動しない。取得結果と現在の open path が違う場合も poll 側で捨てる。
+
 `build_plain_diff_cache()` は `expand_tabs` → `classify_line` → 文字列 interning の 1 パス
 だけで、`ParserPool` を受け取らない。ハイライトを待たずにファイルを表示できるのはこのため
 で、`build_diff_cache()` による差し替えは後追いで届く。
@@ -214,8 +248,8 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 
 同じ手が既に `build_pr_description_patch()` で使われていたので、それに倣った形。
 
-チャネルは 4 本（`paths_receiver` / `index_receiver` / `file_receiver` /
-`highlight_receiver`）とも `poll_browse_updates()` で `try_recv()` する。描画ループを
+`paths_receiver` / `index_receiver` / `file_receiver` / `highlight_receiver` /
+`blame_receiver` はすべて `poll_browse_updates()` で `try_recv()` する。描画ループを
 ブロックしない。
 
 ## 4. キー処理の階層
@@ -226,7 +260,7 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 1. オーバーレイ（Outline / SymbolSearch）  ← モーダル。開いていれば全部ここで消費
 2. フィルタ入力バー（ツリーのみ）           ← 開いていれば文字入力を全部消費
 3. 両ペイン共通（s / ? / Z / Ctrl-o）
-4. シーケンス（ツリー: Space / と gg ／ ファイル: gd, gf, gg）
+4. シーケンス（ツリー: Space / と gg ／ ファイル: gb, gd, gf, gg）
 5. 単一キー
 ```
 
@@ -240,7 +274,8 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 
 ## 5. キーバインド登録の注意
 
-`KeybindingsConfig::validate()` は単一キーの重複を検出して**起動時にエラーにする**。
+`KeybindingsConfig::validate()` は単一キーの重複を検出するが、loader は stderr へ
+`Warning:` を出して起動を続ける。
 新しい既定キーは既存と衝突しやすい:
 
 - `b` … `rally_background` と衝突
@@ -248,12 +283,19 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 - `s` … `suggestion` / `git_ops_stage_all` と衝突
 
 3 つとも `is_context_compatible()` の `SCREEN_SPECIFIC_KEYS` に登録して回避している
-（「その画面でしか生きないキー」の扱い）。キーを足すときは以下 4 箇所を全部触る:
+（「その画面でしか生きないキー」の扱い）。キーを足すときは以下を全部触る:
 
 1. `KeybindingsConfig` のフィールド
 2. `Default` 実装
 3. `validate()` の `bindings` 配列
-4. `Serialize` 実装の `serialize_entry`
+4. `SCREEN_SPECIFIC_KEYS`（単一キーが本当に特定画面だけで有効な場合）
+5. `Serialize` 実装の `serialize_entry`
+
+blame gutter は file pane の既存シーケンス層へ `toggle_blame = ["g", "b"]` として登録する。
+`gg` / `gd` / `gf` と同じ prefix を共有するが、2 キー目が重ならない。
+`validate()` はシーケンスの先頭キーだけを `sequence_prefixes` に入れるため、
+`toggle_blame` を `SCREEN_SPECIFIC_KEYS` に登録してはいけない。登録すると `g` prefix
+全体との単一キー衝突が context compatible として抑制される。
 
 ## 6. 描画
 
@@ -265,6 +307,11 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
   桁数に合わせて広げる。100,000 行のファイルでは 6 桁になり、上限を 999,999 行より先へ
   引き上げても自動で再び広がる。カーソル行は gutter を黄色にし、`diff.bg_color` が
   有効なら行背景も付ける
+- `BlameState::Ready` では blame gutter を行番号の左へ置く。取得結果の到着時に commit
+  ごとの full（sha + author + relative time）／time なし／identity の文字列を表示幅で
+  切り詰めて準備し、同一 commit の連続行は空欄にする。描画時は準備済み `&str` を参照する
+  だけで、狭くなる順に full → time なし → identity → 非表示へ落とす。未コミット行は
+  zero SHA と epoch 0 を出さず `Uncommitted` と表示する
 - 擬似 patch 由来の `LineType::Header` 行（`@@ ... @@`）は描画前に除外する。
   `content_window()` はヘッダが前置プレフィックスであることを使って連続スライスを
   借りるだけなので、走査量はビューポート幅で決まる。**ファイルの N 行目はキャッシュの
@@ -484,5 +531,6 @@ cargo test --lib <test_name> 2>&1 | sed -n '/Snapshot Summary/,/insta review/p'
   `matches_single_key` の分岐を足す。`self` の借用と `browse_state` の可変借用が
   衝突するので、**判定を先に bool へ落としてから state を取る**のが定石
   （既存コードがその形になっている）
-- **blame などの行アノテーション**: `OpenFile` にサイドカーの `Vec<...>` を持たせ、
-  `render_content` の gutter を拡張するのが素直。
+- **行アノテーションの追加**: blame と同様、取得 lifecycle は `BrowseState` の列挙型、
+  描画データは結果到着時に作るサイドカーとして持たせ、`render_content` の per-frame
+  経路では借用だけにする。

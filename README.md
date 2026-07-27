@@ -1018,6 +1018,7 @@ go_to_definition = ["g", "d"]
 | `repo_browse` | `b` | Open the Repository Browser |
 | `symbol_outline` | `o` | File outline (browser only) |
 | `symbol_search` | `s` | Repository symbol search (browser only) |
+| `toggle_blame` | `gb` | Toggle blame gutter (browser file pane only) |
 | `toggle_zen_mode` | `Z` | Toggle zen mode (fullscreen diff) |
 | **Git Ops** |||
 | `git_ops_stage` | `Space` | Stage/unstage file or directory |

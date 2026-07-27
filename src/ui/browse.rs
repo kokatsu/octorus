@@ -13,7 +13,10 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::browse::{BrowseOverlay, BrowseState};
+use crate::app::browse::{
+    BlameCoverage, BlameGutter, BlameGutterWidth, BlameState, BrowseOverlay, BrowseState,
+    BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
+};
 use crate::app::{App, AppState, CachedDiffLine, DiffCache, LoadState, TreeRow};
 use crate::diff::LineType;
 use crate::symbols::Symbol;
@@ -23,6 +26,7 @@ use crate::symbols::Symbol;
 /// Five columns hold every line number up to 99,999. Beyond that the gutter
 /// grows rather than overflowing — see [`gutter_width`].
 const LINE_NUMBER_WIDTH: usize = 5;
+const MIN_CODE_WIDTH_WITH_BLAME: usize = 24;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let zen = app.zen_mode;
@@ -272,7 +276,15 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
     let window = content_window(&open.cache, state.scroll_offset, inner_height);
     let total = window.total;
-    let lines = content_lines(&window, state.cursor_line, bg_color);
+    let blame = match state.blame {
+        BlameState::Ready {
+            ref path,
+            ref gutter,
+        } if path == &open.path => Some(gutter),
+        _ => None,
+    };
+    let content_width = area.width.saturating_sub(2) as usize;
+    let lines = content_lines(&window, state.cursor_line, bg_color, blame, content_width);
 
     let building = matches!(state.index, crate::app::browse::IndexState::Building);
     let title = if open.cache.highlighted || !building {
@@ -371,8 +383,11 @@ fn content_lines<'a>(
     window: &ContentWindow<'a>,
     cursor_line: usize,
     bg_color: bool,
+    blame: Option<&'a BlameGutter>,
+    content_width: usize,
 ) -> Vec<Line<'a>> {
     let width = gutter_width(window.total);
+    let blame_width = blame_gutter_width(content_width, window.total);
     window
         .lines
         .iter()
@@ -381,7 +396,13 @@ fn content_lines<'a>(
             let line_index = window.first_line + offset;
             let is_cursor = line_index == cursor_line;
 
-            let mut spans = Vec::with_capacity(cached.spans.len() + 1);
+            let mut spans = Vec::with_capacity(cached.spans.len() + 2);
+            if let (Some(gutter), Some(blame_width)) = (blame, blame_width) {
+                spans.push(Span::styled(
+                    gutter.text(line_index, blame_width),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             spans.push(Span::styled(
                 format!("{:>width$} ", line_index + 1),
                 Style::default().fg(if is_cursor {
@@ -410,30 +431,67 @@ fn content_lines<'a>(
         .collect()
 }
 
+fn blame_gutter_width(content_width: usize, total: usize) -> Option<BlameGutterWidth> {
+    let available =
+        content_width.saturating_sub(gutter_width(total) + 1 + MIN_CODE_WIDTH_WITH_BLAME);
+    if available >= BLAME_FULL_WIDTH {
+        Some(BlameGutterWidth::Full)
+    } else if available >= BLAME_AUTHOR_WIDTH {
+        Some(BlameGutterWidth::Author)
+    } else if available >= BLAME_IDENTITY_WIDTH {
+        Some(BlameGutterWidth::Identity)
+    } else {
+        None
+    }
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let kb = &app.config.keybindings;
-    let status = app
-        .browse_state
-        .as_ref()
-        .and_then(|state| state.status.clone());
+    let state = app.browse_state.as_ref();
+    let status = state.and_then(|state| state.status.as_deref());
+    let coverage = if app.state == AppState::RepoBrowseFile {
+        state.and_then(|state| match (&state.open, &state.blame) {
+            (Some(open), BlameState::Ready { path, gutter }) if open.path == *path => {
+                Some(gutter.coverage())
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
 
-    let text = match status {
-        Some(message) => message,
-        None if app.state == AppState::RepoBrowseTree => format!(
+    let text: std::borrow::Cow<'_, str> = match status {
+        Some(message) => std::borrow::Cow::Borrowed(message),
+        None if app.state == AppState::RepoBrowseTree => std::borrow::Cow::Owned(format!(
             " {} open | {} filter | {} symbol search | {} back",
             kb.open_panel.display(),
             kb.filter.display(),
             kb.symbol_search.display(),
             kb.quit.display(),
-        ),
-        None => format!(
-            " {} outline | {} symbol search | {} definition | {} editor | {} back",
-            kb.symbol_outline.display(),
-            kb.symbol_search.display(),
-            kb.go_to_definition.display(),
-            kb.go_to_file.display(),
-            kb.quit.display(),
-        ),
+        )),
+        None => match coverage {
+            Some(
+                BlameCoverage::ShorterThanBuffer {
+                    blame_lines,
+                    buffer_lines,
+                }
+                | BlameCoverage::LongerThanBuffer {
+                    blame_lines,
+                    buffer_lines,
+                },
+            ) => std::borrow::Cow::Owned(format!(
+                " blame covers {blame_lines} lines, this file shows {buffer_lines} — reopen the file to refresh"
+            )),
+            Some(BlameCoverage::Exact) | None => std::borrow::Cow::Owned(format!(
+                " {} outline | {} symbol search | {} blame | {} definition | {} editor | {} back",
+                kb.symbol_outline.display(),
+                kb.symbol_search.display(),
+                kb.toggle_blame.display(),
+                kb.go_to_definition.display(),
+                kb.go_to_file.display(),
+                kb.quit.display(),
+            )),
+        },
     };
 
     frame.render_widget(
@@ -640,6 +698,7 @@ mod tests {
     };
     use crate::config::Config;
     use crate::filter::ListFilter;
+    use crate::github::parse_porcelain;
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use insta::assert_snapshot;
@@ -710,6 +769,14 @@ mod tests {
         });
     }
 
+    fn attach_blame(state: &mut BrowseState, path: &str, porcelain: &str) {
+        let buffer_lines = state.open.as_ref().map_or(0, OpenFile::line_count);
+        state.blame = BlameState::Ready {
+            path: path.to_string(),
+            gutter: BlameGutter::from_file(parse_porcelain(porcelain), buffer_lines),
+        };
+    }
+
     #[test]
     fn test_render_tree_while_listing() {
         let mut app = App::new_for_test();
@@ -767,8 +834,37 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gd definition | gf editor | q/Esc back
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
         "#);
+    }
+
+    #[test]
+    fn test_file_pane_footer_includes_blame_within_the_eighty_column_budget() {
+        let mut app = app_with_browse(&["src/app.rs"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "src/app.rs", "fn main() {}\n");
+        }
+        app.state = AppState::RepoBrowseFile;
+
+        let footer_at = |app: &mut App, width| {
+            render_at(app, width, 8)
+                .lines()
+                .last()
+                .unwrap()
+                .trim_end()
+                .to_string()
+        };
+        assert_snapshot!(
+            format!(
+                "80: {}\n60: {}",
+                footer_at(&mut app, 80),
+                footer_at(&mut app, 60)
+            ),
+            @"
+        80:  o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+        60:  o outline | s symbol search | gb blame | gd definition | gf
+        "
+        );
     }
 
     #[test]
@@ -779,7 +875,7 @@ mod tests {
         }
         app.state = AppState::RepoBrowseFile;
 
-        assert_snapshot!(render_at(&mut app, 80, 12), @r"
+        assert_snapshot!(render_at(&mut app, 80, 12), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                                       │
         └──────────────────────────────────────────────────────────────────────────────┘
@@ -791,7 +887,206 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gd definition | gf editor | q/Esc back
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+        ");
+    }
+
+    #[test]
+    fn test_blame_gutter_degrades_full_then_no_time_then_identity_then_hidden() {
+        let timestamp = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp();
+        let porcelain = format!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice Example\n\
+             author-time {timestamp}\n\
+             summary baseline\n\
+             \tfn main() {{}}\n"
+        );
+        let mut renders = Vec::new();
+        for (label, width) in [
+            ("full", 120),
+            ("no time", 90),
+            ("identity", 70),
+            ("hidden", 50),
+        ] {
+            let mut app = app_with_browse(&["main.rs"]);
+            if let Some(state) = app.browse_state.as_mut() {
+                open_file(state, "main.rs", "fn main() {}\n");
+                attach_blame(state, "main.rs", &porcelain);
+            }
+            app.state = AppState::RepoBrowseFile;
+            renders.push(format!(
+                "--- {label} ({width}) ---\n{}",
+                render_at(&mut app, width, 8)
+            ));
+        }
+
+        assert_snapshot!(renders.join("\n"), @"
+        --- full (120) ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                                               │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files───────────────────────────────────┐┌main.rs (1/1)───────────────────────────────────────────────────────────────┐
+        │  main.rs                               ││aaaaaaa Alice Example 2h ago        1 fn main() {}                          │
+        │                                        ││                                                                            │
+        └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+        --- no time (90) ---
+        ┌────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                 │
+        └────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────────────────────┐┌main.rs (1/1)───────────────────────────────────────────┐
+        │  main.rs                     ││aaaaaaa Alice Example      1 fn main() {}               │
+        │                              ││                                                        │
+        └──────────────────────────────┘└────────────────────────────────────────────────────────┘
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+        --- identity (70) ---
+        ┌────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                             │
+        └────────────────────────────────────────────────────────────────────┘
+        ┌Files──────────────────┐┌main.rs (1/1)──────────────────────────────┐
+        │  main.rs              ││aaaaaaa         1 fn main() {}             │
+        │                       ││                                           │
+        └───────────────────────┘└───────────────────────────────────────────┘
+         o outline | s symbol search | gb blame | gd definition | gf editor |
+        --- hidden (50) ---
+        ┌────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -         │
+        └────────────────────────────────────────────────┘
+        ┌Files───────────┐┌main.rs (1/1)─────────────────┐
+        │  main.rs       ││    1 fn main() {}            │
+        │                ││                              │
+        └────────────────┘└──────────────────────────────┘
+         o outline | s symbol search | gb blame | gd defin
+        ");
+    }
+
+    #[test]
+    fn test_blame_gutter_handles_cjk_repeats_and_uncommitted_lines_honestly() {
+        let timestamp = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp();
+        let porcelain = format!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author 山田太郎 Long Name\n\
+             author-time {timestamp}\n\
+             summary baseline\n\
+             \tfirst\n\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2 1\n\
+             \tsecond\n\
+             0000000000000000000000000000000000000000 3 3 1\n\
+             author Not Committed Yet\n\
+             author-time 0\n\
+             summary working tree\n\
+             \tthird\n"
+        );
+        let mut app = app_with_browse(&["main.rs"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "main.rs", "first\nsecond\nthird\n");
+            attach_blame(state, "main.rs", &porcelain);
+        }
+        app.state = AppState::RepoBrowseFile;
+
+        assert_snapshot!(render_at(&mut app, 120, 10), @"
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                                               │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files───────────────────────────────────┐┌main.rs (1/3)───────────────────────────────────────────────────────────────┐
+        │  main.rs                               ││aaaaaaa 山 田 太 郎  Long N… 2h ago     1 first                                 │
+        │                                        ││                                    2 second                                │
+        │                                        ││Uncommitted                         3 third                                 │
+        │                                        ││                                                                            │
+        └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
+        ");
+    }
+
+    #[test]
+    fn test_blame_and_buffer_line_count_mismatches_keep_source_alignment() {
+        let timestamp = (chrono::Utc::now() - chrono::Duration::days(2)).timestamp();
+        let short_porcelain = format!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time {timestamp}\n\
+             summary first\n\
+             \tone\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2 2 1\n\
+             author Bob\n\
+             author-time {timestamp}\n\
+             summary second\n\
+             \ttwo\n"
+        );
+        let long_porcelain = format!(
+            "{short_porcelain}\
+             cccccccccccccccccccccccccccccccccccccccc 3 3 1\n\
+             author Carol\n\
+             author-time {timestamp}\n\
+             summary ignored\n\
+             \textra\n"
+        );
+
+        let mut short_blame = app_with_browse(&["short.rs"]);
+        if let Some(state) = short_blame.browse_state.as_mut() {
+            open_file(state, "short.rs", "one\ntwo\nthree\nfour\n");
+            attach_blame(state, "short.rs", &short_porcelain);
+        }
+        short_blame.state = AppState::RepoBrowseFile;
+
+        let mut long_blame = app_with_browse(&["long.rs"]);
+        if let Some(state) = long_blame.browse_state.as_mut() {
+            open_file(state, "long.rs", "one\ntwo\n");
+            attach_blame(state, "long.rs", &long_porcelain);
+        }
+        long_blame.state = AppState::RepoBrowseFile;
+
+        assert_snapshot!(
+            format!(
+                "--- blame shorter than buffer ---\n{}\n--- blame longer than buffer ---\n{}",
+                render_at(&mut short_blame, 120, 11),
+                render_at(&mut long_blame, 120, 9)
+            ),
+            @"
+        --- blame shorter than buffer ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                                               │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files───────────────────────────────────┐┌short.rs (1/4)──────────────────────────────────────────────────────────────┐
+        │  short.rs                              ││aaaaaaa Alice 2d ago                1 one                                   │
+        │                                        ││bbbbbbb Bob 2d ago                  2 two                                   │
+        │                                        ││[not blamed]                        3 three                                 │
+        │                                        ││[not blamed]                        4 four                                  │
+        │                                        ││                                                                            │
+        └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+         blame covers 2 lines, this file shows 4 — reopen the file to refresh
+        --- blame longer than buffer ---
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                                               │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files───────────────────────────────────┐┌long.rs (1/2)───────────────────────────────────────────────────────────────┐
+        │  long.rs                               ││aaaaaaa Alice 2d ago                1 one                                   │
+        │                                        ││bbbbbbb Bob 2d ago                  2 two                                   │
+        │                                        ││                                                                            │
+        └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+         blame covers 3 lines, this file shows 2 — reopen the file to refresh
+        "
+        );
+    }
+
+    #[test]
+    fn test_empty_file_with_ready_blame_renders_without_rows_or_panics() {
+        let mut app = app_with_browse(&["empty.rs"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "empty.rs", "");
+            attach_blame(state, "empty.rs", "");
+        }
+        app.state = AppState::RepoBrowseFile;
+
+        assert_snapshot!(render_at(&mut app, 80, 8), @"
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                       │
+        └──────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────────────────┐┌empty.rs (1/1)────────────────────────────────────┐
+        │  empty.rs                ││                                                  │
+        │                          ││                                                  │
+        └──────────────────────────┘└──────────────────────────────────────────────────┘
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
         ");
     }
 
@@ -806,7 +1101,7 @@ mod tests {
         }
         app.state = AppState::RepoBrowseFile;
 
-        assert_snapshot!(render_at(&mut app, 80, 10), @r"
+        assert_snapshot!(render_at(&mut app, 80, 10), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                                       │
         └──────────────────────────────────────────────────────────────────────────────┘
@@ -816,7 +1111,7 @@ mod tests {
         │                          ││   28 line 28                                     ║
         │                          ││   29 line 29                                     █
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s symbol search | gd definition | gf editor | q/Esc back
+         o outline | s symbol search | gb blame | gd definition | gf editor | q/Esc back
         ");
     }
 
@@ -867,7 +1162,7 @@ mod tests {
         assert_eq!(window.total, 30);
         assert_eq!(window.lines.len(), 30);
 
-        let lines = content_lines(&window, 0, false);
+        let lines = content_lines(&window, 0, false, None, usize::MAX);
         let content_of = |line: &Line| -> String {
             line.spans[1..]
                 .iter()
@@ -902,7 +1197,7 @@ mod tests {
         let cache = cache_of("fn main() {\n    println!(\"hi\");\n}\n");
         let window = content_window(&cache, 0, 3);
 
-        let lines = content_lines(&window, 0, true);
+        let lines = content_lines(&window, 0, true, None, usize::MAX);
 
         assert_eq!(lines.len(), 3);
         for line in &lines {
@@ -930,6 +1225,38 @@ mod tests {
         assert_eq!(lines[0].spans[0].content.as_ref(), "    1 ");
         assert_eq!(content_of(&lines[0]), "fn main() {");
         assert_eq!(content_of(&lines[2]), "}");
+
+        let blame = BlameGutter::from_file(
+            parse_porcelain(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 3\n\
+                 author Alice\n\
+                 author-time 1700000000\n\
+                 summary baseline\n\
+                 \tfn main() {\n\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n\
+                 \t    println!(\"hi\");\n\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 3 3\n\
+                 \t}\n",
+            ),
+            3,
+        );
+        let lines = content_lines(&window, 0, true, Some(&blame), 120);
+        for line in &lines {
+            assert!(
+                matches!(line.spans[0].content, Cow::Borrowed(_)),
+                "prepared blame text was allocated during rendering"
+            );
+            assert!(
+                matches!(line.spans[1].content, Cow::Owned(_)),
+                "the line number remains the only generated span"
+            );
+            for span in &line.spans[2..] {
+                assert!(
+                    matches!(span.content, Cow::Borrowed(_)),
+                    "source text was copied while rendering blame"
+                );
+            }
+        }
     }
 
     /// The gutter is the one part of a browse row the renderer writes itself, so
@@ -959,7 +1286,7 @@ mod tests {
             let cache = cache_of(&numbered_source(total));
             let window = content_window(&cache, total - 3, 3);
             assert_eq!(window.total, total);
-            content_lines(&window, total - 1, false)
+            content_lines(&window, total - 1, false, None, usize::MAX)
                 .iter()
                 .map(|line| line.spans[0].content.chars().count())
                 .collect()

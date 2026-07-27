@@ -1017,6 +1017,10 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             fmt_key(&kb.symbol_search.display(), key_width)
         )),
         Line::from(format!(
+            "{}  Toggle blame gutter",
+            fmt_key(&kb.toggle_blame.display(), key_width)
+        )),
+        Line::from(format!(
             "{}  Go to definition (tree-sitter index)",
             fmt_key(&kb.go_to_definition.display(), key_width)
         )),
@@ -1496,6 +1500,19 @@ mod tests {
         for key in ["Ctrl-A", "Ctrl-E", "Ctrl-W", "Ctrl-K", "Ctrl-U"] {
             assert!(joined.contains(key), "help missing binding: {key}");
         }
+    }
+
+    #[test]
+    fn test_build_help_lines_lists_blame_toggle_binding() {
+        let lines = build_help_lines(&KeybindingsConfig::default());
+        let joined = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("gb"));
+        assert!(joined.contains("Toggle blame gutter"));
     }
 
     #[test]

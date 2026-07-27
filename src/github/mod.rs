@@ -69,3 +69,7 @@ pub use pr::{
     CheckItem, CiStatus, Label, PrListPage, PrStateFilter, PullRequest, PullRequestSummary,
     StatusCheckRollupItem, User,
 };
+
+pub(crate) fn format_relative_time_from_epoch(epoch_seconds: i64) -> String {
+    commit::format_relative_time_from_epoch(epoch_seconds)
+}
