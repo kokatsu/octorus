@@ -12,14 +12,17 @@ use std::io::Stdout;
 use crate::filter::ListFilter;
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
-use super::browse::{BrowseCommitDiffState, BrowseOverlay, IndexState};
-use super::{App, AppState};
+use super::browse::{BrowseCommitDiffState, BrowseOverlay, IndexState, PrLookupState};
+use super::{App, AppState, PrOpenSource};
 
 /// Rows moved by a page key when the real viewport height is unknown.
 const PAGE_STEP: usize = 15;
 
 impl App {
     pub(crate) fn handle_repo_browse_tree_input(&mut self, key: event::KeyEvent) -> Result<()> {
+        if self.handle_pr_lookup_selection_input(&key) {
+            return Ok(());
+        }
         if self.handle_browse_overlay_input(key) {
             return Ok(());
         }
@@ -95,6 +98,9 @@ impl App {
         key: event::KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
+        if self.handle_pr_lookup_selection_input(&key) {
+            return Ok(());
+        }
         if self.handle_browse_overlay_input(key) {
             return Ok(());
         }
@@ -106,6 +112,10 @@ impl App {
         let kb = self.config.keybindings.clone();
         if self.matches_single_key(&key, &kb.open_blame_commit) {
             self.open_browse_blame_commit();
+            return Ok(());
+        }
+        if self.matches_single_key(&key, &kb.open_blame_pr) {
+            self.open_browse_blame_pr();
             return Ok(());
         }
         if self.handle_browse_shared_input(&key) {
@@ -154,6 +164,48 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn handle_pr_lookup_selection_input(&mut self, key: &event::KeyEvent) -> bool {
+        let selecting = self
+            .browse_state
+            .as_ref()
+            .is_some_and(|state| matches!(state.pr_lookup, PrLookupState::Selecting { .. }));
+        if !selecting {
+            return false;
+        }
+
+        let kb = self.config.keybindings.clone();
+        let close = key.code == KeyCode::Esc || self.matches_single_key(key, &kb.quit);
+        let down = self.matches_single_key(key, &kb.move_down);
+        let up = self.matches_single_key(key, &kb.move_up);
+        let confirm = self.matches_single_key(key, &kb.open_panel);
+        let mut selected_pull = None;
+
+        if let Some(state) = self.browse_state.as_mut() {
+            let PrLookupState::Selecting {
+                sha,
+                pulls,
+                selected,
+            } = &mut state.pr_lookup
+            else {
+                return false;
+            };
+            if close {
+                state.pr_lookup = PrLookupState::Idle;
+            } else if down {
+                *selected = (*selected + 1).min(pulls.len().saturating_sub(1));
+            } else if up {
+                *selected = selected.saturating_sub(1);
+            } else if confirm {
+                selected_pull = pulls.get(*selected).map(|pull| (pull.number, sha.clone()));
+            }
+        }
+
+        if let Some((number, sha)) = selected_pull {
+            self.open_pr_from_browse(number, PrOpenSource::ConfirmedCommit { sha });
+        }
+        true
     }
 
     /// Resolve tree-pane sequences (`Space /` filter, `gg` jump to first).
@@ -227,7 +279,9 @@ impl App {
         false
     }
 
-    /// Resolve `gg` / `gb` / `gd` / `gf`. Returns `true` when the key was consumed.
+    /// Resolve `gg` / `gb` / `gc` / `gp` / `gd` / `gf`.
+    ///
+    /// Returns `true` when the key was consumed.
     fn handle_browse_sequence_input(
         &mut self,
         key: &event::KeyEvent,
@@ -251,6 +305,11 @@ impl App {
             if self.try_match_sequence(&kb.open_blame_commit) == SequenceMatch::Full {
                 self.clear_pending_keys();
                 self.open_browse_blame_commit();
+                return Ok(true);
+            }
+            if self.try_match_sequence(&kb.open_blame_pr) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                self.open_browse_blame_pr();
                 return Ok(true);
             }
             if self.try_match_sequence(&kb.go_to_definition) == SequenceMatch::Full {
@@ -277,6 +336,7 @@ impl App {
 
         let starts_sequence = self.key_could_match_sequence(key, &kb.toggle_blame)
             || self.key_could_match_sequence(key, &kb.open_blame_commit)
+            || self.key_could_match_sequence(key, &kb.open_blame_pr)
             || self.key_could_match_sequence(key, &kb.go_to_definition)
             || self.key_could_match_sequence(key, &kb.go_to_file)
             || self.key_could_match_sequence(key, &kb.jump_to_first);
@@ -676,10 +736,13 @@ impl super::browse::BrowseState {
 mod tests {
     use super::*;
     use crate::app::browse::{
-        build_file_patch, BlameGutter, BlameState, BrowseState, OpenFile, OpenLoad,
+        build_file_patch, BlameGutter, BlameState, BrowseState, OpenFile, OpenLoad, PrLookupState,
     };
+    use crate::app::{PrOpenSource, RepositoryAvailability};
     use crate::diff_store::{DiffScrollState, ScrollMode};
-    use crate::github::parse_porcelain;
+    use crate::github::{
+        parse_porcelain, CommitPrResolution, CommitPullRequest, CommitPullRequestState,
+    };
     use crate::keybinding::{KeyBinding, KeySequence};
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
@@ -1170,6 +1233,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_scenario_custom_single_key_runs_blame_pr_lookup_without_waiting_for_a_prefix() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary pushed directly\n\
+             \tone\n";
+        let mut app = browsing_app(&["a.rs"]);
+        app.set_repository_availability(RepositoryAvailability::Available);
+        attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut app, "a.rs", COMMITTED);
+        app.state = AppState::RepoBrowseFile;
+        app.config.keybindings.open_blame_pr = KeySequence::single(KeyBinding::char('x'));
+        app.session_cache
+            .put_commit_pr_resolution(SHA.to_string(), CommitPrResolution::NotFound);
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('x')), &mut test_terminal())
+            .unwrap();
+
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("No pull request found for commit aaaaaaa")
+        );
+    }
+
+    #[test]
+    fn test_scenario_default_gp_sequence_runs_blame_pr_lookup() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary pushed directly\n\
+             \tone\n";
+        let mut app = browsing_app(&["a.rs"]);
+        app.set_repository_availability(RepositoryAvailability::Available);
+        attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut app, "a.rs", COMMITTED);
+        app.state = AppState::RepoBrowseFile;
+        app.session_cache
+            .put_commit_pr_resolution(SHA.to_string(), CommitPrResolution::NotFound);
+        let mut terminal = test_terminal();
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('g')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('p')), &mut terminal)
+            .unwrap();
+
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("No pull request found for commit aaaaaaa")
+        );
+    }
+
     #[tokio::test]
     async fn test_scenario_pressing_open_blame_commit_twice_cancels_and_returns_without_respawn() {
         const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
@@ -1198,6 +1315,101 @@ mod tests {
         assert!(state.commit_diff_receiver.is_none());
         assert!(state.jump_stack.is_empty());
         assert_eq!(app.state, AppState::RepoBrowseFile);
+    }
+
+    #[tokio::test]
+    async fn test_scenario_multiple_commit_pull_requests_require_selection_before_opening() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let mut app = browsing_app(&["a.rs"]);
+        app.set_repository_availability(RepositoryAvailability::Available);
+        attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+        attach_blame(&mut app, "a.rs", COMMITTED);
+        app.state = AppState::RepoBrowseFile;
+        app.session_cache.put_commit_pr_resolution(
+            SHA.to_string(),
+            CommitPrResolution::Confirmed {
+                pulls: vec![
+                    CommitPullRequest {
+                        number: 10,
+                        title: "still open".to_string(),
+                        state: CommitPullRequestState::Open,
+                    },
+                    CommitPullRequest {
+                        number: 20,
+                        title: "already merged".to_string(),
+                        state: CommitPullRequestState::Merged,
+                    },
+                ],
+            },
+        );
+
+        app.open_browse_blame_pr();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().pr_lookup,
+            PrLookupState::Selecting {
+                selected: 0,
+                ref pulls,
+                ..
+            } if pulls.len() == 2
+        ));
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut terminal)
+            .unwrap();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().pr_lookup,
+            PrLookupState::Selecting { selected: 1, .. }
+        ));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut terminal)
+            .unwrap();
+
+        assert_eq!(app.state, AppState::FileList);
+        assert_eq!(app.pr_number, Some(20));
+        assert!(app.browse_state.is_none());
+        assert_eq!(
+            app.pr_open_source,
+            PrOpenSource::ConfirmedCommit {
+                sha: SHA.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_scenario_escape_closes_pull_request_selection_without_opening_a_pr() {
+        let mut app = browsing_app(&["a.rs"]);
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().pr_lookup = PrLookupState::Selecting {
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            pulls: vec![
+                CommitPullRequest {
+                    number: 10,
+                    title: "one".to_string(),
+                    state: CommitPullRequestState::Open,
+                },
+                CommitPullRequest {
+                    number: 20,
+                    title: "two".to_string(),
+                    state: CommitPullRequestState::Closed,
+                },
+            ],
+            selected: 0,
+        };
+
+        app.handle_repo_browse_file_input(press(KeyCode::Esc), &mut test_terminal())
+            .unwrap();
+
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(app.pr_number, Some(1));
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().pr_lookup,
+            PrLookupState::Idle
+        ));
     }
 
     #[test]

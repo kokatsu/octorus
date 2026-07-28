@@ -2527,7 +2527,12 @@ mod tests {
         tokio::sync::mpsc::Sender<crate::loader::DataLoadResult>,
     ) {
         let config = Config::default();
-        super::super::App::new_loading("owner/repo", 1, config)
+        super::super::App::new_loading(
+            "owner/repo",
+            1,
+            config,
+            super::super::RepositoryAvailability::Available,
+        )
     }
 
     #[tokio::test]

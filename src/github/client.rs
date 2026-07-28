@@ -80,52 +80,54 @@ fn format_gh_error(stderr: &str, stdout: &str) -> String {
     }
 }
 
+/// Build a child process for a GitHub CLI query.
+///
+/// `kill_on_drop` is set here rather than at each call site so cancellation
+/// actually stops the work: dropping the fetch future must take the child with
+/// it, otherwise a cancelled fetch only discards the result while the process
+/// keeps running to completion.
+fn spawnable_command(program: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 /// Execute gh CLI command and return stdout
-/// Uses spawn_blocking to avoid blocking the tokio runtime
 pub async fn gh_command(args: &[&str]) -> Result<String> {
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let mut command = spawnable_command("gh");
+    let output = command
+        .args(args)
+        .output()
+        .await
+        .context("Failed to execute gh CLI - is it installed?")?;
 
-    tokio::task::spawn_blocking(move || {
-        let output = Command::new("gh")
-            .args(&args)
-            .output()
-            .context("Failed to execute gh CLI - is it installed?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!("{}", format_gh_error(stderr.trim(), stdout.trim()));
+    }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            anyhow::bail!("{}", format_gh_error(stderr.trim(), stdout.trim()));
-        }
-
-        String::from_utf8(output.stdout).context("gh output contains invalid UTF-8")
-    })
-    .await
-    .context("spawn_blocking task panicked")?
+    String::from_utf8(output.stdout).context("gh output contains invalid UTF-8")
 }
 
 /// Execute gh CLI command, treating specified exit codes as success.
 /// For example, `gh pr checks` returns exit code 8 when checks are pending.
 pub async fn gh_command_allow_exit_codes(args: &[&str], allowed_codes: &[i32]) -> Result<String> {
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let allowed_codes: Vec<i32> = allowed_codes.to_vec();
+    let mut command = spawnable_command("gh");
+    let output = command
+        .args(args)
+        .output()
+        .await
+        .context("Failed to execute gh CLI - is it installed?")?;
 
-    tokio::task::spawn_blocking(move || {
-        let output = Command::new("gh")
-            .args(&args)
-            .output()
-            .context("Failed to execute gh CLI - is it installed?")?;
-
-        let code = output.status.code().unwrap_or(-1);
-        if output.status.success() || allowed_codes.contains(&code) {
-            String::from_utf8(output.stdout).context("gh output contains invalid UTF-8")
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            anyhow::bail!("{}", format_gh_error(stderr.trim(), stdout.trim()));
-        }
-    })
-    .await
-    .context("spawn_blocking task panicked")?
+    let code = output.status.code().unwrap_or(-1);
+    if output.status.success() || allowed_codes.contains(&code) {
+        String::from_utf8(output.stdout).context("gh output contains invalid UTF-8")
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!("{}", format_gh_error(stderr.trim(), stdout.trim()));
+    }
 }
 
 /// Execute gh api command with JSON output
@@ -146,7 +148,7 @@ pub async fn gh_api_paginate(endpoint: &str) -> Result<serde_json::Value> {
 
 /// Flatten an array of JSON arrays (from --paginate --slurp) into a single array.
 /// Returns an error if any page is not a JSON array.
-fn flatten_pages(pages: Vec<serde_json::Value>) -> Result<serde_json::Value> {
+pub(super) fn flatten_pages(pages: Vec<serde_json::Value>) -> Result<serde_json::Value> {
     let mut result = Vec::new();
     for (i, page) in pages.iter().enumerate() {
         match page {
@@ -295,5 +297,41 @@ mod tests {
         let err = flatten_pages(pages).unwrap_err();
         assert!(err.to_string().contains("page 2"));
         assert!(err.to_string().contains("null"));
+    }
+
+    /// Dropping a GitHub fetch must take the child process with it.
+    ///
+    /// Exercises the builder every `gh` invocation in this module uses, with
+    /// an absolute stand-in program so the test changes no process-wide state.
+    /// Mutating `PATH` here would make concurrently running tests resolve this
+    /// test's stand-in instead of the real `gh` binary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_dropped_gh_fetch_kills_the_child_it_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let completed = dir.path().join("completed");
+        let script = format!(
+            ": > {started}; sleep 1; : > {completed}",
+            started = started.display(),
+            completed = completed.display(),
+        );
+
+        let mut command = spawnable_command("/bin/sh");
+        command.args(["-c", &script]);
+        let fetch = command.output();
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        drop(fetch);
+        tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+
+        assert!(
+            started.exists(),
+            "the stand-in child must have been spawned before the drop"
+        );
+        assert!(
+            !completed.exists(),
+            "a dropped gh fetch must not leave its child running to completion"
+        );
     }
 }

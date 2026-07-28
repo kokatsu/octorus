@@ -168,7 +168,12 @@ mod tests {
         use crate::app::DataState;
         use crate::github::{Branch, PullRequest, User};
 
-        let (mut app, _) = App::new_loading("owner/repo", 1, crate::config::Config::default());
+        let (mut app, _) = App::new_loading(
+            "owner/repo",
+            1,
+            crate::config::Config::default(),
+            crate::app::RepositoryAvailability::Available,
+        );
         let pr = Box::new(PullRequest {
             number: 1,
             node_id: None,

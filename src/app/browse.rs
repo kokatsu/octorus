@@ -21,7 +21,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::diff_store::{DiffScrollState, ScrollMode};
 use crate::filter::ListFilter;
-use crate::github::{blame_file, BlameError, BlameFile, BlameRef};
+use crate::github::{
+    blame_file, BlameError, BlameFile, BlameRef, CommitPrLookupError, CommitPrResolution,
+    CommitPullRequest,
+};
 use crate::symbols::{CancelSignal, IndexBuild, Symbol, SymbolIndex, SymbolRef};
 use crate::syntax::ParserPool;
 use crate::ui::common::truncate_with_width;
@@ -123,6 +126,7 @@ impl App {
     /// Drain background browse channels: file list, symbol index, highlighting.
     pub(crate) fn poll_browse_updates(&mut self) {
         let tab_width = self.config.diff.tab_width;
+        let browse_file_active = self.state == AppState::RepoBrowseFile;
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
@@ -130,6 +134,18 @@ impl App {
         let mut paths_ready = false;
         let mut file_ready = false;
         let mut focus_listing_failure = false;
+        let mut completed_pr_lookup = None;
+
+        if let PrLookupState::Loading { .. } = &state.pr_lookup {
+            if !browse_file_active || !state.pr_lookup_matches_current_context() {
+                state.cancel_pr_lookup_request();
+                state.pr_lookup = PrLookupState::Idle;
+                state.status = Some(
+                    "Pull request lookup abandoned because the context moved off that commit"
+                        .to_string(),
+                );
+            }
+        }
         if let Some(rx) = state.paths_receiver.as_mut() {
             match rx.try_recv() {
                 Ok(Ok(listing)) => {
@@ -325,6 +341,53 @@ impl App {
             }
         }
 
+        if let Some(rx) = state.pr_lookup_receiver.as_mut() {
+            match rx.try_recv() {
+                Ok(delivery) => {
+                    let matches_request = matches!(
+                        state.pr_lookup,
+                        PrLookupState::Loading {
+                            request_id,
+                            ref sha,
+                            ..
+                        } if request_id == delivery.request_id && sha == &delivery.sha
+                    );
+                    if matches_request {
+                        state.pr_lookup_receiver = None;
+                        match delivery.result {
+                            Ok(resolution) => {
+                                completed_pr_lookup = Some((delivery.sha, resolution));
+                            }
+                            Err(error) => {
+                                state.pr_lookup = PrLookupState::Failed {
+                                    sha: delivery.sha,
+                                    failure: PrLookupFailure::Lookup(error),
+                                };
+                                state.status = Some(error.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    state.pr_lookup_receiver = None;
+                    let failed_sha = match &state.pr_lookup {
+                        PrLookupState::Loading { sha, cancel, .. } if !cancel.is_cancelled() => {
+                            Some(sha.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(sha) = failed_sha {
+                        state.pr_lookup = PrLookupState::Failed {
+                            sha,
+                            failure: PrLookupFailure::Lookup(CommitPrLookupError::ApiFailure),
+                        };
+                        state.status = Some(CommitPrLookupError::ApiFailure.to_string());
+                    }
+                }
+            }
+        }
+
         if let Some(rx) = state.highlight_receiver.as_mut() {
             match rx.try_recv() {
                 Ok((path, cache)) => {
@@ -350,6 +413,9 @@ impl App {
         // Help or another screen the user has already entered.
         if focus_listing_failure && self.state == AppState::RepoBrowseTree {
             self.state = AppState::RepoBrowseFile;
+        }
+        if let Some((sha, resolution)) = completed_pr_lookup {
+            self.install_pr_lookup_resolution(sha, resolution);
         }
     }
 
@@ -618,6 +684,139 @@ impl App {
         self.start_browse_commit_diff(annotation);
     }
 
+    pub(crate) fn open_browse_blame_pr(&mut self) {
+        if !self.repository_availability().is_available() {
+            self.set_browse_status("No GitHub repository is associated with this browser session");
+            return;
+        }
+
+        let toggle_blame = self.config.keybindings.toggle_blame.display();
+        let annotation = {
+            let Some(state) = self.browse_state.as_mut() else {
+                return;
+            };
+            if state.open_is_pending() {
+                state.status = Some("Still opening this file".to_string());
+                return;
+            }
+            let Some(open) = state.open.as_ref() else {
+                state.status = Some("No file is open".to_string());
+                return;
+            };
+            let gutter = match &state.blame {
+                BlameState::Waiting { .. } | BlameState::Loading { .. } => {
+                    state.status = Some("Blame is still loading".to_string());
+                    return;
+                }
+                BlameState::Ready { path, gutter } if path == &open.path => gutter,
+                BlameState::Off => {
+                    state.status = Some(format!("Blame is off — press {toggle_blame} to enable"));
+                    return;
+                }
+                BlameState::Failed => {
+                    state.status = Some("Blame failed for this file".to_string());
+                    return;
+                }
+                BlameState::Ready { .. } => {
+                    state.status = Some("Blame belongs to another file".to_string());
+                    return;
+                }
+            };
+            let Some(annotation) = gutter.annotation_at(state.cursor_line) else {
+                state.status = Some("Blame is unavailable for this line".to_string());
+                return;
+            };
+            if annotation.is_uncommitted() {
+                state.status = Some("Uncommitted line has no pull request".to_string());
+                return;
+            }
+            Arc::clone(annotation)
+        };
+
+        let sha = annotation.sha().to_string();
+        if let Some(resolution) = self.session_cache.get_commit_pr_resolution(&sha).cloned() {
+            self.install_pr_lookup_resolution(sha, resolution);
+            return;
+        }
+        self.start_browse_pr_lookup(sha, annotation.summary().to_string());
+    }
+
+    fn start_browse_pr_lookup(&mut self, sha: String, subject: String) {
+        let repo = self.repo.clone();
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let (request_id, cancel) = state.begin_pr_lookup(&sha);
+        let (tx, rx) = mpsc::channel(1);
+        state.pr_lookup_receiver = Some(rx);
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = crate::github::fetch_commit_pull_requests(&repo, &sha, &subject) => result,
+            };
+            if cancel.is_cancelled() {
+                return;
+            }
+            let _ = tx
+                .send(PrLookupLoadResult {
+                    request_id,
+                    sha,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn install_pr_lookup_resolution(&mut self, sha: String, resolution: CommitPrResolution) {
+        self.session_cache
+            .put_commit_pr_resolution(sha.clone(), resolution.clone());
+        match resolution {
+            CommitPrResolution::Confirmed { mut pulls } if pulls.len() == 1 => {
+                let pull = pulls.remove(0);
+                self.open_pr_from_browse(pull.number, PrOpenSource::ConfirmedCommit { sha });
+            }
+            CommitPrResolution::Confirmed { pulls } if !pulls.is_empty() => {
+                if let Some(state) = self.browse_state.as_mut() {
+                    state.overlay = BrowseOverlay::None;
+                    state.status = None;
+                    state.pr_lookup = PrLookupState::Selecting {
+                        sha,
+                        pulls,
+                        selected: 0,
+                    };
+                }
+            }
+            CommitPrResolution::Confirmed { .. } | CommitPrResolution::NotFound => {
+                if let Some(state) = self.browse_state.as_mut() {
+                    state.status = Some(format!(
+                        "No pull request found for commit {}",
+                        crate::github::short_sha(&sha)
+                    ));
+                    state.pr_lookup = PrLookupState::Failed {
+                        sha,
+                        failure: PrLookupFailure::NotFound,
+                    };
+                }
+            }
+            CommitPrResolution::Inferred { pull } => {
+                self.open_pr_from_browse(pull.number, PrOpenSource::InferredCommitSubject { sha });
+            }
+        }
+    }
+
+    pub(crate) fn open_pr_from_browse(&mut self, pr_number: u32, source: PrOpenSource) {
+        if let Some(state) = self.browse_state.take() {
+            state.cancel_token.cancel();
+        }
+        if self.local_mode {
+            self.deactivate_watcher();
+            self.local_mode = false;
+        }
+        self.select_pr(pr_number);
+        self.pr_open_source = source;
+    }
+
     fn start_browse_commit_diff(&mut self, annotation: Arc<BlameAnnotation>) {
         let use_local = self.local_mode || self.pr_number.is_none();
         let working_dir = self.working_dir.clone();
@@ -628,6 +827,8 @@ impl App {
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
+        state.cancel_pr_lookup_request();
+        state.pr_lookup = PrLookupState::Idle;
         state.cancel_commit_diff_request();
         state.commit_diff_generation = state.commit_diff_generation.wrapping_add(1);
         let request_id = state.commit_diff_generation;
@@ -1207,6 +1408,37 @@ pub(crate) struct CommitDiffLoadResult {
     result: Result<DiffCache, String>,
 }
 
+pub(crate) struct PrLookupLoadResult {
+    request_id: u64,
+    sha: String,
+    result: Result<CommitPrResolution, CommitPrLookupError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrLookupFailure {
+    NotFound,
+    Lookup(CommitPrLookupError),
+}
+
+#[derive(Debug)]
+pub enum PrLookupState {
+    Idle,
+    Loading {
+        request_id: u64,
+        sha: String,
+        cancel: CancellationToken,
+    },
+    Selecting {
+        sha: String,
+        pulls: Vec<CommitPullRequest>,
+        selected: usize,
+    },
+    Failed {
+        sha: String,
+        failure: PrLookupFailure,
+    },
+}
+
 /// Outcome of one background file load.
 #[derive(Debug)]
 pub(crate) enum FileLoad {
@@ -1337,6 +1569,8 @@ pub struct BrowseState {
     pub(crate) blame: BlameState,
     pub(crate) commit_diff: BrowseCommitDiffState,
     commit_diff_generation: u64,
+    pub(crate) pr_lookup: PrLookupState,
+    pr_lookup_generation: u64,
     /// 0-based cursor line within the open file.
     pub cursor_line: usize,
     pub scroll_offset: usize,
@@ -1359,6 +1593,7 @@ pub struct BrowseState {
     pub(crate) file_receiver: Option<mpsc::Receiver<FileLoadResult>>,
     pub(crate) blame_receiver: Option<mpsc::Receiver<BlameLoadResult>>,
     pub(crate) commit_diff_receiver: Option<mpsc::Receiver<CommitDiffLoadResult>>,
+    pub(crate) pr_lookup_receiver: Option<mpsc::Receiver<PrLookupLoadResult>>,
     pub(crate) highlight_receiver: Option<mpsc::Receiver<(String, DiffCache)>>,
 }
 
@@ -1386,6 +1621,8 @@ impl BrowseState {
             blame: BlameState::Off,
             commit_diff: BrowseCommitDiffState::Off,
             commit_diff_generation: 0,
+            pr_lookup: PrLookupState::Idle,
+            pr_lookup_generation: 0,
             cursor_line: 0,
             scroll_offset: 0,
             index: IndexState::Idle,
@@ -1399,6 +1636,7 @@ impl BrowseState {
             file_receiver: None,
             blame_receiver: None,
             commit_diff_receiver: None,
+            pr_lookup_receiver: None,
             highlight_receiver: None,
         }
     }
@@ -1415,6 +1653,46 @@ impl BrowseState {
             cancel.cancel();
         }
         self.commit_diff_receiver = None;
+    }
+
+    fn cancel_pr_lookup_request(&mut self) {
+        if let PrLookupState::Loading { ref cancel, .. } = self.pr_lookup {
+            cancel.cancel();
+        }
+        self.pr_lookup_receiver = None;
+    }
+
+    fn begin_pr_lookup(&mut self, sha: &str) -> (u64, CancellationToken) {
+        self.cancel_pr_lookup_request();
+        self.pr_lookup_generation = self.pr_lookup_generation.wrapping_add(1);
+        let request_id = self.pr_lookup_generation;
+        let cancel = self.cancel_token.child_token();
+        self.pr_lookup = PrLookupState::Loading {
+            request_id,
+            sha: sha.to_string(),
+            cancel: cancel.clone(),
+        };
+        self.status = None;
+        (request_id, cancel)
+    }
+
+    fn pr_lookup_matches_current_context(&self) -> bool {
+        let PrLookupState::Loading { sha, .. } = &self.pr_lookup else {
+            return false;
+        };
+        if !matches!(self.commit_diff, BrowseCommitDiffState::Off) {
+            return false;
+        }
+        let Some(open) = self.open.as_ref() else {
+            return false;
+        };
+        let BlameState::Ready { path, gutter } = &self.blame else {
+            return false;
+        };
+        path == &open.path
+            && gutter
+                .annotation_at(self.cursor_line)
+                .is_some_and(|annotation| annotation.sha() == sha)
     }
 
     /// Install a freshly listed set of tracked paths and rebuild the tree.
@@ -1973,7 +2251,10 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{parse_porcelain, BlameError};
+    use crate::github::{
+        parse_porcelain, BlameError, CommitPrLookupError, CommitPrResolution, CommitPullRequest,
+        CommitPullRequestState,
+    };
     use crate::symbols::{FileSymbols, SymbolKind};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -2279,6 +2560,15 @@ mod tests {
             viewable: true,
             notice: None,
         });
+        state
+    }
+
+    fn state_with_ready_blame(porcelain: &str, line_count: usize) -> BrowseState {
+        let mut state = state_with_open_file(line_count);
+        state.blame = BlameState::Ready {
+            path: "src/a.rs".to_string(),
+            gutter: BlameGutter::from_file(parse_porcelain(porcelain), line_count),
+        };
         state
     }
 
@@ -2885,6 +3175,356 @@ mod tests {
                     line.spans.iter().any(|span| cache.resolve(span.content).contains("request 2"))
                 })
         ));
+    }
+
+    #[test]
+    fn test_open_blame_pr_reports_no_repo_blame_off_loading_and_uncommitted_without_a_request() {
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        const UNCOMMITTED: &str = "0000000000000000000000000000000000000000 1 1 1\n\
+             author Not Committed Yet\n\
+             author-time 0\n\
+             summary working tree\n\
+             \tone\n";
+
+        let mut no_repo = App::new_for_test();
+        no_repo.set_repository_availability(RepositoryAvailability::Unavailable);
+        no_repo.browse_state = Some(state_with_ready_blame(COMMITTED, 1));
+        no_repo.state = AppState::RepoBrowseFile;
+        no_repo.open_browse_blame_pr();
+        assert_eq!(
+            no_repo.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("No GitHub repository is associated with this browser session")
+        );
+
+        let mut blame_off = App::new_for_test();
+        blame_off.set_repository_availability(RepositoryAvailability::Available);
+        blame_off.browse_state = Some(state_with_open_file(1));
+        blame_off.state = AppState::RepoBrowseFile;
+        blame_off.open_browse_blame_pr();
+        assert_eq!(
+            blame_off.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Blame is off — press gb to enable")
+        );
+
+        let mut blame_loading = App::new_for_test();
+        blame_loading.set_repository_availability(RepositoryAvailability::Available);
+        let mut loading_state = state_with_open_file(1);
+        loading_state.blame = BlameState::Loading {
+            path: "src/a.rs".to_string(),
+            cancel: loading_state.cancel_token.child_token(),
+        };
+        blame_loading.browse_state = Some(loading_state);
+        blame_loading.state = AppState::RepoBrowseFile;
+        blame_loading.open_browse_blame_pr();
+        assert_eq!(
+            blame_loading
+                .browse_state
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Blame is still loading")
+        );
+
+        let mut uncommitted = App::new_for_test();
+        uncommitted.set_repository_availability(RepositoryAvailability::Available);
+        uncommitted.browse_state = Some(state_with_ready_blame(UNCOMMITTED, 1));
+        uncommitted.state = AppState::RepoBrowseFile;
+        uncommitted.open_browse_blame_pr();
+        assert_eq!(
+            uncommitted.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Uncommitted line has no pull request")
+        );
+
+        for app in [&no_repo, &blame_off, &blame_loading, &uncommitted] {
+            let state = app.browse_state.as_ref().unwrap();
+            assert!(matches!(state.pr_lookup, PrLookupState::Idle));
+            assert!(state.pr_lookup_receiver.is_none());
+        }
+    }
+
+    #[test]
+    fn test_cached_not_found_answer_reports_the_commit_without_starting_a_request() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary pushed directly\n\
+             \tone\n";
+        let mut app = App::new_for_test();
+        app.set_repository_availability(RepositoryAvailability::Available);
+        app.browse_state = Some(state_with_ready_blame(COMMITTED, 1));
+        app.state = AppState::RepoBrowseFile;
+        app.session_cache
+            .put_commit_pr_resolution(SHA.to_string(), CommitPrResolution::NotFound);
+
+        app.open_browse_blame_pr();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.pr_lookup,
+            PrLookupState::Failed {
+                ref sha,
+                failure: PrLookupFailure::NotFound,
+            } if sha == SHA
+        ));
+        assert!(state.pr_lookup_receiver.is_none());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("No pull request found for commit aaaaaaa")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_inferred_answer_opens_pr_with_persistent_unconfirmed_provenance() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary squash merge subject (#123)\n\
+             \tone\n";
+        let mut app = App::new_for_test();
+        app.set_repository_availability(RepositoryAvailability::Available);
+        app.browse_state = Some(state_with_ready_blame(COMMITTED, 1));
+        app.state = AppState::RepoBrowseFile;
+        app.session_cache.put_commit_pr_resolution(
+            SHA.to_string(),
+            CommitPrResolution::Inferred {
+                pull: CommitPullRequest {
+                    number: 123,
+                    title: "squash merge subject".to_string(),
+                    state: CommitPullRequestState::Unknown,
+                },
+            },
+        );
+
+        app.open_browse_blame_pr();
+
+        assert_eq!(app.state, AppState::FileList);
+        assert_eq!(app.pr_number, Some(123));
+        assert_eq!(
+            app.pr_open_source,
+            PrOpenSource::InferredCommitSubject {
+                sha: SHA.to_string()
+            }
+        );
+        assert_eq!(
+            app.pr_open_notice().as_deref(),
+            Some("PR #123 inferred from commit subject; GitHub did not confirm it")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pr_lookup_second_request_cancels_first_and_old_ok_or_err_never_installs() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let mut app = App::new_for_test();
+        let mut state = state_with_ready_blame(COMMITTED, 1);
+        let (first_id, first_cancel) = state.begin_pr_lookup(SHA);
+        let (second_id, second_cancel) = state.begin_pr_lookup(SHA);
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+        assert!(second_id > first_id);
+
+        let (tx, rx) = mpsc::channel(3);
+        state.pr_lookup_receiver = Some(rx);
+        app.browse_state = Some(state);
+        app.state = AppState::RepoBrowseFile;
+
+        tx.send(PrLookupLoadResult {
+            request_id: first_id,
+            sha: SHA.to_string(),
+            result: Err(CommitPrLookupError::ApiFailure),
+        })
+        .await
+        .unwrap();
+        tx.send(PrLookupLoadResult {
+            request_id: first_id,
+            sha: SHA.to_string(),
+            result: Ok(CommitPrResolution::Confirmed {
+                pulls: vec![CommitPullRequest {
+                    number: 9,
+                    title: "stale".to_string(),
+                    state: CommitPullRequestState::Open,
+                }],
+            }),
+        })
+        .await
+        .unwrap();
+        let current = CommitPrResolution::Confirmed {
+            pulls: vec![CommitPullRequest {
+                number: 42,
+                title: "current".to_string(),
+                state: CommitPullRequestState::Merged,
+            }],
+        };
+        tx.send(PrLookupLoadResult {
+            request_id: second_id,
+            sha: SHA.to_string(),
+            result: Ok(current.clone()),
+        })
+        .await
+        .unwrap();
+
+        app.poll_browse_updates();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().pr_lookup,
+            PrLookupState::Loading {
+                request_id,
+                ref sha,
+                ..
+            } if request_id == second_id && sha == SHA
+        ));
+        assert!(app.session_cache.get_commit_pr_resolution(SHA).is_none());
+
+        app.poll_browse_updates();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(app.pr_number, Some(1), "stale PR #9 was opened");
+
+        app.poll_browse_updates();
+        assert_eq!(app.state, AppState::FileList);
+        assert_eq!(app.pr_number, Some(42));
+        assert!(app.browse_state.is_none());
+        assert_eq!(
+            app.session_cache.get_commit_pr_resolution(SHA),
+            Some(&current)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pr_lookup_result_is_cancelled_when_cursor_moves_to_another_commit() {
+        const FIRST_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary first\n\
+             \tone\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2 2 1\n\
+             author Bob\n\
+             author-time 1700000001\n\
+             summary second\n\
+             \ttwo\n";
+        let mut app = App::new_for_test();
+        let mut state = state_with_ready_blame(PORCELAIN, 2);
+        let (request_id, cancel) = state.begin_pr_lookup(FIRST_SHA);
+        let (tx, rx) = mpsc::channel(1);
+        state.pr_lookup_receiver = Some(rx);
+        state.cursor_line = 1;
+        app.browse_state = Some(state);
+        app.state = AppState::RepoBrowseFile;
+
+        tx.send(PrLookupLoadResult {
+            request_id,
+            sha: FIRST_SHA.to_string(),
+            result: Ok(CommitPrResolution::Confirmed {
+                pulls: vec![CommitPullRequest {
+                    number: 9,
+                    title: "wrong cursor".to_string(),
+                    state: CommitPullRequestState::Closed,
+                }],
+            }),
+        })
+        .await
+        .unwrap();
+
+        app.poll_browse_updates();
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(app.pr_number, Some(1));
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.pr_lookup, PrLookupState::Idle));
+        assert!(state.pr_lookup_receiver.is_none());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Pull request lookup abandoned because the context moved off that commit")
+        );
+        assert!(app
+            .session_cache
+            .get_commit_pr_resolution(FIRST_SHA)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pr_lookup_failures_map_to_distinct_exact_footer_messages() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let cases = [
+            (
+                CommitPrLookupError::CliMissing,
+                "GitHub CLI is not installed or not on PATH",
+            ),
+            (
+                CommitPrLookupError::Unauthenticated,
+                "GitHub CLI is not authenticated — run gh auth login",
+            ),
+            (
+                CommitPrLookupError::RateLimited,
+                "GitHub API rate limit exceeded — try again later",
+            ),
+            (
+                CommitPrLookupError::CommitNotOnGitHub,
+                "GitHub does not know this commit — it may not be pushed yet",
+            ),
+            (
+                CommitPrLookupError::ApiFailure,
+                "GitHub API failed while looking up this commit",
+            ),
+            (
+                CommitPrLookupError::EmptyResponse,
+                "GitHub returned an empty response for this commit",
+            ),
+            (
+                CommitPrLookupError::MalformedResponse,
+                "GitHub returned malformed pull request data for this commit",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let mut app = App::new_for_test();
+            let mut state = state_with_ready_blame(COMMITTED, 1);
+            let (request_id, _) = state.begin_pr_lookup(SHA);
+            let (tx, rx) = mpsc::channel(1);
+            state.pr_lookup_receiver = Some(rx);
+            app.browse_state = Some(state);
+            app.state = AppState::RepoBrowseFile;
+            tx.send(PrLookupLoadResult {
+                request_id,
+                sha: SHA.to_string(),
+                result: Err(error),
+            })
+            .await
+            .unwrap();
+
+            app.poll_browse_updates();
+
+            let state = app.browse_state.as_ref().unwrap();
+            assert_eq!(state.status.as_deref(), Some(expected));
+            assert!(matches!(
+                state.pr_lookup,
+                PrLookupState::Failed {
+                    failure: PrLookupFailure::Lookup(actual),
+                    ..
+                } if actual == error
+            ));
+            assert!(
+                app.session_cache.get_commit_pr_resolution(SHA).is_none(),
+                "operational failures must remain retryable"
+            );
+        }
     }
 
     #[tokio::test]

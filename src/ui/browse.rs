@@ -17,10 +17,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::browse::{
     BlameCoverage, BlameGutter, BlameGutterWidth, BlameState, BrowseCommitDiffState, BrowseOverlay,
-    BrowseState, BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
+    BrowseState, PrLookupState, BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
 };
 use crate::app::{App, AppState, CachedDiffLine, DiffCache, LoadState, TreeRow};
 use crate::diff::LineType;
+use crate::github::{CommitPullRequest, CommitPullRequestState};
 use crate::symbols::Symbol;
 
 /// Narrowest the line-number gutter ever gets.
@@ -574,6 +575,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let state = app.browse_state.as_ref();
     let status = state.and_then(|state| state.status.as_deref());
     let commit_diff = state.map(|state| &state.commit_diff);
+    let pr_lookup = state.map(|state| &state.pr_lookup);
     let coverage = if app.state == AppState::RepoBrowseFile {
         state.and_then(|state| match (&state.open, &state.blame) {
             (Some(open), BlameState::Ready { path, gutter }) if open.path == *path => {
@@ -585,7 +587,22 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         None
     };
 
-    let text: std::borrow::Cow<'_, str> = match commit_diff {
+    let lookup_text = match pr_lookup {
+        Some(PrLookupState::Loading { sha, .. }) => Some(format!(
+            " {} Looking up pull requests for {}…",
+            app.spinner_char(),
+            crate::github::short_sha(sha)
+        )),
+        Some(PrLookupState::Selecting { .. }) => {
+            Some(" j/k move | Enter open PR | Esc cancel".to_string())
+        }
+        Some(PrLookupState::Idle | PrLookupState::Failed { .. }) | None => None,
+    };
+
+    let text: std::borrow::Cow<'_, str> = if let Some(text) = lookup_text {
+        std::borrow::Cow::Owned(text)
+    } else {
+        match commit_diff {
         Some(BrowseCommitDiffState::Loading { .. }) => std::borrow::Cow::Owned(format!(
             " {} Loading commit diff… | {} back",
             app.spinner_char(),
@@ -628,17 +645,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " blame covers {blame_lines} lines, this file shows {buffer_lines} — reopen the file to refresh"
             )),
             Some(BlameCoverage::Exact) | None => std::borrow::Cow::Owned(format!(
-                " {} outline | {} search | {} blame | {} diff | {} def | {} edit | {} back",
+                " {} outline | {} search | {} blame | {} diff | {} PR | {} def | {} edit | {} back",
                 kb.symbol_outline.display(),
                 kb.symbol_search.display(),
                 kb.toggle_blame.display(),
                 kb.open_blame_commit.display(),
+                kb.open_blame_pr.display(),
                 kb.go_to_definition.display(),
                 kb.go_to_file.display(),
                 kb.quit.display(),
             )),
         },
         },
+        }
     };
 
     frame.render_widget(
@@ -655,6 +674,14 @@ fn render_overlay(frame: &mut Frame, app: &App) {
         return;
     };
 
+    if let PrLookupState::Selecting {
+        pulls, selected, ..
+    } = &state.pr_lookup
+    {
+        render_pr_selection(frame, pulls, *selected);
+        return;
+    }
+
     match state.overlay {
         BrowseOverlay::None => {}
         BrowseOverlay::Outline { selected } => render_outline(frame, state, selected),
@@ -663,6 +690,53 @@ fn render_overlay(frame: &mut Frame, app: &App) {
             selected,
         } => render_symbol_search(frame, state, query, selected),
     }
+}
+
+fn render_pr_selection(frame: &mut Frame, pulls: &[CommitPullRequest], selected: usize) {
+    let area = overlay_rect(frame.area(), 70, 60);
+    clear_overlay_area(frame, area);
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let offset = scroll_offset(selected, pulls.len(), inner_height);
+    let items = pulls
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(inner_height)
+        .map(|(index, pull)| {
+            let style = if index == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let state = match pull.state {
+                CommitPullRequestState::Open => "open",
+                CommitPullRequestState::Closed => "closed",
+                CommitPullRequestState::Merged => "merged",
+                CommitPullRequestState::Unknown => "unconfirmed",
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!(" #{} [{}] {}", pull.number, state, pull.title),
+                style,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(
+                "Pull requests containing this commit ({})",
+                pulls.len()
+            ))
+            .title_bottom(Line::from(Span::styled(
+                " j/k move | Enter open | Esc cancel ",
+                Style::default().fg(Color::DarkGray),
+            ))),
+    );
+    frame.render_widget(list, area);
 }
 
 /// Clear `area` for an overlay, blanking the double-width glyph it lands inside.
@@ -841,12 +915,12 @@ mod tests {
     use super::*;
     use crate::app::browse::{
         build_file_patch, BlameAnnotation, BrowseCommitDiffState, BrowseState, IndexState,
-        OpenFile, MAX_SYMBOL_SEARCH_RESULTS, MAX_VIEWABLE_FILE_LINES,
+        OpenFile, PrLookupState, MAX_SYMBOL_SEARCH_RESULTS, MAX_VIEWABLE_FILE_LINES,
     };
     use crate::config::Config;
     use crate::diff_store::{DiffScrollState, ScrollMode};
     use crate::filter::ListFilter;
-    use crate::github::parse_porcelain;
+    use crate::github::{parse_porcelain, CommitPullRequest, CommitPullRequestState};
     use crate::keybinding::{KeyBinding, KeySequence};
     use crate::symbols::{FileSymbols, Symbol, SymbolIndex, SymbolKind};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -966,6 +1040,52 @@ mod tests {
     }
 
     #[test]
+    fn test_multiple_commit_pull_requests_render_a_stateful_selection_popup() {
+        let mut app = app_with_browse(&["src/app.rs"]);
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().pr_lookup = PrLookupState::Selecting {
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            pulls: vec![
+                CommitPullRequest {
+                    number: 10,
+                    title: "still open".to_string(),
+                    state: CommitPullRequestState::Open,
+                },
+                CommitPullRequest {
+                    number: 20,
+                    title: "already closed".to_string(),
+                    state: CommitPullRequestState::Closed,
+                },
+                CommitPullRequest {
+                    number: 30,
+                    title: "already merged".to_string(),
+                    state: CommitPullRequestState::Merged,
+                },
+            ],
+            selected: 1,
+        };
+
+        assert_snapshot!(render_at(&mut app, 100, 16), @"
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────┌Pull requests containing this commit (3)────────────────────────────┐──────────────┐
+        │▼ src/        │ #10 [open] still open                                              │              │
+        │    app.rs    │ #20 [closed] already closed                                        │              │
+        │              │ #30 [merged] already merged                                        │              │
+        │              │                                                                    │              │
+        │              │                                                                    │              │
+        │              │                                                                    │              │
+        │              │                                                                    │              │
+        │              └ j/k move | Enter open | Esc cancel ────────────────────────────────┘              │
+        │                                 ││                                                               │
+        │                                 ││                                                               │
+        └─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
+         j/k move | Enter open PR | Esc cancel
+        ");
+    }
+
+    #[test]
     fn test_render_file_content_with_line_numbers() {
         let mut app = app_with_browse(&["src/app.rs"]);
         if let Some(state) = app.browse_state.as_mut() {
@@ -988,7 +1108,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
         "#);
     }
 
@@ -1234,8 +1354,8 @@ mod tests {
                 footer_at(&mut app, 60)
             ),
             @"
-        80:  o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
-        60:  o outline | s search | gb blame | gc diff | gd def | gf edi
+        80:  o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
+        60:  o outline | s search | gb blame | gc diff | gp PR | gd def
         "
         );
     }
@@ -1260,7 +1380,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
         ");
     }
 
@@ -1302,7 +1422,7 @@ mod tests {
         │  main.rs                               ││aaaaaaa Alice Example 2h ago        1 fn main() {}                          │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc back
         --- no time (90) ---
         ┌────────────────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                                                 │
@@ -1311,7 +1431,7 @@ mod tests {
         │  main.rs                     ││aaaaaaa Alice Example      1 fn main() {}               │
         │                              ││                                                        │
         └──────────────────────────────┘└────────────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc back
         --- identity (70) ---
         ┌────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                             │
@@ -1320,7 +1440,7 @@ mod tests {
         │  main.rs              ││aaaaaaa         1 fn main() {}             │
         │                       ││                                           │
         └───────────────────────┘└───────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit
         --- hidden (50) ---
         ┌────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -         │
@@ -1329,7 +1449,7 @@ mod tests {
         │  main.rs       ││    1 fn main() {}            │
         │                ││                              │
         └────────────────┘└──────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd de
+         o outline | s search | gb blame | gc diff | gp PR
         ");
     }
 
@@ -1367,7 +1487,7 @@ mod tests {
         │                                        ││Uncommitted                         3 third                                 │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc back
         ");
     }
 
@@ -1459,7 +1579,7 @@ mod tests {
         │  empty.rs                ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
         ");
     }
 
@@ -1484,7 +1604,7 @@ mod tests {
         │                          ││   28 line 28                                     ║
         │                          ││   29 line 29                                     █
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
         ");
     }
 

@@ -27,7 +27,7 @@ wc -l src/app/browse.rs src/symbols.rs src/ui/browse.rs src/app/input_browse.rs
 - `src/app/mod.rs` — `browse` / `input_browse` のモジュール宣言、`browse_state: Option<BrowseState>` フィールド、`poll_browse_updates()` を polling ループへ
 - `src/app/input.rs` — dispatch 2 アーム、file list に `b` の分岐
 - `src/ui/mod.rs` — モジュール宣言と dispatch 1 行
-- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `toggle_blame` / `open_blame_commit`
+- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `toggle_blame` / `open_blame_commit` / `open_blame_pr`
 - `src/main.rs` — `--browse` フラグ
 - `src/ui/help.rs` — ヘルプ項目
 - `src/app/cockpit.rs` / `src/ui/cockpit.rs` — ブラウザを開く Cockpit メニュー項目
@@ -93,6 +93,11 @@ commit:    BrowseCommitDiffState
            Off → Loading { request_id, annotation, cancel }
                → Ready { annotation, cache, scroll }
                | Failed { annotation, message }
+
+PR lookup: PrLookupState
+           Idle → Loading { request_id, sha, cancel }
+                → Selecting { sha, pulls, selected }
+                | Failed { sha, failure }
 
 overlay:   BrowseOverlay
            None | Outline { selected } | SymbolSearch { query, selected }
@@ -252,6 +257,36 @@ GitHub commit diff API を使う。fetch と cache build はどちらも draw lo
 footer の両方へ出す。cancel は外部 process の完走そのものを保証しないが、request 固有の
 token、receiver 交換、request id の3段で古い結果の install を防ぐ。
 
+blame 行から導入 PR を開くとき:
+
+```
+open_browse_blame_pr() (`gp`)
+   │
+   ├─ top-level RepositoryAvailability が Unavailable → footer（API は呼ばない）
+   ├─ cursor 行の BlameAnnotation から full SHA と subject を取得
+   ├─ SessionCache[sha] hit → resolution をそのまま適用
+   └─ miss → PrLookupState::Loading { request_id, sha, cancel }
+                │ tokio task: gh api repos/{owner}/{repo}/commits/{sha}/pulls
+                ▼
+          poll_browse_updates()
+             ├─ request_id / SHA / 現在 cursor の SHA 不一致 → stale result を破棄
+             ├─ typed failure → Failed + 固定 footer
+             ├─ API 1件 → select_pr(number)
+             ├─ API 複数件 → Selecting popup
+             ├─ API [] + subject 末尾 ` (#123)` → inferred として select_pr(number)
+             └─ API [] + fallback 無し → NotFound を cache
+```
+
+API の非空配列が常に source of truth であり、commit subject は正常な空配列 `[]` の場合だけ
+使う second-best fallback である。malformed/null/empty response や CLI/API failure を
+subject で隠さない。inferred 遷移は PR data の loading 中から PR 画面を離れるまで
+`PR #N inferred from commit subject; GitHub did not confirm it` と表示し続ける。
+
+lookup result は成功（confirmed / inferred / not found）だけを session cache に SHA 単位で
+保存する。CLI 未導入、未認証、rate limit、API failure、empty response、malformed response
+は再試行できるよう cache しない。同じ commit が blame gutter の多数行に現れても network
+call は一度で済む。
+
 `build_plain_diff_cache()` は `expand_tabs` → `classify_line` → 文字列 interning の 1 パス
 だけで、`ParserPool` を受け取らない。ハイライトを待たずにファイルを表示できるのはこのため
 で、`build_diff_cache()` による差し替えは後追いで届く。
@@ -301,7 +336,7 @@ truncate する。打ち切った事実は `total` に残り、フッタで件�
 2. commit diff mode（file のみ）             ← source 用 action を遮断
 3. フィルタ入力バー（ツリーのみ）           ← 開いていれば文字入力を全部消費
 4. 両ペイン共通（s / ? / Z / Ctrl-o）
-5. シーケンス（ツリー: Space / と gg ／ ファイル: gb, gc, gd, gf, gg）
+5. シーケンス（ツリー: Space / と gg ／ ファイル: gb, gc, gp, gd, gf, gg）
 6. 単一キー
 ```
 
@@ -339,6 +374,9 @@ blame gutter は file pane の既存シーケンス層へ `toggle_blame = ["g", 
 全体との単一キー衝突が context compatible として抑制される。
 `open_blame_commit = ["g", "c"]` も同じ理由で登録しない。validator は完全に同じ sequence
 同士も検出するため、`gb` など既存 action と同じ設定は拒否される。
+`open_blame_pr = ["g", "p"]` も同様に登録しない。3 binding はすべて `g` prefix owner
+として duplicate detector に残り、いずれかを単一キーへ設定した場合は sequence layer
+より前の single-key dispatch で実行する。
 
 ## 6. 描画
 

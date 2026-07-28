@@ -720,6 +720,7 @@ mod tests {
     use super::*;
     use crate::app::{
         DestructiveOp, FileStatus, GitOpsState, GitStatusEntry, PendingGitOpsConfirm,
+        RepositoryAvailability,
     };
     use crate::config::Config;
     use insta::assert_snapshot;
@@ -732,7 +733,7 @@ mod tests {
         tokio::sync::mpsc::Sender<crate::loader::DataLoadResult>,
     ) {
         let config = Config::default();
-        App::new_loading("owner/repo", 1, config)
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available)
     }
 
     fn entry(path: &str, index: FileStatus, worktree: FileStatus) -> GitStatusEntry {

@@ -208,6 +208,14 @@ impl AppState {
             Self::IssueList | Self::IssueDetail | Self::IssueCommentList
         )
     }
+
+    /// Whether this screen is part of the pull request review flow.
+    pub fn is_pr_review(self) -> bool {
+        matches!(
+            self,
+            Self::FileList | Self::DiffView | Self::SplitViewFileList | Self::SplitViewDiff
+        )
+    }
 }
 
 /// Variant for diff view handling (fullscreen vs split pane)
@@ -441,6 +449,25 @@ pub struct CockpitState {
     pub(crate) mentioned_receiver: Option<mpsc::Receiver<Result<u32, String>>>,
     pub(crate) review_receiver: Option<mpsc::Receiver<Result<u32, String>>>,
     pub repo_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrOpenSource {
+    Standard,
+    ConfirmedCommit { sha: String },
+    InferredCommitSubject { sha: String },
+}
+
+impl RepositoryAvailability {
+    pub fn is_available(self) -> bool {
+        matches!(self, Self::Available)
+    }
 }
 
 impl CockpitState {

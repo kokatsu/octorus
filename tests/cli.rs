@@ -1,5 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use octorus::app::{App, AppState};
+use octorus::app::{App, AppState, RepositoryAvailability};
 use octorus::config::Config;
 use predicates::prelude::*;
 use ratatui::backend::TestBackend;
@@ -416,7 +416,11 @@ async fn git_ops_screen_works_in_a_repo_less_session() {
     }
     let working_dir = tmp.path().to_string_lossy().to_string();
 
-    let mut app = App::new_pr_list("local", Config::default());
+    let mut app = App::new_pr_list(
+        "local",
+        Config::default(),
+        RepositoryAvailability::Unavailable,
+    );
     app.set_working_dir(Some(working_dir.clone()));
     app.open_git_ops();
 

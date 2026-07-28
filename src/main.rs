@@ -436,17 +436,27 @@ async fn main() -> Result<()> {
     }
 
     if args.local {
-        run_with_local_diff(&repo, &config, &args).await
+        run_with_local_diff(&repo, &config, &args, repo_available).await
     } else if let Some(pr) = args.pr.filter(|&n| n > 0) {
-        run_with_pr(&repo, pr, &config, &args).await
+        run_with_pr(&repo, pr, &config, &args, repo_available).await
     } else {
-        run_with_pr_list(&repo, config, &args, args.issue).await
+        run_with_pr_list(&repo, config, &args, args.issue, repo_available).await
     }
 }
 
-async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -> Result<()> {
+async fn run_with_local_diff(
+    repo: &str,
+    config: &config::Config,
+    args: &Args,
+    repo_available: bool,
+) -> Result<()> {
     let (retry_tx, mut retry_rx) = mpsc::channel::<RefreshRequest>(1);
-    let (mut app, tx) = app::App::new_loading(repo, 0, config.clone());
+    let repository_availability = if repo_available {
+        app::RepositoryAvailability::Available
+    } else {
+        app::RepositoryAvailability::Unavailable
+    };
+    let (mut app, tx) = app::App::new_loading(repo, 0, config.clone(), repository_availability);
     let working_dir = args.working_dir.clone();
     let refresh_pending = Arc::new(AtomicBool::new(false));
 
@@ -478,8 +488,18 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
             _ = token_clone.cancelled() => {}
             _ = async {
                 while let Some(request) = retry_rx.recv().await {
-                    match request {
-                        RefreshRequest::LocalRefresh => {
+                    match local_startup_refresh_route(request) {
+                        LocalStartupRefreshRoute::PullRequest(pr_number) => {
+                            let tx_retry = tx.clone();
+                            loader::fetch_pr_data(
+                                repo.clone(),
+                                pr_number,
+                                loader::FetchMode::Fresh,
+                                tx_retry,
+                            )
+                            .await;
+                        }
+                        LocalStartupRefreshRoute::WatchedLocal => {
                             refresh_pending.store(false, Ordering::Release);
 
                             loop {
@@ -491,9 +511,8 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
                                 }
                             }
                         }
-                        RefreshRequest::PrRefresh { .. } => {
-                            // In local mode, pr_number == 0 is a dummy value that would
-                            // produce invalid API calls, so treat PrRefresh as LocalRefresh.
+                        LocalStartupRefreshRoute::LocalSentinel => {
+                            // PR zero is the local-mode sentinel, never a GitHub PR number.
                             let tx_retry = tx.clone();
                             loader::fetch_local_diff(repo.clone(), working_dir.clone(), tx_retry).await;
                         }
@@ -513,6 +532,23 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
 
     let exit_code = if result.is_ok() { 0 } else { 1 };
     std::process::exit(exit_code);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalStartupRefreshRoute {
+    WatchedLocal,
+    LocalSentinel,
+    PullRequest(u32),
+}
+
+fn local_startup_refresh_route(request: RefreshRequest) -> LocalStartupRefreshRoute {
+    match request {
+        RefreshRequest::PrRefresh { pr_number } if pr_number > 0 => {
+            LocalStartupRefreshRoute::PullRequest(pr_number)
+        }
+        RefreshRequest::PrRefresh { .. } => LocalStartupRefreshRoute::LocalSentinel,
+        RefreshRequest::LocalRefresh => LocalStartupRefreshRoute::WatchedLocal,
+    }
 }
 
 fn setup_local_watch(
@@ -572,11 +608,22 @@ fn is_octorus_config_file(path: &Path) -> bool {
 }
 
 /// Run the app with a specific PR number (existing flow)
-async fn run_with_pr(repo: &str, pr: u32, config: &config::Config, args: &Args) -> Result<()> {
+async fn run_with_pr(
+    repo: &str,
+    pr: u32,
+    config: &config::Config,
+    args: &Args,
+    repo_available: bool,
+) -> Result<()> {
     let (retry_tx, mut retry_rx) = mpsc::channel::<RefreshRequest>(1);
     let refresh_pending = Arc::new(AtomicBool::new(false));
 
-    let (mut app, tx) = app::App::new_loading(repo, pr, config.clone());
+    let repository_availability = if repo_available {
+        app::RepositoryAvailability::Available
+    } else {
+        app::RepositoryAvailability::Unavailable
+    };
+    let (mut app, tx) = app::App::new_loading(repo, pr, config.clone(), repository_availability);
 
     app.set_retry_sender(retry_tx);
     start_update_check(&mut app);
@@ -648,12 +695,18 @@ async fn run_with_pr_list(
     config: config::Config,
     args: &Args,
     issue_arg: Option<u32>,
+    repo_available: bool,
 ) -> Result<()> {
     // Retry channel also handles PR list → Local mode transitions.
     let (retry_tx, mut retry_rx) = mpsc::channel::<RefreshRequest>(1);
     let refresh_pending = Arc::new(AtomicBool::new(false));
 
-    let mut app = app::App::new_pr_list(repo, config);
+    let repository_availability = if repo_available {
+        app::RepositoryAvailability::Available
+    } else {
+        app::RepositoryAvailability::Unavailable
+    };
+    let mut app = app::App::new_pr_list(repo, config, repository_availability);
     app.set_retry_sender(retry_tx);
     start_update_check(&mut app);
     setup_working_dir(&mut app, args);
@@ -1014,6 +1067,22 @@ mod tests {
         let args = Args::parse_from(["or", "--git-ops"]);
 
         assert!(tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_local_startup_refresh_route_distinguishes_every_dispatch_target() {
+        assert_eq!(
+            local_startup_refresh_route(RefreshRequest::PrRefresh { pr_number: 42 }),
+            LocalStartupRefreshRoute::PullRequest(42)
+        );
+        assert_eq!(
+            local_startup_refresh_route(RefreshRequest::PrRefresh { pr_number: 0 }),
+            LocalStartupRefreshRoute::LocalSentinel
+        );
+        assert_eq!(
+            local_startup_refresh_route(RefreshRequest::LocalRefresh),
+            LocalStartupRefreshRoute::WatchedLocal
+        );
     }
 
     #[test]

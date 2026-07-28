@@ -75,6 +75,7 @@ pub struct KeybindingsConfig {
     pub symbol_search: KeySequence,
     pub toggle_blame: KeySequence,
     pub open_blame_commit: KeySequence,
+    pub open_blame_pr: KeySequence,
 
     pub filter_open: KeySequence,
     pub filter_closed: KeySequence,
@@ -158,6 +159,7 @@ impl Default for KeybindingsConfig {
             symbol_search: KeySequence::single(KeyBinding::char('s')),
             toggle_blame: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('b')),
             open_blame_commit: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('c')),
+            open_blame_pr: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('p')),
 
             filter_open: KeySequence::single(KeyBinding::char('o')),
             filter_closed: KeySequence::single(KeyBinding::char('c')),
@@ -242,6 +244,7 @@ impl KeybindingsConfig {
             ("symbol_search", &self.symbol_search),
             ("toggle_blame", &self.toggle_blame),
             ("open_blame_commit", &self.open_blame_commit),
+            ("open_blame_pr", &self.open_blame_pr),
             ("shell_command", &self.shell_command),
             ("filter_open", &self.filter_open),
             ("filter_closed", &self.filter_closed),
@@ -481,6 +484,7 @@ impl Serialize for KeybindingsConfig {
         map.serialize_entry("symbol_search", &seq_to_value(&self.symbol_search))?;
         map.serialize_entry("toggle_blame", &seq_to_value(&self.toggle_blame))?;
         map.serialize_entry("open_blame_commit", &seq_to_value(&self.open_blame_commit))?;
+        map.serialize_entry("open_blame_pr", &seq_to_value(&self.open_blame_pr))?;
         map.serialize_entry("shell_command", &seq_to_value(&self.shell_command))?;
         map.serialize_entry("filter_open", &seq_to_value(&self.filter_open))?;
         map.serialize_entry("filter_closed", &seq_to_value(&self.filter_closed))?;

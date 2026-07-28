@@ -226,7 +226,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::app::{
-        DestructiveOp, GitOpsState, PendingGitOpsConfirm, SimulationPreview, SimulationResult,
+        DestructiveOp, GitOpsState, PendingGitOpsConfirm, RepositoryAvailability,
+        SimulationPreview, SimulationResult,
     };
     use crate::config::Config;
     use crate::gitfilm::{GitfilmAreaSnapshot, GitfilmFileEntry, GitfilmRepoState};
@@ -239,7 +240,7 @@ mod tests {
         tokio::sync::mpsc::Sender<crate::loader::DataLoadResult>,
     ) {
         let config = Config::default();
-        crate::app::App::new_loading("owner/repo", 1, config)
+        crate::app::App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available)
     }
 
     fn empty_snapshot() -> GitfilmAreaSnapshot {

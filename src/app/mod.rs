@@ -28,9 +28,9 @@ pub use types::{
     HelpTab, IndexEntry, InputMode, InternedSpan, IssueDetailFocus, IssueState, JumpLocation,
     LeftPaneFocus, LineInputContext, LoadState, LogEntry, LogEventType, MultilineSelection,
     PauseState, PendingGitOpsConfirm, PendingPostConfirmation, PermissionInfo, PrListState,
-    RefreshRequest, RepoSymbolSearchResult, ReviewAction, ShellCommandResult, ShellPhase,
-    ShellState, SimulationPreview, SimulationResult, SpanVec, SymbolPopupState, SymbolSearchState,
-    SymbolSearchUpdate, TreeRow, UndoAction, WatcherHandle,
+    PrOpenSource, RefreshRequest, RepoSymbolSearchResult, RepositoryAvailability, ReviewAction,
+    ShellCommandResult, ShellPhase, ShellState, SimulationPreview, SimulationResult, SpanVec,
+    SymbolPopupState, SymbolSearchState, SymbolSearchUpdate, TreeRow, UndoAction, WatcherHandle,
 };
 // Internal-only types (not re-exported from crate::app)
 use types::MarkViewedResult;
@@ -76,8 +76,10 @@ pub struct SuggestionHighlightCache {
 
 pub struct App {
     pub repo: String,
+    repository_availability: RepositoryAvailability,
     /// 選択されたPR番号（PR一覧から選択した場合は後から設定）
     pub pr_number: Option<u32>,
+    pub(crate) pr_open_source: PrOpenSource,
     pub data_state: DataState,
     pub state: AppState,
     // PR list state
@@ -207,7 +209,9 @@ impl App {
         let submit_key = config.keybindings.submit.clone();
         Self {
             repo,
+            repository_availability: RepositoryAvailability::Unavailable,
             pr_number: Some(1),
+            pr_open_source: PrOpenSource::Standard,
             data_state: DataState::Loading,
             state: AppState::FileList,
             prs: PrListState::default(),
@@ -285,10 +289,12 @@ impl App {
         repo: &str,
         pr_number: u32,
         config: Config,
+        repository_availability: RepositoryAvailability,
     ) -> (Self, mpsc::Sender<DataLoadResult>) {
         let (tx, rx) = mpsc::channel(2);
         let mut app = Self::base_app(repo.to_string(), config);
         // Overrides from base_app defaults
+        app.repository_availability = repository_availability;
         app.pr_number = Some(pr_number);
         app.original_pr_number = Some(pr_number);
         app.data_receiver = Some((pr_number, rx));
@@ -296,10 +302,15 @@ impl App {
         (app, tx)
     }
 
-    pub fn new_pr_list(repo: &str, config: Config) -> Self {
+    pub fn new_pr_list(
+        repo: &str,
+        config: Config,
+        repository_availability: RepositoryAvailability,
+    ) -> Self {
         let zen_mode = config.layout.zen_mode;
         let mut app = Self::base_app(repo.to_string(), config);
         // Overrides from base_app defaults
+        app.repository_availability = repository_availability;
         app.pr_number = None;
         app.state = AppState::PullRequestList;
         app.prs.pr_list = LoadState::Loading;
@@ -312,12 +323,39 @@ impl App {
     pub fn new_cockpit(repo: &str, config: Config, repo_available: bool) -> Self {
         let zen_mode = config.layout.zen_mode;
         let mut app = Self::base_app(repo.to_string(), config);
+        app.repository_availability = if repo_available {
+            RepositoryAvailability::Available
+        } else {
+            RepositoryAvailability::Unavailable
+        };
         app.pr_number = None;
         app.state = AppState::Cockpit;
         app.home_state = Some(AppState::Cockpit);
         app.zen_mode = zen_mode;
         app.cockpit_state = Some(CockpitState::new(repo_available));
         app
+    }
+
+    pub fn set_repository_availability(&mut self, availability: RepositoryAvailability) {
+        self.repository_availability = availability;
+    }
+
+    pub fn repository_availability(&self) -> RepositoryAvailability {
+        self.repository_availability
+    }
+
+    pub(crate) fn pr_open_notice(&self) -> Option<String> {
+        if !self.state.is_pr_review() {
+            return None;
+        }
+        match &self.pr_open_source {
+            PrOpenSource::InferredCommitSubject { .. } => {
+                self.pr_number.filter(|number| *number > 0).map(|number| {
+                    format!("PR #{number} inferred from commit subject; GitHub did not confirm it")
+                })
+            }
+            PrOpenSource::Standard | PrOpenSource::ConfirmedCommit { .. } => None,
+        }
     }
 
     /// PR一覧受信チャンネルを設定

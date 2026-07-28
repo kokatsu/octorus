@@ -68,6 +68,8 @@ pub fn build_footer_line_with_focus<'a>(
             format!("{} {}", icon, message),
             Style::default().fg(color),
         ))
+    } else if let Some(message) = app.pr_open_notice() {
+        Line::from(Span::styled(message, Style::default().fg(Color::Yellow)))
     } else {
         let mut spans = vec![Span::raw(help_text)];
         if app.cmt.comments_loading {
@@ -149,7 +151,8 @@ fn render_shell_input_line(input: &str, cursor: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, AppState, PrOpenSource};
+    use insta::assert_snapshot;
 
     const HELP: &str = "j/k: move | q: quit";
 
@@ -218,6 +221,38 @@ mod tests {
         // Check color is red
         let style = line.spans[0].style;
         assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn test_inferred_commit_pr_notice_persists_in_the_pr_footer() {
+        let mut app = App::new_for_test();
+        app.state = AppState::FileList;
+        app.pr_number = Some(123);
+        app.pr_open_source = PrOpenSource::InferredCommitSubject {
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+
+        let line = build_footer_line(&app, HELP);
+
+        assert_eq!(
+            line_to_string(&line),
+            "PR #123 inferred from commit subject; GitHub did not confirm it"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn test_inferred_commit_pr_notice_does_not_replace_issue_list_footer_help() {
+        let mut app = App::new_for_test();
+        app.state = AppState::IssueList;
+        app.pr_number = Some(123);
+        app.pr_open_source = PrOpenSource::InferredCommitSubject {
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+
+        let line = build_footer_line(&app, HELP);
+
+        assert_snapshot!(line_to_string(&line), @"j/k: move | q: quit");
     }
 
     #[test]

@@ -119,6 +119,12 @@ mod tests {
                 .any(|error| error.contains("open_blame_commit")),
             "open_blame_commit must remain a reported owner: {prefix_conflicts:?}"
         );
+        assert!(
+            prefix_conflicts
+                .iter()
+                .any(|error| error.contains("open_blame_pr")),
+            "open_blame_pr must remain a reported owner: {prefix_conflicts:?}"
+        );
     }
 
     #[test]
@@ -1171,6 +1177,45 @@ timeout_secs = 3600
         }));
     }
 
+    #[test]
+    fn test_open_blame_pr_keybinding_default_custom_and_serialize_roundtrip() {
+        let config = KeybindingsConfig::default();
+        assert_eq!(config.open_blame_pr.display(), "gp");
+        assert!(config.validate().is_ok());
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("open_blame_pr"));
+        let parsed: KeybindingsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.open_blame_pr.display(), "gp");
+
+        let custom: Config = toml::from_str(
+            r#"
+            [keybindings]
+            open_blame_pr = "x"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(custom.keybindings.open_blame_pr.display(), "x");
+    }
+
+    #[test]
+    fn test_open_blame_pr_rejects_an_exact_browser_sequence_collision() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            open_blame_pr = ["g", "b"]
+            "#,
+        )
+        .unwrap();
+
+        let errors = config.keybindings.validate().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("duplicate key sequence")
+                && error.contains("open_blame_pr")
+                && error.contains("toggle_blame")
+        }));
+    }
+
     /// KeybindingsConfig の全フィールドが serialize に含まれることを検証。
     /// 新しいフィールドを追加した際に serialize_entry の追加を忘れるとここで落ちる。
     #[test]
@@ -1229,6 +1274,7 @@ timeout_secs = 3600
             "tree_toggle",
             "toggle_blame",
             "open_blame_commit",
+            "open_blame_pr",
         ];
 
         for field in &expected_fields {
