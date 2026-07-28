@@ -13,6 +13,7 @@ use crate::filter::ListFilter;
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
 use super::browse::{BrowseCommitDiffState, BrowseOverlay, IndexState, PrLookupState};
+use super::browse_discussion::{DiscussionView, LineDiscussionState};
 use super::{App, AppState, PrOpenSource};
 
 /// Rows moved by a page key when the real viewport height is unknown.
@@ -98,6 +99,9 @@ impl App {
         key: event::KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
+        if self.handle_line_discussion_input(&key) {
+            return Ok(());
+        }
         if self.handle_pr_lookup_selection_input(&key) {
             return Ok(());
         }
@@ -116,6 +120,10 @@ impl App {
         }
         if self.matches_single_key(&key, &kb.open_blame_pr) {
             self.open_browse_blame_pr();
+            return Ok(());
+        }
+        if self.matches_single_key(&key, &kb.open_line_discussion) {
+            self.open_browse_line_discussion();
             return Ok(());
         }
         if self.handle_browse_shared_input(&key) {
@@ -205,6 +213,74 @@ impl App {
         if let Some((number, sha)) = selected_pull {
             self.open_pr_from_browse(number, PrOpenSource::ConfirmedCommit { sha });
         }
+        true
+    }
+
+    fn handle_line_discussion_input(&mut self, key: &event::KeyEvent) -> bool {
+        let kb = self.config.keybindings.clone();
+        let close = key.code == KeyCode::Esc || self.matches_single_key(key, &kb.quit);
+        let down = self.matches_single_key(key, &kb.move_down);
+        let up = self.matches_single_key(key, &kb.move_up);
+        let confirm = self.matches_single_key(key, &kb.open_panel);
+
+        let Some(state) = self.browse_state.as_mut() else {
+            return false;
+        };
+        match &mut state.line_discussion {
+            LineDiscussionState::Ready { index, view, .. } => match view {
+                DiscussionView::Closed => return false,
+                DiscussionView::ThreadList {
+                    line,
+                    selected,
+                    scroll: _,
+                } => {
+                    let count = index.thread_indices_at(*line).len();
+                    if close {
+                        *view = DiscussionView::Closed;
+                    } else if down {
+                        *selected = (*selected + 1).min(count.saturating_sub(1));
+                    } else if up {
+                        *selected = selected.saturating_sub(1);
+                    } else if confirm && count > 0 {
+                        *view = DiscussionView::Expanded {
+                            line: *line,
+                            thread_position: *selected,
+                            selected: 0,
+                            scroll: 0,
+                        };
+                    }
+                }
+                DiscussionView::Expanded {
+                    line,
+                    thread_position,
+                    selected,
+                    scroll: _,
+                } => {
+                    let count = index
+                        .thread_indices_at(*line)
+                        .get(*thread_position)
+                        .and_then(|thread| index.threads.get(*thread))
+                        .map(|thread| thread.replies.len() + 1)
+                        .unwrap_or(0);
+                    if close {
+                        *view = DiscussionView::ThreadList {
+                            line: *line,
+                            selected: *thread_position,
+                            scroll: 0,
+                        };
+                    } else if down {
+                        *selected = (*selected + 1).min(count.saturating_sub(1));
+                    } else if up {
+                        *selected = selected.saturating_sub(1);
+                    }
+                }
+            },
+            LineDiscussionState::Idle
+            | LineDiscussionState::ResolvingPullRequests { .. }
+            | LineDiscussionState::LoadingComments { .. }
+            | LineDiscussionState::Failed { .. } => return false,
+        }
+
         true
     }
 
@@ -312,6 +388,11 @@ impl App {
                 self.open_browse_blame_pr();
                 return Ok(true);
             }
+            if self.try_match_sequence(&kb.open_line_discussion) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                self.open_browse_line_discussion();
+                return Ok(true);
+            }
             if self.try_match_sequence(&kb.go_to_definition) == SequenceMatch::Full {
                 self.clear_pending_keys();
                 self.browse_run_go_to_definition();
@@ -337,6 +418,7 @@ impl App {
         let starts_sequence = self.key_could_match_sequence(key, &kb.toggle_blame)
             || self.key_could_match_sequence(key, &kb.open_blame_commit)
             || self.key_could_match_sequence(key, &kb.open_blame_pr)
+            || self.key_could_match_sequence(key, &kb.open_line_discussion)
             || self.key_could_match_sequence(key, &kb.go_to_definition)
             || self.key_could_match_sequence(key, &kb.go_to_file)
             || self.key_could_match_sequence(key, &kb.jump_to_first);
@@ -754,6 +836,15 @@ mod tests {
         KeyEvent {
             code,
             modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn press_binding(binding: KeyBinding) -> KeyEvent {
+        KeyEvent {
+            code: binding.code.to_keycode(),
+            modifiers: binding.modifiers.to_crossterm(),
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
@@ -1285,6 +1376,48 @@ mod tests {
             app.browse_state.as_ref().unwrap().status.as_deref(),
             Some("No pull request found for commit aaaaaaa")
         );
+    }
+
+    #[test]
+    fn test_scenario_configurable_line_discussion_key_works_as_single_and_default_sequence() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             summary pushed directly\n\
+             filename a.rs\n\
+             \tone\n";
+
+        for binding in [
+            KeySequence::single(KeyBinding::char('x')),
+            KeySequence::double(KeyBinding::char('g'), KeyBinding::char('r')),
+        ] {
+            let mut app = browsing_app(&["a.rs"]);
+            app.set_repository_availability(RepositoryAvailability::Available);
+            attach_open_file(&mut app, "a.rs", "one\n", Vec::new());
+            attach_blame(&mut app, "a.rs", COMMITTED);
+            app.state = AppState::RepoBrowseFile;
+            app.config.keybindings.open_line_discussion = binding.clone();
+            app.session_cache
+                .put_commit_pr_resolution(SHA.to_string(), CommitPrResolution::NotFound);
+            let mut terminal = test_terminal();
+
+            for key in &binding.keys {
+                app.handle_repo_browse_file_input(press_binding(*key), &mut terminal)
+                    .unwrap();
+            }
+
+            assert_eq!(
+                app.browse_state.as_ref().unwrap().status.as_deref(),
+                Some("No confirmed pull request found for this file")
+            );
+            assert!(matches!(
+                app.browse_state.as_ref().unwrap().line_discussion,
+                LineDiscussionState::Failed {
+                    failure: crate::app::browse_discussion::LineDiscussionFailure::NoPullRequest,
+                    ..
+                }
+            ));
+        }
     }
 
     #[tokio::test]

@@ -1,13 +1,13 @@
 //! Benchmarks for the pure `git blame --porcelain` parser.
 //!
 //! Speed is the smaller half of what this guards. The parser's whole design
-//! rests on two claims — one `u32` per line, and an allocation count that does
+//! rests on two claims — two `u32`s per line, and an allocation count that does
 //! not scale with the number of commits — and both are invisible to
 //! `cargo test`. `allocation_count_does_not_scale_with_commit_count` below
 //! fails loudly if either regresses.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use octorus::github::parse_porcelain;
+use octorus::github::{parse_porcelain, BLAME_LINE_BYTES};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -111,6 +111,12 @@ fn allocation_count_does_not_scale_with_commit_count(c: &mut Criterion) {
     const LINES: usize = 5_000;
     /// Five per commit is what per-commit `String` storage costs.
     const REJECTED_SHAPE: usize = LINES * 5;
+
+    assert_eq!(
+        BLAME_LINE_BYTES,
+        2 * std::mem::size_of::<u32>(),
+        "the retained blame-line layout grew"
+    );
 
     let few_commits = synthetic_porcelain(LINES, LINES); // 1 commit
     let many_commits = synthetic_porcelain(LINES, 1); // 5,000 commits

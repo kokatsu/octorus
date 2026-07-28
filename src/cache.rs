@@ -14,6 +14,10 @@ use crate::github::{ChangedFile, CommitPrResolution, PullRequest};
 /// セッションキャッシュが保持するPRデータの最大エントリ数。
 /// 超過時は最も古いエントリ（LRU）を削除してメモリ増加を防止する。
 const MAX_PR_CACHE_ENTRIES: usize = 5;
+/// Browser-only inline review-comment payloads are complete enough for line
+/// anchoring but intentionally separate from the normal comment screen's
+/// inline-comments-plus-review-summaries payload.
+const MAX_BROWSER_REVIEW_COMMENT_ENTRIES: usize = 5;
 
 /// Sanitize repository name to prevent path traversal attacks.
 /// Only allows alphanumeric characters, underscores, hyphens, and single dots (not ".." sequences).
@@ -276,6 +280,8 @@ pub struct SessionCache {
     /// アクセス順序リスト（末尾が最新）。LRU eviction に使用。
     access_order: Vec<PrCacheKey>,
     review_comments: HashMap<PrCacheKey, Vec<ReviewComment>>,
+    browser_review_comments: HashMap<PrCacheKey, Vec<ReviewComment>>,
+    browser_review_comment_order: Vec<PrCacheKey>,
     discussion_comments: HashMap<PrCacheKey, Vec<DiscussionComment>>,
     commit_pr_resolutions: HashMap<String, CommitPrResolution>,
 }
@@ -292,6 +298,8 @@ impl SessionCache {
             pr_data: HashMap::new(),
             access_order: Vec::new(),
             review_comments: HashMap::new(),
+            browser_review_comments: HashMap::new(),
+            browser_review_comment_order: Vec::new(),
             discussion_comments: HashMap::new(),
             commit_pr_resolutions: HashMap::new(),
         }
@@ -349,6 +357,37 @@ impl SessionCache {
         self.review_comments.remove(key);
     }
 
+    pub fn get_browser_review_comments(&mut self, key: &PrCacheKey) -> Option<&[ReviewComment]> {
+        if !self.browser_review_comments.contains_key(key) {
+            return None;
+        }
+        self.touch_browser_review_comments(key);
+        self.browser_review_comments.get(key).map(Vec::as_slice)
+    }
+
+    pub fn put_browser_review_comments(&mut self, key: PrCacheKey, comments: Vec<ReviewComment>) {
+        self.touch_browser_review_comments(&key);
+        self.browser_review_comments.insert(key, comments);
+        while self.browser_review_comments.len() > MAX_BROWSER_REVIEW_COMMENT_ENTRIES {
+            let Some(oldest) = self.browser_review_comment_order.first().cloned() else {
+                break;
+            };
+            self.browser_review_comment_order.remove(0);
+            self.browser_review_comments.remove(&oldest);
+        }
+    }
+
+    fn touch_browser_review_comments(&mut self, key: &PrCacheKey) {
+        if let Some(position) = self
+            .browser_review_comment_order
+            .iter()
+            .position(|candidate| candidate == key)
+        {
+            self.browser_review_comment_order.remove(position);
+        }
+        self.browser_review_comment_order.push(key.clone());
+    }
+
     pub fn get_discussion_comments(&self, key: &PrCacheKey) -> Option<&[DiscussionComment]> {
         self.discussion_comments.get(key).map(|v| v.as_slice())
     }
@@ -385,6 +424,8 @@ impl SessionCache {
         self.pr_data.clear();
         self.access_order.clear();
         self.review_comments.clear();
+        self.browser_review_comments.clear();
+        self.browser_review_comment_order.clear();
         self.discussion_comments.clear();
         self.commit_pr_resolutions.clear();
     }
@@ -397,6 +438,11 @@ impl SessionCache {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.pr_data.is_empty()
+    }
+
+    #[cfg(test)]
+    fn browser_review_comment_entry_count(&self) -> usize {
+        self.browser_review_comments.len()
     }
 }
 
@@ -429,6 +475,18 @@ mod tests {
             },
             updated_at: updated_at.to_string(),
         }
+    }
+
+    fn make_review_comment(id: u64) -> ReviewComment {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "path": "src/lib.rs",
+            "line": 1,
+            "body": format!("comment {id}"),
+            "user": { "login": "reviewer" },
+            "created_at": "2026-07-28T00:00:00Z"
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -557,6 +615,7 @@ mod tests {
             },
             created_at: "2026-03-24T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         })];
 
         save_local_review_comments_with_base(
@@ -697,6 +756,7 @@ mod tests {
                 },
                 created_at: "2026-04-27T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             }),
             LocalReviewComment::new(ReviewComment {
                 id: 2,
@@ -709,6 +769,7 @@ mod tests {
                 },
                 created_at: "2026-04-27T00:01:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             }),
         ];
         save_local_review_comments_with_base(
@@ -812,6 +873,53 @@ mod tests {
         cache.put_review_comments(key.clone(), vec![]);
         let comments = cache.get_review_comments(&key).unwrap();
         assert!(comments.is_empty());
+    }
+
+    #[test]
+    fn browser_inline_comments_are_bounded_without_pr_data_and_do_not_replace_complete_comments() {
+        let mut cache = SessionCache::new();
+        let complete_key = PrCacheKey {
+            repo: "owner/repo".to_string(),
+            pr_number: 1,
+        };
+        cache.put_pr_data(
+            complete_key.clone(),
+            PrData {
+                pr: Box::new(make_test_pr("test", "2024-01-01")),
+                files: vec![],
+                pr_updated_at: "2024-01-01".to_string(),
+            },
+        );
+        cache.put_review_comments(complete_key.clone(), vec![make_review_comment(1)]);
+        cache.put_browser_review_comments(complete_key.clone(), vec![make_review_comment(2)]);
+
+        assert_eq!(cache.get_review_comments(&complete_key).unwrap()[0].id, 1);
+        assert_eq!(
+            cache.get_browser_review_comments(&complete_key).unwrap()[0].id,
+            2
+        );
+
+        for number in 2..=(MAX_BROWSER_REVIEW_COMMENT_ENTRIES as u32 + 2) {
+            cache.put_browser_review_comments(
+                PrCacheKey {
+                    repo: "owner/repo".to_string(),
+                    pr_number: number,
+                },
+                vec![],
+            );
+        }
+
+        assert!(cache
+            .get_browser_review_comments(&PrCacheKey {
+                repo: "owner/repo".to_string(),
+                pr_number: 2,
+            })
+            .is_none());
+        assert_eq!(
+            cache.browser_review_comment_entry_count(),
+            MAX_BROWSER_REVIEW_COMMENT_ENTRIES
+        );
+        assert_eq!(cache.get_review_comments(&complete_key).unwrap()[0].id, 1);
     }
 
     #[test]

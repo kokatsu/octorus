@@ -1029,6 +1029,10 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             fmt_key(&kb.open_blame_pr.display(), key_width)
         )),
         Line::from(format!(
+            "{}  Open review discussion for the current line",
+            fmt_key(&kb.open_line_discussion.display(), key_width)
+        )),
+        Line::from(format!(
             "{}  Go to definition (tree-sitter index)",
             fmt_key(&kb.go_to_definition.display(), key_width)
         )),

@@ -125,6 +125,12 @@ mod tests {
                 .any(|error| error.contains("open_blame_pr")),
             "open_blame_pr must remain a reported owner: {prefix_conflicts:?}"
         );
+        assert!(
+            prefix_conflicts
+                .iter()
+                .any(|error| error.contains("open_line_discussion")),
+            "open_line_discussion must remain a reported owner: {prefix_conflicts:?}"
+        );
     }
 
     #[test]
@@ -1216,6 +1222,32 @@ timeout_secs = 3600
         }));
     }
 
+    #[test]
+    fn test_open_line_discussion_is_configurable_serialized_and_collision_checked() {
+        let config = KeybindingsConfig::default();
+        assert_eq!(config.open_line_discussion.display(), "gr");
+        assert!(config.validate().is_ok());
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("open_line_discussion"));
+        let parsed: KeybindingsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.open_line_discussion.display(), "gr");
+
+        let collision: Config = toml::from_str(
+            r#"
+            [keybindings]
+            open_line_discussion = ["g", "b"]
+            "#,
+        )
+        .unwrap();
+        let errors = collision.keybindings.validate().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("duplicate key sequence")
+                && error.contains("open_line_discussion")
+                && error.contains("toggle_blame")
+        }));
+    }
+
     /// KeybindingsConfig の全フィールドが serialize に含まれることを検証。
     /// 新しいフィールドを追加した際に serialize_entry の追加を忘れるとここで落ちる。
     #[test]
@@ -1275,6 +1307,7 @@ timeout_secs = 3600
             "toggle_blame",
             "open_blame_commit",
             "open_blame_pr",
+            "open_line_discussion",
         ];
 
         for field in &expected_fields {

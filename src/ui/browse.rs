@@ -19,6 +19,9 @@ use crate::app::browse::{
     BlameCoverage, BlameGutter, BlameGutterWidth, BlameState, BrowseCommitDiffState, BrowseOverlay,
     BrowseState, PrLookupState, BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
 };
+use crate::app::browse_discussion::{
+    DiscussionIndex, DiscussionView, LineDiscussionFailure, LineDiscussionState,
+};
 use crate::app::{App, AppState, CachedDiffLine, DiffCache, LoadState, TreeRow};
 use crate::diff::LineType;
 use crate::github::{CommitPullRequest, CommitPullRequestState};
@@ -30,6 +33,7 @@ use crate::symbols::Symbol;
 /// grows rather than overflowing — see [`gutter_width`].
 const LINE_NUMBER_WIDTH: usize = 5;
 const MIN_CODE_WIDTH_WITH_BLAME: usize = 24;
+const DISCUSSION_GUTTER_WIDTH: usize = 2;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let zen = app.zen_mode;
@@ -291,8 +295,19 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         } if path == &open.path => Some(gutter),
         _ => None,
     };
+    let discussion = match state.line_discussion {
+        LineDiscussionState::Ready { ref index, .. } => Some(index),
+        _ => None,
+    };
     let content_width = area.width.saturating_sub(2) as usize;
-    let lines = content_lines(&window, state.cursor_line, bg_color, blame, content_width);
+    let lines = content_lines(
+        &window,
+        state.cursor_line,
+        bg_color,
+        blame,
+        discussion,
+        content_width,
+    );
 
     let building = matches!(state.index, crate::app::browse::IndexState::Building);
     let title = if open.cache.highlighted || !building {
@@ -509,10 +524,13 @@ fn content_lines<'a>(
     cursor_line: usize,
     bg_color: bool,
     blame: Option<&'a BlameGutter>,
+    discussion: Option<&DiscussionIndex>,
     content_width: usize,
 ) -> Vec<Line<'a>> {
     let width = gutter_width(window.total);
-    let blame_width = blame_gutter_width(content_width, window.total);
+    let discussion_width = discussion.map_or(0, |_| DISCUSSION_GUTTER_WIDTH);
+    let blame_width =
+        blame_gutter_width(content_width.saturating_sub(discussion_width), window.total);
     window
         .lines
         .iter()
@@ -526,6 +544,16 @@ fn content_lines<'a>(
                 spans.push(Span::styled(
                     gutter.text(line_index, blame_width),
                     Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(index) = discussion {
+                spans.push(Span::styled(
+                    if index.thread_indices_at(line_index).is_empty() {
+                        "  "
+                    } else {
+                        "● "
+                    },
+                    Style::default().fg(Color::Cyan),
                 ));
             }
             spans.push(Span::styled(
@@ -576,6 +604,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let status = state.and_then(|state| state.status.as_deref());
     let commit_diff = state.map(|state| &state.commit_diff);
     let pr_lookup = state.map(|state| &state.pr_lookup);
+    let line_discussion = state.map(|state| &state.line_discussion);
     let coverage = if app.state == AppState::RepoBrowseFile {
         state.and_then(|state| match (&state.open, &state.blame) {
             (Some(open), BlameState::Ready { path, gutter }) if open.path == *path => {
@@ -599,7 +628,41 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Some(PrLookupState::Idle | PrLookupState::Failed { .. }) | None => None,
     };
 
-    let text: std::borrow::Cow<'_, str> = if let Some(text) = lookup_text {
+    let discussion_text = match line_discussion {
+        Some(LineDiscussionState::ResolvingPullRequests { .. }) => Some(format!(
+            " {} Looking up pull requests for this file…",
+            app.spinner_char()
+        )),
+        Some(LineDiscussionState::LoadingComments { .. }) => Some(format!(
+            " {} Loading review discussions…",
+            app.spinner_char()
+        )),
+        Some(LineDiscussionState::Ready {
+            view: DiscussionView::ThreadList { .. },
+            ..
+        }) => Some(" j/k move | Enter expand thread | Esc close".to_string()),
+        Some(LineDiscussionState::Ready {
+            view: DiscussionView::Expanded { .. },
+            ..
+        }) => Some(" j/k move | Esc back to threads".to_string()),
+        Some(
+            LineDiscussionState::Idle
+            | LineDiscussionState::Ready {
+                view: DiscussionView::Closed,
+                ..
+            },
+        )
+        | None => None,
+        Some(LineDiscussionState::Failed { failure }) => match failure {
+            LineDiscussionFailure::NoPullRequest
+            | LineDiscussionFailure::Api
+            | LineDiscussionFailure::Anchor => None,
+        },
+    };
+
+    let text: std::borrow::Cow<'_, str> = if let Some(text) = discussion_text {
+        std::borrow::Cow::Owned(text)
+    } else if let Some(text) = lookup_text {
         std::borrow::Cow::Owned(text)
     } else {
         match commit_diff {
@@ -645,12 +708,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " blame covers {blame_lines} lines, this file shows {buffer_lines} — reopen the file to refresh"
             )),
             Some(BlameCoverage::Exact) | None => std::borrow::Cow::Owned(format!(
-                " {} outline | {} search | {} blame | {} diff | {} PR | {} def | {} edit | {} back",
+                " {} outline | {} search | {} blame | {} diff | {} PR | {} discuss | {} def | {} edit | {} back",
                 kb.symbol_outline.display(),
                 kb.symbol_search.display(),
                 kb.toggle_blame.display(),
                 kb.open_blame_commit.display(),
                 kb.open_blame_pr.display(),
+                kb.open_line_discussion.display(),
                 kb.go_to_definition.display(),
                 kb.go_to_file.display(),
                 kb.quit.display(),
@@ -669,10 +733,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn render_overlay(frame: &mut Frame, app: &App) {
-    let Some(state) = app.browse_state.as_ref() else {
+fn render_overlay(frame: &mut Frame, app: &mut App) {
+    let Some(state) = app.browse_state.as_mut() else {
         return;
     };
+
+    match &mut state.line_discussion {
+        LineDiscussionState::Ready { index, view, .. }
+            if !matches!(view, DiscussionView::Closed) =>
+        {
+            render_line_discussion(frame, index, view);
+            return;
+        }
+        _ => {}
+    }
 
     if let PrLookupState::Selecting {
         pulls, selected, ..
@@ -689,6 +763,69 @@ fn render_overlay(frame: &mut Frame, app: &App) {
             ref query,
             selected,
         } => render_symbol_search(frame, state, query, selected),
+    }
+}
+
+fn render_line_discussion(frame: &mut Frame, index: &DiscussionIndex, view: &mut DiscussionView) {
+    let area = overlay_rect(frame.area(), 80, 75);
+    clear_overlay_area(frame, area);
+    let content_area = if let Some(note) = index.confidence_note() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("⚠ Incomplete: {note}"),
+                Style::default().fg(Color::Yellow),
+            ))),
+            rows[0],
+        );
+        rows[1]
+    } else {
+        area
+    };
+    let resolved = HashSet::new();
+    match view {
+        DiscussionView::Closed => {}
+        DiscussionView::ThreadList {
+            line,
+            selected,
+            scroll,
+        } => crate::ui::comment_list::render_review_thread_list_data(
+            frame,
+            content_area,
+            crate::ui::comment_list::ReviewThreadListData {
+                comments: &index.comments,
+                threads: &index.threads,
+                visible_threads: Some(index.thread_indices_at(*line)),
+                selected: *selected,
+                resolved_ids: &resolved,
+            },
+            scroll,
+        ),
+        DiscussionView::Expanded {
+            line,
+            thread_position,
+            selected,
+            scroll,
+        } => {
+            let Some(thread_index) = index.thread_indices_at(*line).get(*thread_position) else {
+                return;
+            };
+            let Some(thread) = index.threads.get(*thread_index) else {
+                return;
+            };
+            crate::ui::comment_list::render_review_thread_data(
+                frame,
+                content_area,
+                &index.comments,
+                thread,
+                *selected,
+                scroll,
+                &resolved,
+            );
+        }
     }
 }
 
@@ -917,6 +1054,11 @@ mod tests {
         build_file_patch, BlameAnnotation, BrowseCommitDiffState, BrowseState, IndexState,
         OpenFile, PrLookupState, MAX_SYMBOL_SEARCH_RESULTS, MAX_VIEWABLE_FILE_LINES,
     };
+    use crate::app::browse_discussion::{
+        DiscussionIndex, DiscussionOutcome, DiscussionView, LineDiscussionFailure,
+        LineDiscussionState,
+    };
+    use crate::app::CommentThread;
     use crate::config::Config;
     use crate::diff_store::{DiffScrollState, ScrollMode};
     use crate::filter::ListFilter;
@@ -931,6 +1073,31 @@ mod tests {
     use std::borrow::Cow;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn discussion_index(line_count: usize, marked_line: usize) -> DiscussionIndex {
+        let comment = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "path": "main.rs",
+            "line": 2,
+            "body": "Discuss this line",
+            "user": { "login": "reviewer" },
+            "created_at": "2026-07-28T00:00:00Z"
+        }))
+        .unwrap();
+        let mut line_threads = vec![smallvec::SmallVec::new(); line_count];
+        line_threads[marked_line].push(0);
+        DiscussionIndex {
+            comments: vec![comment],
+            threads: vec![CommentThread {
+                root: 0,
+                replies: vec![],
+            }],
+            line_threads,
+            file_thread_count: 1,
+            comment_paths: vec!["main.rs".to_string()],
+            outcome: DiscussionOutcome::Complete,
+        }
+    }
 
     fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
@@ -1108,7 +1275,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
         "#);
     }
 
@@ -1251,6 +1418,75 @@ mod tests {
     }
 
     #[test]
+    fn discussion_failure_respects_existing_footer_priority_and_falls_back_to_status() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let annotation = blame_annotation(PORCELAIN);
+        let failed_discussion = || LineDiscussionState::Failed {
+            failure: LineDiscussionFailure::Api,
+        };
+        let footer = |app: &mut App| {
+            render_at(app, 100, 10)
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+
+        let mut commit_diff = app_with_browse(&["main.rs"]);
+        if let Some(state) = commit_diff.browse_state.as_mut() {
+            open_file(state, "main.rs", "one\n");
+            state.status = Some("Review comment API failed: rate limited".to_string());
+            state.line_discussion = failed_discussion();
+            state.commit_diff = BrowseCommitDiffState::Loading {
+                request_id: 1,
+                annotation: Arc::clone(&annotation),
+                cancel: state.cancel_token.child_token(),
+            };
+        }
+        commit_diff.state = AppState::RepoBrowseFile;
+
+        let mut pr_lookup = app_with_browse(&["main.rs"]);
+        if let Some(state) = pr_lookup.browse_state.as_mut() {
+            open_file(state, "main.rs", "one\n");
+            state.status = Some("Review comment API failed: rate limited".to_string());
+            state.line_discussion = failed_discussion();
+            state.pr_lookup = PrLookupState::Loading {
+                request_id: 2,
+                sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                cancel: state.cancel_token.child_token(),
+            };
+        }
+        pr_lookup.state = AppState::RepoBrowseFile;
+
+        let mut status = app_with_browse(&["main.rs"]);
+        if let Some(state) = status.browse_state.as_mut() {
+            open_file(state, "main.rs", "one\n");
+            state.status = Some("Review comment API failed: rate limited".to_string());
+            state.line_discussion = failed_discussion();
+        }
+        status.state = AppState::RepoBrowseFile;
+
+        assert_snapshot!(
+            format!(
+                "commit diff: {}\nPR lookup: {}\nstatus: {}",
+                footer(&mut commit_diff),
+                footer(&mut pr_lookup),
+                footer(&mut status),
+            ),
+            @"
+        commit diff: ⠋ Loading commit diff… | q/Esc back
+        PR lookup: ⠋ Looking up pull requests for aaaaaaa…
+        status: Review comment API failed: rate limited
+        "
+        );
+    }
+
+    #[test]
     fn test_large_commit_diff_renders_only_the_deep_visible_window() {
         const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
              author Alice\n\
@@ -1354,8 +1590,8 @@ mod tests {
                 footer_at(&mut app, 60)
             ),
             @"
-        80:  o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
-        60:  o outline | s search | gb blame | gc diff | gp PR | gd def
+        80:  o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
+        60:  o outline | s search | gb blame | gc diff | gp PR | gr disc
         "
         );
     }
@@ -1380,7 +1616,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
         ");
     }
 
@@ -1422,7 +1658,7 @@ mod tests {
         │  main.rs                               ││aaaaaaa Alice Example 2h ago        1 fn main() {}                          │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc back
         --- no time (90) ---
         ┌────────────────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                                                 │
@@ -1431,7 +1667,7 @@ mod tests {
         │  main.rs                     ││aaaaaaa Alice Example      1 fn main() {}               │
         │                              ││                                                        │
         └──────────────────────────────┘└────────────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc
         --- identity (70) ---
         ┌────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                             │
@@ -1440,7 +1676,7 @@ mod tests {
         │  main.rs              ││aaaaaaa         1 fn main() {}             │
         │                       ││                                           │
         └───────────────────────┘└───────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd d
         --- hidden (50) ---
         ┌────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -         │
@@ -1451,6 +1687,101 @@ mod tests {
         └────────────────┘└──────────────────────────────┘
          o outline | s search | gb blame | gc diff | gp PR
         ");
+    }
+
+    #[test]
+    fn test_discussion_marker_survives_after_the_blame_gutter_is_hidden() {
+        let cache = cache_of("first\nsecond\n");
+        let window = content_window(&cache, 0, 2);
+        let blame = BlameGutter::from_file(
+            parse_porcelain(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 2\n\
+                 author Alice\n\
+                 summary baseline\n\
+                 filename main.rs\n\
+                 \tfirst\n\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n\
+                 \tsecond\n",
+            ),
+            2,
+        );
+        let index = discussion_index(2, 1);
+
+        let rendered: Vec<String> =
+            content_lines(&window, 0, false, Some(&blame), Some(&index), 20)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect();
+
+        assert!(!rendered.join("\n").contains("aaaaaaa"));
+        assert!(rendered[0].starts_with("      1"), "{rendered:?}");
+        assert!(rendered[1].starts_with("●     2"), "{rendered:?}");
+    }
+
+    #[test]
+    fn test_browser_discussion_overlay_reuses_the_review_thread_renderer() {
+        let mut app = app_with_browse(&["main.rs"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "main.rs", "first\nsecond\n");
+            state.line_discussion = LineDiscussionState::Ready {
+                path: "main.rs".to_string(),
+                pr_numbers: vec![42],
+                index: discussion_index(2, 1),
+                view: DiscussionView::ThreadList {
+                    line: 1,
+                    selected: 0,
+                    scroll: 0,
+                },
+            };
+        }
+        app.state = AppState::RepoBrowseFile;
+
+        let rendered = render_at(&mut app, 100, 20);
+        assert!(rendered.contains("@reviewer on main.rs:2"), "{rendered}");
+        assert!(rendered.contains("Discuss this line"), "{rendered}");
+    }
+
+    #[test]
+    fn open_thread_list_overlay_renders_the_incomplete_index_note() {
+        let mut app = app_with_browse(&["main.rs"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(state, "main.rs", "first\nsecond\n");
+            let mut index = discussion_index(2, 1);
+            index.outcome = DiscussionOutcome::BudgetExhausted {
+                max_groups: crate::app::browse_discussion::MAX_DISCUSSION_ANCHOR_GROUPS,
+                max_lines: crate::app::browse_discussion::MAX_DISCUSSION_ANCHOR_LINES,
+            };
+            state.line_discussion = LineDiscussionState::Ready {
+                path: "main.rs".to_string(),
+                pr_numbers: vec![42],
+                index,
+                view: DiscussionView::ThreadList {
+                    line: 1,
+                    selected: 0,
+                    scroll: 0,
+                },
+            };
+        }
+        app.state = AppState::RepoBrowseFile;
+
+        let rendered = render_at(&mut app, 140, 20);
+        assert!(rendered.contains("@reviewer on main.rs:2"), "{rendered}");
+        let expected_note =
+            "⚠ Incomplete: the anchoring budget was reached (16 groups or 20000 lines maximum)";
+        let note = rendered
+            .lines()
+            .find(|line| line.contains(expected_note))
+            .map(|_| expected_note)
+            .unwrap_or("<missing>");
+        assert_snapshot!(
+            note,
+            @"⚠ Incomplete: the anchoring budget was reached (16 groups or 20000 lines maximum)"
+        );
     }
 
     #[test]
@@ -1487,7 +1818,7 @@ mod tests {
         │                                        ││Uncommitted                         3 third                                 │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc back
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc back
         ");
     }
 
@@ -1579,7 +1910,7 @@ mod tests {
         │  empty.rs                ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
         ");
     }
 
@@ -1604,7 +1935,7 @@ mod tests {
         │                          ││   28 line 28                                     ║
         │                          ││   29 line 29                                     █
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | gb blame | gc diff | gp PR | gd def | gf edit | q/Esc ba
+         o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
         ");
     }
 
@@ -1655,7 +1986,7 @@ mod tests {
         assert_eq!(window.total, 30);
         assert_eq!(window.lines.len(), 30);
 
-        let lines = content_lines(&window, 0, false, None, usize::MAX);
+        let lines = content_lines(&window, 0, false, None, None, usize::MAX);
         let content_of = |line: &Line| -> String {
             line.spans[1..]
                 .iter()
@@ -1690,7 +2021,7 @@ mod tests {
         let cache = cache_of("fn main() {\n    println!(\"hi\");\n}\n");
         let window = content_window(&cache, 0, 3);
 
-        let lines = content_lines(&window, 0, true, None, usize::MAX);
+        let lines = content_lines(&window, 0, true, None, None, usize::MAX);
 
         assert_eq!(lines.len(), 3);
         for line in &lines {
@@ -1733,7 +2064,7 @@ mod tests {
             ),
             3,
         );
-        let lines = content_lines(&window, 0, true, Some(&blame), 120);
+        let lines = content_lines(&window, 0, true, Some(&blame), None, 120);
         for line in &lines {
             assert!(
                 matches!(line.spans[0].content, Cow::Borrowed(_)),
@@ -1779,7 +2110,7 @@ mod tests {
             let cache = cache_of(&numbered_source(total));
             let window = content_window(&cache, total - 3, 3);
             assert_eq!(window.total, total);
-            content_lines(&window, total - 1, false, None, usize::MAX)
+            content_lines(&window, total - 1, false, None, None, usize::MAX)
                 .iter()
                 .map(|line| line.spans[0].content.chars().count())
                 .collect()

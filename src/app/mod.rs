@@ -37,6 +37,7 @@ use types::MarkViewedResult;
 
 mod ai_rally;
 pub mod browse;
+pub(crate) mod browse_discussion;
 mod cockpit;
 mod comments;
 mod diff_cache;

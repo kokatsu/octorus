@@ -380,6 +380,7 @@ mod tests {
             },
             created_at: created_at.to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         })
     }
 
@@ -404,6 +405,7 @@ mod tests {
                 },
                 created_at: created_at.to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             LocalCommentMeta {
                 is_resolved: true,

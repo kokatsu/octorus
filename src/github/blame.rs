@@ -26,14 +26,27 @@ struct BlameCommit {
     sha: Span,
     author: Span,
     summary: Span,
+    original_path: Span,
     author_time: i64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlameLine {
+    commit_index: u32,
+    original_line: u32,
+}
+
+/// Retained bytes per parsed blame line.
+///
+/// This is exported so the benchmark binary can enforce the parser's compact
+/// layout instead of relying on a comment that can drift.
+pub const BLAME_LINE_BYTES: usize = std::mem::size_of::<BlameLine>();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlameFile {
     text: String,
     commits: Vec<BlameCommit>,
-    lines: Vec<u32>,
+    lines: Vec<BlameLine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,17 +55,21 @@ pub struct BlameRef<'a> {
     pub author: &'a str,
     pub summary: &'a str,
     pub author_time: i64,
+    pub original_line: u32,
+    pub original_path: &'a str,
 }
 
 impl BlameFile {
     pub fn at(&self, line: usize) -> Option<BlameRef<'_>> {
-        let commit_index = *self.lines.get(line)? as usize;
-        let commit = self.commits.get(commit_index)?;
+        let line = self.lines.get(line)?;
+        let commit = self.commits.get(line.commit_index as usize)?;
         Some(BlameRef {
             sha: self.resolve(commit.sha)?,
             author: self.resolve(commit.author)?,
             summary: self.resolve(commit.summary)?,
             author_time: commit.author_time,
+            original_line: line.original_line,
+            original_path: self.resolve(commit.original_path)?,
         })
     }
 
@@ -69,12 +86,12 @@ impl BlameFile {
             .lines
             .iter()
             .enumerate()
-            .filter_map(|(line_index, &commit_index)| {
+            .filter_map(|(line_index, line)| {
                 let blame = self.at(line_index)?;
                 Some(format!(
                     "{}: #{} {} — {}",
                     line_index + 1,
-                    commit_index,
+                    line.commit_index,
                     blame.author,
                     blame.summary
                 ))
@@ -144,7 +161,7 @@ fn parse_porcelain_with_line_limit(stdout: &str, line_limit: usize) -> BlameFile
             continue;
         }
 
-        if let Some(sha) = parse_header(line) {
+        if let Some((sha, original_line)) = parse_header(line) {
             if result.lines.len() >= line_limit {
                 break;
             }
@@ -167,6 +184,7 @@ fn parse_porcelain_with_line_limit(stdout: &str, line_limit: usize) -> BlameFile
                     sha: sha_span,
                     author: empty,
                     summary: empty,
+                    original_path: empty,
                     author_time: 0,
                 });
                 commit_by_sha.insert(sha, index);
@@ -174,7 +192,10 @@ fn parse_porcelain_with_line_limit(stdout: &str, line_limit: usize) -> BlameFile
             };
 
             current_commit = Some(commit_index);
-            result.lines.push(commit_index);
+            result.lines.push(BlameLine {
+                commit_index,
+                original_line,
+            });
             continue;
         }
 
@@ -205,6 +226,14 @@ fn parse_porcelain_with_line_limit(stdout: &str, line_limit: usize) -> BlameFile
                     }
                 }
             }
+            "filename" => {
+                let path = unquote_git_path(value);
+                if let Some(span) = push_text(&mut result.text, &path) {
+                    if let Some(commit) = result.commits.get_mut(commit_index) {
+                        commit.original_path = span;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -212,7 +241,7 @@ fn parse_porcelain_with_line_limit(stdout: &str, line_limit: usize) -> BlameFile
     result
 }
 
-fn parse_header(line: &str) -> Option<&str> {
+fn parse_header(line: &str) -> Option<(&str, u32)> {
     let mut fields = line.split(' ');
     let sha = fields.next()?;
     if !matches!(sha.len(), 40 | 64)
@@ -224,21 +253,28 @@ fn parse_header(line: &str) -> Option<&str> {
     }
 
     let original_line = fields.next()?;
-    let final_line = fields.next()?;
-    if !is_decimal(original_line) || !is_decimal(final_line) {
+    if !is_decimal(original_line) {
         return None;
     }
+    let original_line = original_line.parse::<u32>().ok()?;
+
+    let final_line = fields.next()?;
+    if !is_decimal(final_line) {
+        return None;
+    }
+    final_line.parse::<u32>().ok()?;
 
     if let Some(group_size) = fields.next() {
         if !is_decimal(group_size) {
             return None;
         }
+        group_size.parse::<u32>().ok()?;
     }
     if fields.next().is_some() {
         return None;
     }
 
-    Some(sha)
+    Some((sha, original_line))
 }
 
 fn is_decimal(value: &str) -> bool {
@@ -255,6 +291,38 @@ fn push_text(text: &mut String, value: &str) -> Option<Span> {
 /// Returns the exact arguments used by [`blame_file`].
 pub fn blame_argv(path: &str) -> [&str; 5] {
     ["blame", "--porcelain", "-w", "--", path]
+}
+
+/// Returns the exact arguments used by [`blame_file_at_revision_range`].
+///
+/// An empty vector means the revision or range is invalid and must not be
+/// passed to Git.
+pub(crate) fn blame_revision_argv(
+    revision: &str,
+    path: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Vec<String> {
+    if !is_object_name(revision) || start_line == 0 || end_line < start_line {
+        return Vec::new();
+    }
+    vec![
+        "blame".to_string(),
+        "--porcelain".to_string(),
+        "-w".to_string(),
+        "-L".to_string(),
+        format!("{start_line},{end_line}"),
+        revision.to_string(),
+        "--".to_string(),
+        path.to_string(),
+    ]
+}
+
+fn is_object_name(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Runs `git blame` for a repository-relative working-tree path.
@@ -283,11 +351,50 @@ pub fn blame_file(repo_root: &Path, path: &str) -> Result<BlameFile, BlameError>
             }
         })?;
 
+    parse_blame_output(output, path.as_ref())
+}
+
+/// Runs range-limited blame against the exact blob coordinate returned by
+/// GitHub for a review comment.
+///
+/// The returned [`BlameFile`] starts at `start_line`; its row zero represents
+/// that source line, not line one of the historical file.
+pub(crate) fn blame_file_at_revision_range(
+    repo_root: &Path,
+    revision: &str,
+    path: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Result<BlameFile, BlameError> {
+    if !repo_root.is_dir() {
+        return Err(BlameError::NotARepository);
+    }
+    let path = unquote_git_path(path);
+    let argv = blame_revision_argv(revision, &path, start_line, end_line);
+    if argv.is_empty() {
+        return Err(BlameError::Failed(
+            "invalid revision or line range for blame".to_string(),
+        ));
+    }
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(argv)
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                BlameError::GitUnavailable
+            } else {
+                BlameError::Failed(error.to_string())
+            }
+        })?;
+    parse_blame_output(output, &path)
+}
+
+fn parse_blame_output(output: std::process::Output, path: &str) -> Result<BlameFile, BlameError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(classify_failure(&stderr, path.as_ref()));
+        return Err(classify_failure(&stderr, path));
     }
-
     if output.stdout.len() > MAX_BLAME_STDOUT_BYTES {
         return Err(BlameError::TooLarge {
             bytes: output.stdout.len(),
@@ -377,7 +484,28 @@ mod tests {
         assert_eq!(line.author, "Alice Example");
         assert_eq!(line.summary, "initial commit");
         assert_eq!(line.author_time, 1_700_000_000);
+        assert_eq!(line.original_line, 1);
+        assert_eq!(line.original_path, "src/lib.rs");
         assert!(!line.is_uncommitted());
+    }
+
+    #[test]
+    fn retains_each_lines_original_coordinate_across_a_rename() {
+        let blame = parse_porcelain(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 17 1 2\n\
+             author Alice\n\
+             author-time 1\n\
+             summary before rename\n\
+             filename \"src/\\346\\227\\245 \\346\\234\\254.rs\"\n\
+             \tfirst\n\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 18 2\n\
+             \tsecond\n",
+        );
+
+        assert_eq!(blame.at(0).unwrap().original_line, 17);
+        assert_eq!(blame.at(1).unwrap().original_line, 18);
+        assert_eq!(blame.at(0).unwrap().original_path, "src/日 本.rs");
+        assert_eq!(blame.at(1).unwrap().original_path, "src/日 本.rs");
     }
 
     #[test]
@@ -398,9 +526,17 @@ mod tests {
         );
 
         assert_eq!(blame.line_count(), 3);
-        assert_eq!(blame.at(0).unwrap(), blame.at(2).unwrap());
-        assert_eq!(blame.at(0).unwrap().author, "Alice");
-        assert_eq!(blame.at(0).unwrap().summary, "initial commit");
+        let first = blame.at(0).unwrap();
+        let third = blame.at(2).unwrap();
+        assert_eq!(first.sha, third.sha);
+        assert_eq!(first.author, third.author);
+        assert_eq!(first.summary, third.summary);
+        assert_eq!(first.author_time, third.author_time);
+        assert_eq!(first.original_path, third.original_path);
+        assert_eq!(first.original_line, 1);
+        assert_eq!(third.original_line, 2);
+        assert_eq!(first.author, "Alice");
+        assert_eq!(first.summary, "initial commit");
         assert_snapshot!(blame.dump(), @"
         1: #0 Alice — initial commit
         2: #1 Bob — second commit
@@ -549,6 +685,40 @@ mod tests {
     }
 
     #[test]
+    fn porcelain_header_numeric_fields_require_plain_ascii_decimal() {
+        let blame = parse_porcelain(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa +5 1 1\n\
+             author Plus Original\n\
+             \trejected original line\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 5 +1 1\n\
+             author Plus Final\n\
+             \trejected final line\n\
+             cccccccccccccccccccccccccccccccccccccccc 5 1 +1\n\
+             author Plus Group\n\
+             \trejected group size\n\
+             dddddddddddddddddddddddddddddddddddddddd 5 1 1\n\
+             author Plain Decimal\n\
+             summary accepted\n\
+             \taccepted line\n",
+        );
+        let accepted = blame.at(0).unwrap();
+
+        assert_snapshot!(
+            format!(
+                "accepted lines: {}\naccepted sha: {}\noriginal line: {}",
+                blame.line_count(),
+                accepted.sha,
+                accepted.original_line,
+            ),
+            @"
+        accepted lines: 1
+        accepted sha: dddddddddddddddddddddddddddddddddddddddd
+        original line: 5
+        "
+        );
+    }
+
+    #[test]
     fn blame_argv_has_the_exact_safe_argument_order() {
         assert_eq!(
             blame_argv("--force"),
@@ -558,6 +728,26 @@ mod tests {
             blame_argv("main"),
             ["blame", "--porcelain", "-w", "--", "main"]
         );
+    }
+
+    #[test]
+    fn revision_blame_argv_keeps_revision_and_range_outside_the_path_slot() {
+        assert_eq!(
+            blame_revision_argv("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--force", 2, 4),
+            [
+                "blame",
+                "--porcelain",
+                "-w",
+                "-L",
+                "2,4",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--",
+                "--force",
+            ]
+        );
+        assert!(blame_revision_argv("HEAD --output=/tmp/x", "a.rs", 1, 1).is_empty());
+        assert!(blame_revision_argv(SHA_A, "a.rs", 0, 1).is_empty());
+        assert!(blame_revision_argv(SHA_A, "a.rs", 2, 1).is_empty());
     }
 
     #[test]
@@ -617,24 +807,20 @@ mod tests {
         out
     }
 
-    /// The layout claim the design is built on: per-line cost is one `u32`, and
+    /// The layout claim the design is built on: per-line cost is two `u32`s, and
     /// the arena is a function of the commit count alone.
     ///
     /// Without this, a future refactor that puts a `String` back into
     /// `BlameCommit` — or that stores metadata per line — passes every other
     /// test and every gate.
     #[test]
-    fn per_line_cost_is_four_bytes_and_the_arena_does_not_grow_with_line_count() {
-        // `size_of::<u32>()` would be 4 no matter what `lines` held, so assert
-        // the element type itself. These two are the whole layout claim: four
-        // bytes per line, and a commit record that owns no heap.
-        assert_eq!(
-            std::mem::size_of_val(&BlameFile::default().lines),
-            std::mem::size_of::<Vec<u32>>()
-        );
+    fn per_line_cost_is_eight_bytes_and_the_arena_does_not_grow_with_line_count() {
+        // Assert the private element type itself: eight bytes per line, and a
+        // commit record that owns no heap.
+        assert_eq!(BLAME_LINE_BYTES, 2 * std::mem::size_of::<u32>());
         assert_eq!(
             std::mem::size_of::<BlameCommit>(),
-            3 * std::mem::size_of::<Span>() + std::mem::size_of::<i64>(),
+            4 * std::mem::size_of::<Span>() + std::mem::size_of::<i64>(),
             "BlameCommit grew — a String or another field has crept in"
         );
 
@@ -666,6 +852,8 @@ mod tests {
             author: "",
             summary: "",
             author_time: 0,
+            original_line: 1,
+            original_path: "",
         };
         assert_eq!(hex.short_sha(), "aaaaaaa");
 
@@ -676,6 +864,8 @@ mod tests {
             author: "",
             summary: "",
             author_time: 0,
+            original_line: 1,
+            original_path: "",
         };
         assert_eq!(cjk.short_sha(), "日本語のテキス");
 
@@ -684,6 +874,8 @@ mod tests {
             author: "",
             summary: "",
             author_time: 0,
+            original_line: 1,
+            original_path: "",
         };
         assert_eq!(short.short_sha(), "abc");
 
@@ -692,6 +884,8 @@ mod tests {
             author: "",
             summary: "",
             author_time: 0,
+            original_line: 1,
+            original_path: "",
         };
         assert_eq!(empty.short_sha(), "");
         assert!(!empty.is_uncommitted());
@@ -977,6 +1171,56 @@ mod tests {
         assert_eq!(spaced.line_count(), 1);
         assert_eq!(cjk.line_count(), 1);
         assert_eq!(cjk.at(0).unwrap().author, "t");
+    }
+
+    #[test]
+    fn scenario_revision_blame_normalizes_a_rename_and_insertion() {
+        let temp = tempfile::tempdir().unwrap();
+        if !init_repo(temp.path()) {
+            return;
+        }
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(
+            temp.path().join("src/日 本.rs"),
+            "fn first() {}\nfn discussed() {}\n",
+        )
+        .unwrap();
+        if !commit_all(temp.path(), "original") {
+            return;
+        }
+        let Some(original) = git(temp.path(), &["rev-parse", "HEAD"]) else {
+            return;
+        };
+        let original = String::from_utf8(original.stdout).unwrap();
+        let original = original.trim();
+
+        let Some(rename) = git(temp.path(), &["mv", "src/日 本.rs", "src/renamed file.rs"])
+        else {
+            return;
+        };
+        if !rename.status.success() || !commit_all(temp.path(), "rename") {
+            return;
+        }
+        fs::write(
+            temp.path().join("src/renamed file.rs"),
+            "// inserted later\nfn first() {}\nfn discussed() {}\n",
+        )
+        .unwrap();
+        if !commit_all(temp.path(), "insert above") {
+            return;
+        }
+
+        let historical =
+            blame_file_at_revision_range(temp.path(), original, "src/日 本.rs", 2, 2).unwrap();
+        let current = blame_file(temp.path(), "src/renamed file.rs").unwrap();
+        let old_line = historical.at(0).unwrap();
+        let current_line = current.at(2).unwrap();
+
+        assert_eq!(old_line.sha, current_line.sha);
+        assert_eq!(old_line.original_path, current_line.original_path);
+        assert_eq!(old_line.original_line, current_line.original_line);
+        assert_eq!(old_line.original_path, "src/日 本.rs");
+        assert_eq!(old_line.original_line, 2);
     }
 
     #[test]

@@ -46,11 +46,11 @@ macro_rules! define_state_filter {
 mod issue;
 mod pr;
 
-pub(crate) use blame::short_sha;
 pub use blame::{
-    blame_argv, blame_file, parse_porcelain, BlameError, BlameFile, BlameRef, MAX_BLAME_LINES,
-    MAX_BLAME_STDOUT_BYTES, UNCOMMITTED_SHA,
+    blame_argv, blame_file, parse_porcelain, BlameError, BlameFile, BlameRef, BLAME_LINE_BYTES,
+    MAX_BLAME_LINES, MAX_BLAME_STDOUT_BYTES, UNCOMMITTED_SHA,
 };
+pub(crate) use blame::{blame_file_at_revision_range, short_sha};
 pub use client::{detect_repo, gh_command, DetectRepoError};
 pub use comment::{create_multiline_review_comment, create_reply_comment, create_review_comment};
 pub use commit::{

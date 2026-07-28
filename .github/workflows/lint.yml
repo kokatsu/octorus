@@ -45,7 +45,8 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
 
-  # The blame parser's design rests on a memory layout — four bytes per line,
+  # The blame parser's design rests on a memory layout — eight bytes per line
+  # (commit index plus original line),
   # and an allocation count that does not scale with the commit count. The
   # second half is only observable through a counting allocator, which belongs
   # in a bench binary rather than the lib test binary. `--test` runs each

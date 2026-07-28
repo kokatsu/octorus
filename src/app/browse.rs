@@ -11,9 +11,9 @@
 //! part of the screen stays usable — an index is an accelerator, never a
 //! prerequisite.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,11 @@ use crate::symbols::{CancelSignal, IndexBuild, Symbol, SymbolIndex, SymbolRef};
 use crate::syntax::ParserPool;
 use crate::ui::common::truncate_with_width;
 
+use super::browse_discussion::{
+    DiscussionIndex, DiscussionLookupLimit, DiscussionView, LineDiscussionDelivery,
+    LineDiscussionFailure, LineDiscussionLoadError, LineDiscussionState, LineOrigin,
+    MAX_DISCUSSION_COMMIT_LOOKUPS, MAX_DISCUSSION_PULL_REQUESTS,
+};
 use super::types::*;
 use super::{App, AppState};
 
@@ -135,6 +140,7 @@ impl App {
         let mut file_ready = false;
         let mut focus_listing_failure = false;
         let mut completed_pr_lookup = None;
+        let mut completed_line_discussion = None;
 
         if let PrLookupState::Loading { .. } = &state.pr_lookup {
             if !browse_file_active || !state.pr_lookup_matches_current_context() {
@@ -145,6 +151,18 @@ impl App {
                         .to_string(),
                 );
             }
+        }
+        if matches!(
+            state.line_discussion,
+            LineDiscussionState::ResolvingPullRequests { .. }
+                | LineDiscussionState::LoadingComments { .. }
+        ) && (!browse_file_active || !state.line_discussion_request_matches_context())
+        {
+            state.cancel_line_discussion_request();
+            state.line_discussion = LineDiscussionState::Idle;
+            state.status = Some(
+                "Review discussion lookup abandoned because the open file changed".to_string(),
+            );
         }
         if let Some(rx) = state.paths_receiver.as_mut() {
             match rx.try_recv() {
@@ -388,6 +406,67 @@ impl App {
             }
         }
 
+        if let Some(rx) = state.line_discussion_receiver.as_mut() {
+            match rx.try_recv() {
+                Ok(delivery) => {
+                    let matches_request = match (&state.line_discussion, &delivery) {
+                        (
+                            LineDiscussionState::ResolvingPullRequests {
+                                request_id, path, ..
+                            },
+                            LineDiscussionDelivery::PullRequests {
+                                request_id: delivered_id,
+                                path: delivered_path,
+                                ..
+                            },
+                        ) => request_id == delivered_id && path == delivered_path,
+                        (
+                            LineDiscussionState::LoadingComments {
+                                request_id,
+                                path,
+                                pr_numbers,
+                                ..
+                            },
+                            LineDiscussionDelivery::Comments {
+                                request_id: delivered_id,
+                                path: delivered_path,
+                                pr_numbers: delivered_prs,
+                                ..
+                            },
+                        ) => {
+                            request_id == delivered_id
+                                && path == delivered_path
+                                && pr_numbers == delivered_prs
+                        }
+                        _ => false,
+                    };
+                    if matches_request && state.line_discussion_request_matches_context() {
+                        state.line_discussion_receiver = None;
+                        completed_line_discussion = Some(delivery);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    state.line_discussion_receiver = None;
+                    let failed_path = match &state.line_discussion {
+                        LineDiscussionState::ResolvingPullRequests { path, cancel, .. }
+                        | LineDiscussionState::LoadingComments { path, cancel, .. }
+                            if !cancel.is_cancelled() =>
+                        {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    };
+                    if failed_path.is_some() {
+                        state.status = Some("Review discussion task ended".to_string());
+                        state.line_discussion = LineDiscussionState::Failed {
+                            failure: LineDiscussionFailure::Api,
+                        };
+                    }
+                }
+            }
+        }
+
         if let Some(rx) = state.highlight_receiver.as_mut() {
             match rx.try_recv() {
                 Ok((path, cache)) => {
@@ -416,6 +495,9 @@ impl App {
         }
         if let Some((sha, resolution)) = completed_pr_lookup {
             self.install_pr_lookup_resolution(sha, resolution);
+        }
+        if let Some(delivery) = completed_line_discussion {
+            self.install_line_discussion_delivery(delivery);
         }
     }
 
@@ -523,6 +605,8 @@ impl App {
 
         let blame_active = !matches!(state.blame, BlameState::Off);
         state.cancel_blame_request();
+        state.cancel_line_discussion_request();
+        state.line_discussion = LineDiscussionState::Idle;
         if blame_active {
             state.blame = BlameState::Waiting {
                 path: path.to_string(),
@@ -574,7 +658,9 @@ impl App {
                 BlameState::Waiting { .. } | BlameState::Loading { .. } | BlameState::Ready { .. }
             ) {
                 state.cancel_blame_request();
+                state.cancel_line_discussion_request();
                 state.blame = BlameState::Off;
+                state.line_discussion = LineDiscussionState::Idle;
                 return;
             }
 
@@ -739,6 +825,449 @@ impl App {
             return;
         }
         self.start_browse_pr_lookup(sha, annotation.summary().to_string());
+    }
+
+    pub(crate) fn open_browse_line_discussion(&mut self) {
+        if !self.repository_availability().is_available() {
+            self.set_browse_status("No GitHub repository is associated with this browser session");
+            return;
+        }
+
+        let toggle_blame = self.config.keybindings.toggle_blame.display();
+        let (path, commits, limit) = {
+            let Some(state) = self.browse_state.as_mut() else {
+                return;
+            };
+            if state.open_is_pending() {
+                state.status = Some("Still opening this file".to_string());
+                return;
+            }
+            let Some(open) = state.open.as_ref() else {
+                state.status = Some("No file is open".to_string());
+                return;
+            };
+            let gutter = match &state.blame {
+                BlameState::Waiting { .. } | BlameState::Loading { .. } => {
+                    state.status = Some("Blame is still loading".to_string());
+                    return;
+                }
+                BlameState::Ready { path, gutter } if path == &open.path => gutter,
+                BlameState::Off => {
+                    state.status = Some(format!("Blame is off — press {toggle_blame} to enable"));
+                    return;
+                }
+                BlameState::Failed => {
+                    state.status = Some("Blame failed for this file".to_string());
+                    return;
+                }
+                BlameState::Ready { .. } => {
+                    state.status = Some("Blame belongs to another file".to_string());
+                    return;
+                }
+            };
+            let path = open.path.clone();
+            if let LineDiscussionState::Ready {
+                path: indexed_path,
+                pr_numbers,
+                index,
+                view,
+            } = &mut state.line_discussion
+            {
+                if indexed_path == &path && !index.thread_indices_at(state.cursor_line).is_empty() {
+                    *view = DiscussionView::ThreadList {
+                        line: state.cursor_line,
+                        selected: 0,
+                        scroll: 0,
+                    };
+                    state.status = None;
+                    return;
+                } else if indexed_path == &path {
+                    state.status = Some(line_discussion_closed_status(&path, pr_numbers, index));
+                    return;
+                }
+            }
+
+            let mut commits = gutter.discussion_commits();
+            if commits.is_empty() {
+                state.status =
+                    Some("This file has no committed lines to look up on GitHub".to_string());
+                return;
+            }
+            let omitted_commits = commits.len().saturating_sub(MAX_DISCUSSION_COMMIT_LOOKUPS);
+            commits.truncate(MAX_DISCUSSION_COMMIT_LOOKUPS);
+            (
+                path,
+                commits,
+                DiscussionLookupLimit {
+                    omitted_commits,
+                    omitted_pull_requests: 0,
+                },
+            )
+        };
+
+        self.start_line_discussion_pr_lookups(path, commits, limit);
+    }
+
+    fn start_line_discussion_pr_lookups(
+        &mut self,
+        path: String,
+        commits: Vec<(String, String)>,
+        limit: DiscussionLookupLimit,
+    ) {
+        let mut resolutions = Vec::with_capacity(commits.len());
+        let mut missing = Vec::new();
+        // One file can repeat the same blame commit thousands of times. The
+        // distinct-SHA walk below, plus SessionCache's per-SHA resolution,
+        // makes every repeat and every later keypress free. The explicit cap
+        // bounds the genuinely cold API fan-out for adversarial histories.
+        for (sha, subject) in commits {
+            if let Some(resolution) = self.session_cache.get_commit_pr_resolution(&sha).cloned() {
+                resolutions.push((sha, resolution));
+            } else {
+                missing.push((sha, subject));
+            }
+        }
+
+        if missing.is_empty() {
+            self.install_line_discussion_pr_resolutions(path, resolutions, limit);
+            return;
+        }
+
+        let repo = self.repo.clone();
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let (request_id, cancel) = state.begin_line_discussion_resolution(path.clone());
+        let (tx, rx) = mpsc::channel(1);
+        state.line_discussion_receiver = Some(rx);
+
+        tokio::spawn(async move {
+            let result = async {
+                for (sha, subject) in missing {
+                    let resolution = tokio::select! {
+                        _ = cancel.cancelled() => return Err(CommitPrLookupError::ApiFailure),
+                        result = crate::github::fetch_commit_pull_requests(&repo, &sha, &subject) => result,
+                    }?;
+                    resolutions.push((sha, resolution));
+                }
+                Ok(resolutions)
+            }
+            .await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            let _ = tx
+                .send(LineDiscussionDelivery::PullRequests {
+                    request_id,
+                    path,
+                    limit,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn install_line_discussion_pr_resolutions(
+        &mut self,
+        path: String,
+        resolutions: Vec<(String, CommitPrResolution)>,
+        mut limit: DiscussionLookupLimit,
+    ) {
+        let mut seen = HashSet::new();
+        let mut pr_numbers = Vec::new();
+        for (sha, resolution) in resolutions {
+            self.session_cache
+                .put_commit_pr_resolution(sha, resolution.clone());
+            match resolution {
+                CommitPrResolution::Confirmed { pulls } => {
+                    for pull in pulls {
+                        if seen.insert(pull.number) {
+                            pr_numbers.push(pull.number);
+                        }
+                    }
+                }
+                CommitPrResolution::Inferred { .. } | CommitPrResolution::NotFound => {}
+            }
+        }
+
+        limit.omitted_pull_requests = pr_numbers
+            .len()
+            .saturating_sub(MAX_DISCUSSION_PULL_REQUESTS);
+        pr_numbers.truncate(MAX_DISCUSSION_PULL_REQUESTS);
+        if pr_numbers.is_empty() {
+            if let Some(state) = self.browse_state.as_mut() {
+                state.status = Some("No confirmed pull request found for this file".to_string());
+                state.line_discussion = LineDiscussionState::Failed {
+                    failure: LineDiscussionFailure::NoPullRequest,
+                };
+            }
+            return;
+        }
+
+        self.start_line_discussion_comments(path, pr_numbers, limit);
+    }
+
+    pub(crate) fn start_line_discussion_comments(
+        &mut self,
+        path: String,
+        pr_numbers: Vec<u32>,
+        limit: DiscussionLookupLimit,
+    ) {
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        for &pr_number in &pr_numbers {
+            let cache_key = crate::cache::PrCacheKey {
+                repo: self.repo.clone(),
+                pr_number,
+            };
+            let comments = self
+                .session_cache
+                .get_browser_review_comments(&cache_key)
+                .map(<[crate::github::comment::ReviewComment]>::to_vec)
+                .or_else(|| {
+                    self.session_cache
+                        .get_review_comments(&cache_key)
+                        .map(|comments| {
+                            comments
+                                .iter()
+                                .filter(|comment| comment.path != "[PR Review]")
+                                .cloned()
+                                .collect()
+                        })
+                });
+            if let Some(comments) = comments {
+                cached.push((pr_number, comments));
+            } else {
+                missing.push(pr_number);
+            }
+        }
+
+        let repo = self.repo.clone();
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let (origins, repo_root) = match &state.blame {
+            BlameState::Ready {
+                path: blame_path,
+                gutter,
+            } if blame_path == &path => (gutter.origins(), state.repo_root.clone()),
+            _ => {
+                state.status = Some("Blame is unavailable for this file".to_string());
+                return;
+            }
+        };
+        let (request_id, cancel) =
+            state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+        let (tx, rx) = mpsc::channel(1);
+        state.line_discussion_receiver = Some(rx);
+        let current_path = path.clone();
+
+        tokio::spawn(async move {
+            let mut fetched_comments = Vec::new();
+            let mut comment_sets = cached;
+            for pr_number in missing {
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = crate::github::comment::fetch_review_comments(&repo, pr_number) => result,
+                };
+                let comments = match result {
+                    Ok(comments) => comments,
+                    Err(error) => {
+                        let _ = tx
+                            .send(LineDiscussionDelivery::Comments {
+                                request_id,
+                                path,
+                                pr_numbers,
+                                fetched_comments,
+                                result: Err(LineDiscussionLoadError::Api(format!(
+                                    "pull request #{pr_number}: {error}"
+                                ))),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                fetched_comments.push((pr_number, comments.clone()));
+                comment_sets.push((pr_number, comments));
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+            let mut comment_ids = HashSet::new();
+            let comments = comment_sets
+                .into_iter()
+                .flat_map(|(_, comments)| comments)
+                .filter(|comment| comment_ids.insert(comment.id))
+                .collect();
+
+            let build_cancel = cancel.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut index = super::browse_discussion::build_discussion_index(
+                    comments,
+                    &current_path,
+                    &origins,
+                    |revision, path, start, end| {
+                        crate::github::blame_file_at_revision_range(
+                            &repo_root, revision, path, start, end,
+                        )
+                    },
+                    || build_cancel.is_cancelled(),
+                )
+                .map_err(LineDiscussionLoadError::Anchor)?;
+                if let Some(outcome) = limit.outcome() {
+                    index.outcome = outcome;
+                }
+                Ok(index)
+            })
+            .await
+            .map_err(|error| {
+                LineDiscussionLoadError::Anchor(format!(
+                    "review discussion indexing task failed: {error}"
+                ))
+            })
+            .and_then(|result| result);
+            if cancel.is_cancelled() {
+                return;
+            }
+            let _ = tx
+                .send(LineDiscussionDelivery::Comments {
+                    request_id,
+                    path,
+                    pr_numbers,
+                    fetched_comments,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn install_line_discussion_delivery(&mut self, delivery: LineDiscussionDelivery) {
+        let matches_runtime_context = {
+            let Some(state) = self.browse_state.as_ref() else {
+                return;
+            };
+            let state_matches = match (&state.line_discussion, &delivery) {
+                (
+                    LineDiscussionState::ResolvingPullRequests {
+                        request_id, path, ..
+                    },
+                    LineDiscussionDelivery::PullRequests {
+                        request_id: delivered_id,
+                        path: delivered_path,
+                        ..
+                    },
+                ) => request_id == delivered_id && path == delivered_path,
+                (
+                    LineDiscussionState::LoadingComments {
+                        request_id,
+                        path,
+                        pr_numbers,
+                        ..
+                    },
+                    LineDiscussionDelivery::Comments {
+                        request_id: delivered_id,
+                        path: delivered_path,
+                        pr_numbers: delivered_prs,
+                        ..
+                    },
+                ) => {
+                    request_id == delivered_id
+                        && path == delivered_path
+                        && pr_numbers == delivered_prs
+                }
+                _ => false,
+            };
+            state_matches && state.line_discussion_request_matches_context()
+        };
+        if !matches_runtime_context {
+            return;
+        }
+
+        match delivery {
+            LineDiscussionDelivery::PullRequests {
+                path,
+                limit,
+                result,
+                ..
+            } => match result {
+                Ok(resolution) => {
+                    self.install_line_discussion_pr_resolutions(path, resolution, limit);
+                }
+                Err(error) => {
+                    if let Some(state) = self.browse_state.as_mut() {
+                        state.status = Some(format!("Pull request lookup failed: {error}"));
+                        state.line_discussion = LineDiscussionState::Failed {
+                            failure: LineDiscussionFailure::Api,
+                        };
+                    }
+                }
+            },
+            LineDiscussionDelivery::Comments {
+                path,
+                pr_numbers,
+                fetched_comments,
+                result,
+                ..
+            } => {
+                for (pr_number, comments) in fetched_comments {
+                    self.session_cache.put_browser_review_comments(
+                        crate::cache::PrCacheKey {
+                            repo: self.repo.clone(),
+                            pr_number,
+                        },
+                        comments,
+                    );
+                }
+                match result {
+                    Ok(index) => {
+                        let cursor_line = self
+                            .browse_state
+                            .as_ref()
+                            .map_or(0, |state| state.cursor_line);
+                        let view = if index.thread_indices_at(cursor_line).is_empty() {
+                            DiscussionView::Closed
+                        } else {
+                            DiscussionView::ThreadList {
+                                line: cursor_line,
+                                selected: 0,
+                                scroll: 0,
+                            }
+                        };
+                        let status = if !matches!(view, DiscussionView::Closed) {
+                            None
+                        } else {
+                            Some(line_discussion_closed_status(&path, &pr_numbers, &index))
+                        };
+                        if let Some(state) = self.browse_state.as_mut() {
+                            state.status = status;
+                            state.line_discussion = LineDiscussionState::Ready {
+                                path,
+                                pr_numbers,
+                                index,
+                                view,
+                            };
+                        }
+                    }
+                    Err(LineDiscussionLoadError::Api(message)) => {
+                        if let Some(state) = self.browse_state.as_mut() {
+                            state.status = Some(format!("Review comment API failed: {message}"));
+                            state.line_discussion = LineDiscussionState::Failed {
+                                failure: LineDiscussionFailure::Api,
+                            };
+                        }
+                    }
+                    Err(LineDiscussionLoadError::Anchor(message)) => {
+                        if let Some(state) = self.browse_state.as_mut() {
+                            state.status =
+                                Some(format!("Review comments could not be anchored: {message}"));
+                            state.line_discussion = LineDiscussionState::Failed {
+                                failure: LineDiscussionFailure::Anchor,
+                            };
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn start_browse_pr_lookup(&mut self, sha: String, subject: String) {
@@ -1020,6 +1549,61 @@ impl App {
     }
 }
 
+fn discussion_pr_label(pr_numbers: &[u32]) -> String {
+    match pr_numbers {
+        [] => "No pull requests".to_string(),
+        [number] => format!("Pull request #{number}"),
+        numbers => format!(
+            "Pull requests {}",
+            numbers
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn line_discussion_closed_status(
+    current_path: &str,
+    pr_numbers: &[u32],
+    index: &DiscussionIndex,
+) -> String {
+    if index.file_thread_count == 0 {
+        return format!(
+            "{} has no review comments on this file",
+            discussion_pr_label(pr_numbers)
+        );
+    }
+
+    if index.line_threads.iter().all(|threads| threads.is_empty()) {
+        let previous_paths = index
+            .comment_paths
+            .iter()
+            .filter(|path| path.as_str() != current_path)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !previous_paths.is_empty() {
+            let path_label = if previous_paths.len() == 1 {
+                "previous path"
+            } else {
+                "previous paths"
+            };
+            return format!(
+                "Review comments exist under {path_label} {}, but none could be anchored to {current_path}",
+                previous_paths.join(", ")
+            );
+        }
+    }
+
+    match index.confidence_note() {
+        Some(note) => {
+            format!("This file has review comments, but none on this line ({note})")
+        }
+        None => "This file has review comments, but none on this line".to_string(),
+    }
+}
+
 /// A jump-stack entry inside the browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowseJump {
@@ -1110,6 +1694,7 @@ impl BrowseCommitDiffState {
 pub(crate) struct BlameGutter {
     rows: Vec<BlameGutterRow>,
     coverage: BlameCoverage,
+    origins: OnceLock<Arc<[Option<LineOrigin>]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,8 +1712,8 @@ pub(crate) enum BlameCoverage {
 
 #[derive(Debug)]
 enum BlameGutterRow {
-    Annotation(Arc<BlameAnnotation>),
-    Blank(Arc<BlameAnnotation>),
+    Annotation(Arc<BlameAnnotation>, u32),
+    Blank(Arc<BlameAnnotation>, u32),
     Missing,
 }
 
@@ -1140,6 +1725,7 @@ pub(crate) struct BlameAnnotation {
     full: Arc<str>,
     author: Arc<str>,
     identity: Arc<str>,
+    original_path: Arc<str>,
 }
 
 impl BlameAnnotation {
@@ -1198,7 +1784,7 @@ impl BlameGutter {
         } else {
             BlameCoverage::Exact
         };
-        let mut annotations = HashMap::<&str, Arc<BlameAnnotation>>::new();
+        let mut annotations = HashMap::<(&str, &str), Arc<BlameAnnotation>>::new();
         let mut rows = Vec::with_capacity(buffer_lines);
         let mut previous_sha = None;
 
@@ -1209,18 +1795,25 @@ impl BlameGutter {
                 continue;
             };
             let annotation = annotations
-                .entry(reference.sha)
+                .entry((reference.sha, reference.original_path))
                 .or_insert_with(|| Arc::new(prepare_blame_annotation(reference)))
                 .clone();
             if previous_sha == Some(reference.sha) {
-                rows.push(BlameGutterRow::Blank(annotation));
+                rows.push(BlameGutterRow::Blank(annotation, reference.original_line));
             } else {
-                rows.push(BlameGutterRow::Annotation(annotation));
+                rows.push(BlameGutterRow::Annotation(
+                    annotation,
+                    reference.original_line,
+                ));
             }
             previous_sha = Some(reference.sha);
         }
 
-        Self { rows, coverage }
+        Self {
+            rows,
+            coverage,
+            origins: OnceLock::new(),
+        }
     }
 
     pub(crate) fn coverage(&self) -> BlameCoverage {
@@ -1239,18 +1832,18 @@ impl BlameGutter {
 
     pub(crate) fn text(&self, line: usize, width: BlameGutterWidth) -> &str {
         match (self.rows.get(line), width) {
-            (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Full) => {
+            (Some(BlameGutterRow::Annotation(annotation, _)), BlameGutterWidth::Full) => {
                 &annotation.full
             }
-            (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Author) => {
+            (Some(BlameGutterRow::Annotation(annotation, _)), BlameGutterWidth::Author) => {
                 &annotation.author
             }
-            (Some(BlameGutterRow::Annotation(annotation)), BlameGutterWidth::Identity) => {
+            (Some(BlameGutterRow::Annotation(annotation, _)), BlameGutterWidth::Identity) => {
                 &annotation.identity
             }
-            (Some(BlameGutterRow::Blank(_)), BlameGutterWidth::Full) => BLAME_FULL_BLANK,
-            (Some(BlameGutterRow::Blank(_)), BlameGutterWidth::Author) => BLAME_AUTHOR_BLANK,
-            (Some(BlameGutterRow::Blank(_)), BlameGutterWidth::Identity) => BLAME_IDENTITY_BLANK,
+            (Some(BlameGutterRow::Blank(_, _)), BlameGutterWidth::Full) => BLAME_FULL_BLANK,
+            (Some(BlameGutterRow::Blank(_, _)), BlameGutterWidth::Author) => BLAME_AUTHOR_BLANK,
+            (Some(BlameGutterRow::Blank(_, _)), BlameGutterWidth::Identity) => BLAME_IDENTITY_BLANK,
             (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Full) => BLAME_FULL_MISSING,
             (Some(BlameGutterRow::Missing) | None, BlameGutterWidth::Author) => {
                 BLAME_AUTHOR_MISSING
@@ -1263,11 +1856,57 @@ impl BlameGutter {
 
     pub(crate) fn annotation_at(&self, line: usize) -> Option<&Arc<BlameAnnotation>> {
         match self.rows.get(line)? {
-            BlameGutterRow::Annotation(annotation) | BlameGutterRow::Blank(annotation) => {
+            BlameGutterRow::Annotation(annotation, _) | BlameGutterRow::Blank(annotation, _) => {
                 Some(annotation)
             }
             BlameGutterRow::Missing => None,
         }
+    }
+
+    pub(crate) fn origin_at(
+        &self,
+        line: usize,
+    ) -> Option<crate::app::browse_discussion::LineOrigin> {
+        let (annotation, original_line) = match self.rows.get(line)? {
+            BlameGutterRow::Annotation(annotation, original_line)
+            | BlameGutterRow::Blank(annotation, original_line) => (annotation, original_line),
+            BlameGutterRow::Missing => return None,
+        };
+        Some(crate::app::browse_discussion::LineOrigin {
+            sha: Arc::clone(&annotation.sha),
+            path: Arc::clone(&annotation.original_path),
+            line: *original_line,
+        })
+    }
+
+    fn origins(&self) -> Arc<[Option<LineOrigin>]> {
+        Arc::clone(self.origins.get_or_init(|| {
+            (0..self.rows.len())
+                .map(|line| self.origin_at(line))
+                .collect::<Arc<[_]>>()
+        }))
+    }
+
+    fn discussion_commits(&self) -> Vec<(String, String)> {
+        let mut seen = HashSet::new();
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                BlameGutterRow::Annotation(annotation, _)
+                | BlameGutterRow::Blank(annotation, _)
+                    if !annotation.is_uncommitted()
+                        && seen.insert(annotation.sha().to_string()) =>
+                {
+                    Some((
+                        annotation.sha().to_string(),
+                        annotation.summary().to_string(),
+                    ))
+                }
+                BlameGutterRow::Annotation(_, _)
+                | BlameGutterRow::Blank(_, _)
+                | BlameGutterRow::Missing => None,
+            })
+            .collect()
     }
 }
 
@@ -1286,6 +1925,7 @@ fn prepare_blame_annotation(reference: BlameRef<'_>) -> BlameAnnotation {
                 "Uncommitted".to_string(),
                 BLAME_IDENTITY_WIDTH,
             )),
+            original_path: Arc::from(reference.original_path),
         };
     }
 
@@ -1309,6 +1949,7 @@ fn prepare_blame_annotation(reference: BlameRef<'_>) -> BlameAnnotation {
             BLAME_AUTHOR_WIDTH,
         )),
         identity: Arc::from(pad_blame_text(sha.to_string(), BLAME_IDENTITY_WIDTH)),
+        original_path: Arc::from(reference.original_path),
     }
 }
 
@@ -1571,6 +2212,8 @@ pub struct BrowseState {
     commit_diff_generation: u64,
     pub(crate) pr_lookup: PrLookupState,
     pr_lookup_generation: u64,
+    pub(crate) line_discussion: LineDiscussionState,
+    line_discussion_generation: u64,
     /// 0-based cursor line within the open file.
     pub cursor_line: usize,
     pub scroll_offset: usize,
@@ -1594,6 +2237,7 @@ pub struct BrowseState {
     pub(crate) blame_receiver: Option<mpsc::Receiver<BlameLoadResult>>,
     pub(crate) commit_diff_receiver: Option<mpsc::Receiver<CommitDiffLoadResult>>,
     pub(crate) pr_lookup_receiver: Option<mpsc::Receiver<PrLookupLoadResult>>,
+    pub(crate) line_discussion_receiver: Option<mpsc::Receiver<LineDiscussionDelivery>>,
     pub(crate) highlight_receiver: Option<mpsc::Receiver<(String, DiffCache)>>,
 }
 
@@ -1623,6 +2267,8 @@ impl BrowseState {
             commit_diff_generation: 0,
             pr_lookup: PrLookupState::Idle,
             pr_lookup_generation: 0,
+            line_discussion: LineDiscussionState::Idle,
+            line_discussion_generation: 0,
             cursor_line: 0,
             scroll_offset: 0,
             index: IndexState::Idle,
@@ -1637,6 +2283,7 @@ impl BrowseState {
             blame_receiver: None,
             commit_diff_receiver: None,
             pr_lookup_receiver: None,
+            line_discussion_receiver: None,
             highlight_receiver: None,
         }
     }
@@ -1674,6 +2321,61 @@ impl BrowseState {
         };
         self.status = None;
         (request_id, cancel)
+    }
+
+    fn cancel_line_discussion_request(&mut self) {
+        match &self.line_discussion {
+            LineDiscussionState::ResolvingPullRequests { cancel, .. }
+            | LineDiscussionState::LoadingComments { cancel, .. } => cancel.cancel(),
+            LineDiscussionState::Idle
+            | LineDiscussionState::Ready { .. }
+            | LineDiscussionState::Failed { .. } => {}
+        }
+        self.line_discussion_receiver = None;
+    }
+
+    fn begin_line_discussion_resolution(&mut self, path: String) -> (u64, CancellationToken) {
+        self.cancel_line_discussion_request();
+        self.line_discussion_generation = self.line_discussion_generation.wrapping_add(1);
+        let request_id = self.line_discussion_generation;
+        let cancel = self.cancel_token.child_token();
+        self.line_discussion = LineDiscussionState::ResolvingPullRequests {
+            request_id,
+            path,
+            cancel: cancel.clone(),
+        };
+        self.status = None;
+        (request_id, cancel)
+    }
+
+    fn begin_line_discussion_load(
+        &mut self,
+        path: String,
+        pr_numbers: Vec<u32>,
+    ) -> (u64, CancellationToken) {
+        self.cancel_line_discussion_request();
+        self.line_discussion_generation = self.line_discussion_generation.wrapping_add(1);
+        let request_id = self.line_discussion_generation;
+        let cancel = self.cancel_token.child_token();
+        self.line_discussion = LineDiscussionState::LoadingComments {
+            request_id,
+            path,
+            pr_numbers,
+            cancel: cancel.clone(),
+        };
+        self.status = None;
+        (request_id, cancel)
+    }
+
+    fn line_discussion_request_matches_context(&self) -> bool {
+        let requested_path = match &self.line_discussion {
+            LineDiscussionState::ResolvingPullRequests { path, .. }
+            | LineDiscussionState::LoadingComments { path, .. } => path,
+            _ => return true,
+        };
+        self.open
+            .as_ref()
+            .is_some_and(|open| &open.path == requested_path)
     }
 
     fn pr_lookup_matches_current_context(&self) -> bool {
@@ -1851,6 +2553,8 @@ impl BrowseState {
                     path: path.to_string(),
                     gutter: BlameGutter::from_file(blame, buffer_lines),
                 };
+                self.cancel_line_discussion_request();
+                self.line_discussion = LineDiscussionState::Idle;
                 return true;
             }
         }
@@ -2251,6 +2955,34 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::browse_discussion::{DiscussionIndex, DiscussionOutcome};
+
+    #[test]
+    fn original_line_fits_the_existing_blame_gutter_row_padding() {
+        assert_eq!(std::mem::size_of::<BlameGutterRow>(), 16);
+    }
+
+    #[test]
+    fn discussion_origins_slice_is_built_once_for_repeated_keypresses() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 2\n\
+             author Alice\n\
+             summary first\n\
+             filename src/a.rs\n\
+             \tone\n\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n\
+             \ttwo\n";
+        let gutter = BlameGutter::from_file(parse_porcelain(PORCELAIN), 2);
+        let first: Arc<[Option<LineOrigin>]> = gutter.origins();
+
+        for _ in 0..8 {
+            let next: Arc<[Option<LineOrigin>]> = gutter.origins();
+            assert!(
+                Arc::ptr_eq(&first, &next),
+                "repeated discussion keypress rebuilt the origins slice"
+            );
+        }
+    }
+
     use crate::github::{
         parse_porcelain, BlameError, CommitPrLookupError, CommitPrResolution, CommitPullRequest,
         CommitPullRequestState,
@@ -2397,6 +3129,22 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("blame load never settled");
+    }
+
+    async fn settle_line_discussion(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if matches!(
+                app.browse_state
+                    .as_ref()
+                    .map(|state| &state.line_discussion),
+                Some(LineDiscussionState::Ready { .. } | LineDiscussionState::Failed { .. })
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("line discussion load never settled");
     }
 
     fn state_with_pending_load(path: &str) -> BrowseState {
@@ -2748,6 +3496,7 @@ mod tests {
              author Alice\n\
              author-time 1700000000\n\
              summary shared commit\n\
+             filename src/before rename.rs\n\
              \tone\n\
              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n\
              \ttwo\n";
@@ -2761,8 +3510,419 @@ mod tests {
         assert_eq!(continuation.author_name(), "Alice");
         assert_eq!(continuation.summary(), "shared commit");
         assert_eq!(
+            gutter.origin_at(0),
+            Some(crate::app::browse_discussion::LineOrigin {
+                sha: Arc::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                path: Arc::from("src/before rename.rs"),
+                line: 1,
+            })
+        );
+        assert_eq!(gutter.origin_at(1).map(|origin| origin.line), Some(2));
+        assert_eq!(
             gutter.text(1, BlameGutterWidth::Identity),
             BLAME_IDENTITY_BLANK
+        );
+    }
+
+    #[test]
+    fn stale_line_discussion_delivery_is_generation_safe_but_survives_cursor_changes() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             summary first\n\
+             filename src/a.rs\n\
+             \tone\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2 2 1\n\
+             author Bob\n\
+             summary second\n\
+             filename src/a.rs\n\
+             \ttwo\n";
+        let mut app = App::new_for_test();
+        let mut state = state_with_ready_blame(PORCELAIN, 2);
+        let path = "src/a.rs".to_string();
+        let pr_numbers = vec![42];
+        let (first_request, _) = state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+        let (second_request, _) =
+            state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state = Some(state);
+
+        app.install_line_discussion_delivery(LineDiscussionDelivery::Comments {
+            request_id: first_request,
+            path: path.clone(),
+            pr_numbers: pr_numbers.clone(),
+            fetched_comments: Vec::new(),
+            result: Err(LineDiscussionLoadError::Api(
+                "stale success slot".to_string(),
+            )),
+        });
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().line_discussion,
+            LineDiscussionState::LoadingComments {
+                request_id,
+                ..
+            } if request_id == second_request
+        ));
+        assert!(app.browse_state.as_ref().unwrap().status.is_none());
+
+        app.browse_state.as_mut().unwrap().cursor_line = 1;
+        app.install_line_discussion_delivery(LineDiscussionDelivery::Comments {
+            request_id: second_request,
+            path,
+            pr_numbers,
+            fetched_comments: Vec::new(),
+            result: Err(LineDiscussionLoadError::Api("moved cursor".to_string())),
+        });
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().line_discussion,
+            LineDiscussionState::Failed {
+                failure: LineDiscussionFailure::Api,
+                ..
+            }
+        ));
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Review comment API failed: moved cursor")
+        );
+    }
+
+    #[test]
+    fn line_discussion_delivery_is_rejected_after_the_open_file_changes() {
+        let mut app = App::new_for_test();
+        let mut state = state_with_open_file(1);
+        let path = "src/a.rs".to_string();
+        let pr_numbers = vec![42];
+        let (request_id, _) = state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+        state.open.as_mut().unwrap().path = "src/other.rs".to_string();
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state = Some(state);
+
+        app.install_line_discussion_delivery(LineDiscussionDelivery::Comments {
+            request_id,
+            path,
+            pr_numbers,
+            fetched_comments: Vec::new(),
+            result: Err(LineDiscussionLoadError::Api("stale file".to_string())),
+        });
+
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().line_discussion,
+            LineDiscussionState::LoadingComments { .. }
+        ));
+        assert!(app.browse_state.as_ref().unwrap().status.is_none());
+    }
+
+    #[test]
+    fn current_line_discussion_api_failure_gets_its_own_footer_message() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             summary first\n\
+             filename src/a.rs\n\
+             \tone\n";
+        let mut app = App::new_for_test();
+        let mut state = state_with_ready_blame(PORCELAIN, 1);
+        let path = "src/a.rs".to_string();
+        let pr_numbers = vec![42];
+        let (request_id, _) = state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state = Some(state);
+
+        app.install_line_discussion_delivery(LineDiscussionDelivery::Comments {
+            request_id,
+            path,
+            pr_numbers,
+            fetched_comments: Vec::new(),
+            result: Err(LineDiscussionLoadError::Api("rate limited".to_string())),
+        });
+
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Review comment API failed: rate limited")
+        );
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().line_discussion,
+            LineDiscussionState::Failed {
+                failure: LineDiscussionFailure::Api,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn current_line_discussion_distinguishes_no_file_comments_from_no_line_comments() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             summary first\n\
+             filename src/a.rs\n\
+             \tone\n";
+
+        for (file_thread_count, outcome, expected) in [
+            (
+                0,
+                DiscussionOutcome::Complete,
+                "Pull request #42 has no review comments on this file",
+            ),
+            (
+                1,
+                DiscussionOutcome::UnplacedThreads { count: 1 },
+                "This file has review comments, but none on this line (1 thread(s) could not be placed confidently)",
+            ),
+        ] {
+            let mut app = App::new_for_test();
+            let mut state = state_with_ready_blame(PORCELAIN, 1);
+            let path = "src/a.rs".to_string();
+            let pr_numbers = vec![42];
+            let (request_id, _) =
+                state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+            app.state = AppState::RepoBrowseFile;
+            app.browse_state = Some(state);
+
+            app.install_line_discussion_delivery(LineDiscussionDelivery::Comments {
+                request_id,
+                path,
+                pr_numbers,
+                fetched_comments: Vec::new(),
+                result: Ok(DiscussionIndex {
+                    comments: Vec::new(),
+                    threads: Vec::new(),
+                    line_threads: vec![smallvec::SmallVec::new()],
+                    file_thread_count,
+                    comment_paths: Vec::new(),
+                    outcome,
+                }),
+            });
+
+            let state = app.browse_state.as_ref().unwrap();
+            assert_eq!(state.status.as_deref(), Some(expected));
+            assert!(matches!(
+                state.line_discussion,
+                LineDiscussionState::Ready {
+                    view: DiscussionView::Closed,
+                    ..
+                }
+            ));
+            assert!(state.line_discussion_receiver.is_none());
+        }
+    }
+
+    #[test]
+    fn renamed_file_reports_unanchored_comments_under_previous_path() {
+        let comment = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "path": "src/old.rs",
+            "line": null,
+            "original_line": 1,
+            "side": "RIGHT",
+            "original_commit_id": "cccccccccccccccccccccccccccccccccccccccc",
+            "body": "old-name discussion",
+            "user": { "login": "reviewer" },
+            "created_at": "2026-07-28T00:00:00Z"
+        }))
+        .unwrap();
+        let current_origins = vec![Some(LineOrigin {
+            sha: Arc::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            path: Arc::from("src/old.rs"),
+            line: 1,
+        })];
+        let index = crate::app::browse_discussion::build_discussion_index(
+            vec![comment],
+            "src/a.rs",
+            &current_origins,
+            |_, path, _, _| {
+                assert_eq!(path, "src/old.rs");
+                Ok(parse_porcelain(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 1 1 1\n\
+                     author Alice\n\
+                     summary historical\n\
+                     filename src/old.rs\n\
+                     \told\n",
+                ))
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(index.file_thread_count, 1);
+        assert!(index.line_threads.iter().all(smallvec::SmallVec::is_empty));
+
+        let mut app = App::new_for_test();
+        let mut state = state_with_open_file(1);
+        let path = "src/a.rs".to_string();
+        let pr_numbers = vec![42];
+        let (request_id, _) = state.begin_line_discussion_load(path.clone(), pr_numbers.clone());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state = Some(state);
+        app.install_line_discussion_delivery(LineDiscussionDelivery::Comments {
+            request_id,
+            path,
+            pr_numbers,
+            fetched_comments: Vec::new(),
+            result: Ok(index),
+        });
+
+        let message = app
+            .browse_state
+            .as_ref()
+            .and_then(|state| state.status.as_deref())
+            .unwrap();
+        insta::assert_snapshot!(
+            message,
+            @"Review comments exist under previous path src/old.rs, but none could be anchored to src/a.rs"
+        );
+        assert!(!message.contains("no review comments on this file"));
+    }
+
+    #[tokio::test]
+    async fn file_discussion_marks_and_threads_are_cursor_independent_across_pull_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(temp.path())
+                .args([
+                    "-c",
+                    "user.name=Discussion Fixture",
+                    "-c",
+                    "user.email=discussion@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .expect("git fixture command failed to start");
+            assert!(
+                output.status.success(),
+                "git {} failed with {}\nstdout:\n{}\nstderr:\n{}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+
+        git(&["init"]);
+        std::fs::write(temp.path().join("main.rs"), "first\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-m", "first line"]);
+        let first_sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::fs::write(temp.path().join("main.rs"), "first\nsecond\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-m", "second line"]);
+        let second_sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let comment = |id: u64, line: u32, revision: &str, body: &str| {
+            serde_json::from_value::<crate::github::comment::ReviewComment>(serde_json::json!({
+                "id": id,
+                "path": "main.rs",
+                "line": null,
+                "original_line": line,
+                "side": "RIGHT",
+                "original_commit_id": revision,
+                "body": body,
+                "user": { "login": "reviewer" },
+                "created_at": "2026-07-28T00:00:00Z"
+            }))
+            .unwrap()
+        };
+
+        let mut renders = Vec::new();
+        for start_line in [0, 1] {
+            let mut app = App::new_for_test();
+            app.set_repository_availability(RepositoryAvailability::Available);
+            let mut state = BrowseState::new(temp.path().to_path_buf(), AppState::FileList);
+            state.set_paths(vec!["main.rs".to_string()]);
+            state.open =
+                Some(load_file_for_test(&temp.path().join("main.rs"), "main.rs", 4).unwrap());
+            let blame = crate::github::blame_file(temp.path(), "main.rs").unwrap();
+            state.blame = BlameState::Ready {
+                path: "main.rs".to_string(),
+                gutter: BlameGutter::from_file(blame, 2),
+            };
+            state.cursor_line = start_line;
+            app.state = AppState::RepoBrowseFile;
+            app.browse_state = Some(state);
+
+            for (sha, pr_number) in [(&first_sha, 101), (&second_sha, 202)] {
+                app.session_cache.put_commit_pr_resolution(
+                    sha.clone(),
+                    CommitPrResolution::Confirmed {
+                        pulls: vec![CommitPullRequest {
+                            number: pr_number,
+                            title: format!("PR {pr_number}"),
+                            state: CommitPullRequestState::Merged,
+                        }],
+                    },
+                );
+            }
+            let repo = app.repo.clone();
+            app.session_cache.put_browser_review_comments(
+                crate::cache::PrCacheKey {
+                    repo: repo.clone(),
+                    pr_number: 101,
+                },
+                vec![comment(1, 1, &first_sha, "thread from PR 101")],
+            );
+            app.session_cache.put_browser_review_comments(
+                crate::cache::PrCacheKey {
+                    repo,
+                    pr_number: 202,
+                },
+                vec![comment(2, 2, &second_sha, "thread from PR 202")],
+            );
+
+            app.open_browse_line_discussion();
+            settle_line_discussion(&mut app).await;
+
+            let state = app.browse_state.as_mut().unwrap();
+            let LineDiscussionState::Ready { view, .. } = &mut state.line_discussion else {
+                panic!("cached discussion lookup did not become ready");
+            };
+            *view = DiscussionView::Closed;
+            state.cursor_line = 0;
+            let gutter = render_at(&mut app, 100, 10);
+            assert_eq!(
+                gutter.matches('●').count(),
+                2,
+                "both pull requests must mark their line regardless of the trigger cursor:\n{gutter}"
+            );
+
+            let mut overlays = Vec::new();
+            for line in [0, 1] {
+                let state = app.browse_state.as_mut().unwrap();
+                state.cursor_line = line;
+                let LineDiscussionState::Ready { view, .. } = &mut state.line_discussion else {
+                    unreachable!("discussion stayed ready");
+                };
+                *view = DiscussionView::ThreadList {
+                    line,
+                    selected: 0,
+                    scroll: 0,
+                };
+                overlays.push(render_at(&mut app, 100, 18));
+            }
+            assert!(
+                overlays[0].contains("thread from PR 101"),
+                "{}",
+                overlays[0]
+            );
+            assert!(
+                overlays[1].contains("thread from PR 202"),
+                "{}",
+                overlays[1]
+            );
+            renders.push((gutter, overlays));
+        }
+
+        assert_eq!(
+            renders[0], renders[1],
+            "the file-wide gutter and per-line overlays changed with the trigger cursor"
         );
     }
 
@@ -2773,6 +3933,8 @@ mod tests {
             author: "Alice",
             summary: "multibyte identifier",
             author_time: 1_700_000_000,
+            original_line: 1,
+            original_path: "src/lib.rs",
         });
 
         assert_eq!(annotation.short_sha(), "日本語のテキス");
@@ -3244,6 +4406,68 @@ mod tests {
             let state = app.browse_state.as_ref().unwrap();
             assert!(matches!(state.pr_lookup, PrLookupState::Idle));
             assert!(state.pr_lookup_receiver.is_none());
+        }
+    }
+
+    #[test]
+    fn test_open_line_discussion_reports_all_pre_fetch_dead_ends_without_a_request() {
+        const COMMITTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             summary baseline\n\
+             filename src/a.rs\n\
+             \tone\n";
+        const UNCOMMITTED: &str = "0000000000000000000000000000000000000000 1 1 1\n\
+             author Not Committed Yet\n\
+             summary working tree\n\
+             filename src/a.rs\n\
+             \tone\n";
+
+        let mut cases = Vec::new();
+
+        let mut no_repo = App::new_for_test();
+        no_repo.set_repository_availability(RepositoryAvailability::Unavailable);
+        no_repo.browse_state = Some(state_with_ready_blame(COMMITTED, 1));
+        no_repo.state = AppState::RepoBrowseFile;
+        no_repo.open_browse_line_discussion();
+        cases.push((
+            no_repo,
+            "No GitHub repository is associated with this browser session",
+        ));
+
+        let mut blame_off = App::new_for_test();
+        blame_off.set_repository_availability(RepositoryAvailability::Available);
+        blame_off.browse_state = Some(state_with_open_file(1));
+        blame_off.state = AppState::RepoBrowseFile;
+        blame_off.open_browse_line_discussion();
+        cases.push((blame_off, "Blame is off — press gb to enable"));
+
+        let mut blame_loading = App::new_for_test();
+        blame_loading.set_repository_availability(RepositoryAvailability::Available);
+        let mut loading_state = state_with_open_file(1);
+        loading_state.blame = BlameState::Loading {
+            path: "src/a.rs".to_string(),
+            cancel: loading_state.cancel_token.child_token(),
+        };
+        blame_loading.browse_state = Some(loading_state);
+        blame_loading.state = AppState::RepoBrowseFile;
+        blame_loading.open_browse_line_discussion();
+        cases.push((blame_loading, "Blame is still loading"));
+
+        let mut uncommitted = App::new_for_test();
+        uncommitted.set_repository_availability(RepositoryAvailability::Available);
+        uncommitted.browse_state = Some(state_with_ready_blame(UNCOMMITTED, 1));
+        uncommitted.state = AppState::RepoBrowseFile;
+        uncommitted.open_browse_line_discussion();
+        cases.push((
+            uncommitted,
+            "This file has no committed lines to look up on GitHub",
+        ));
+
+        for (app, expected) in cases {
+            let state = app.browse_state.as_ref().unwrap();
+            assert_eq!(state.status.as_deref(), Some(expected));
+            assert!(matches!(state.line_discussion, LineDiscussionState::Idle));
+            assert!(state.line_discussion_receiver.is_none());
         }
     }
 

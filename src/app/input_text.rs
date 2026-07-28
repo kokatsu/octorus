@@ -210,6 +210,7 @@ impl App {
             },
             created_at: Utc::now().to_rfc3339(),
             in_reply_to_id: None,
+            location: Default::default(),
         }));
 
         self.persist_local_review_comments(comments, "Saved local comment");
@@ -284,6 +285,7 @@ impl App {
             },
             created_at: Utc::now().to_rfc3339(),
             in_reply_to_id: Some(comment_id),
+            location: Default::default(),
         }));
 
         self.persist_local_review_comments(comments, "Saved local reply");

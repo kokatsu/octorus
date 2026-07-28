@@ -766,6 +766,7 @@ async fn test_handle_data_result_resyncs_comment_positions_when_selected_file_ch
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
 
     // Pre-populate stale comment positions for the old file
@@ -3821,6 +3822,7 @@ fn test_build_seed_review_from_local_comments_uses_persisted_comments() {
                 },
                 created_at: "2026-03-24T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
         )],
     )
@@ -3872,6 +3874,7 @@ fn test_build_seed_review_from_local_comments_skips_resolved_comments() {
                 },
                 created_at: "2026-03-24T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             crate::cache::LocalCommentMeta {
                 is_resolved: true,
@@ -3915,6 +3918,7 @@ fn test_start_ai_rally_stashes_seed_review_while_waiting_for_confirmation() {
                 },
                 created_at: "2026-03-24T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
         )],
     )
@@ -4856,6 +4860,7 @@ fn test_load_review_comments_local_mode_refreshes_meta_from_disk() {
             },
             created_at: "2026-03-24T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
     )];
     crate::cache::save_local_review_comments(
@@ -4934,6 +4939,7 @@ fn test_load_review_comments_local_mode_builds_threads_and_counts() {
             },
             created_at: "2026-04-01T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         }),
         crate::cache::LocalReviewComment::new(crate::github::comment::ReviewComment {
             id: 2,
@@ -4946,6 +4952,7 @@ fn test_load_review_comments_local_mode_builds_threads_and_counts() {
             },
             created_at: "2026-04-01T01:00:00Z".to_string(),
             in_reply_to_id: Some(1),
+            location: Default::default(),
         }),
         crate::cache::LocalReviewComment::new(crate::github::comment::ReviewComment {
             id: 3,
@@ -4958,6 +4965,7 @@ fn test_load_review_comments_local_mode_builds_threads_and_counts() {
             },
             created_at: "2026-04-01T02:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         }),
     ];
     crate::cache::save_local_review_comments(
@@ -5041,6 +5049,7 @@ fn test_update_file_comment_positions_with_comments() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.update_file_comment_positions();
     assert_eq!(app.cmt.file_comment_positions.len(), 1);
@@ -5061,6 +5070,7 @@ fn test_update_file_comment_positions_stale_comment() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.update_file_comment_positions();
     assert!(app.cmt.file_comment_positions.is_empty());
@@ -5130,6 +5140,7 @@ fn test_enter_reply_input_sets_mode() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.cmt.file_comment_positions = vec![CommentPosition {
         diff_line_index: 1,
@@ -5218,6 +5229,7 @@ async fn test_jump_to_comment_sets_file_and_line() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.cmt.selected_comment = 0;
 
@@ -7790,6 +7802,7 @@ fn test_try_open_comment_panel_in_local_mode() {
         },
         created_at: "2026-04-27T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
 
     let kb = app.config.keybindings.clone();
@@ -7834,6 +7847,7 @@ fn test_apply_review_comments_preserves_expanded_selection_by_id() {
             },
             created_at: created_at.to_string(),
             in_reply_to_id: parent,
+            location: Default::default(),
         }
     }
 
@@ -7893,6 +7907,7 @@ fn test_apply_review_comments_populates_file_counts() {
             },
             created_at: "2025-01-01T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
         ReviewComment {
             id: 2,
@@ -7905,6 +7920,7 @@ fn test_apply_review_comments_populates_file_counts() {
             },
             created_at: "2025-01-01T01:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
         ReviewComment {
             id: 3,
@@ -7917,6 +7933,7 @@ fn test_apply_review_comments_populates_file_counts() {
             },
             created_at: "2025-01-01T02:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
     ]);
 
@@ -7936,6 +7953,7 @@ fn pr157_rc(id: u64, parent: Option<u64>, path: &str, created_at: &str) -> Revie
         },
         created_at: created_at.to_string(),
         in_reply_to_id: parent,
+        location: Default::default(),
     }
 }
 
