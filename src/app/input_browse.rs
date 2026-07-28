@@ -1035,6 +1035,63 @@ mod tests {
         assert!(app.browse_state.is_none());
     }
 
+    #[test]
+    fn test_scenario_refocusing_the_open_file_keeps_the_cursor_position() {
+        let source: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let mut app = browsing_app(&["a.rs"]);
+        attach_open_file(&mut app, "a.rs", &source, Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        let mut terminal = test_terminal();
+
+        for _ in 0..10 {
+            app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut terminal)
+                .unwrap();
+        }
+        assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 10);
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('h')), &mut terminal)
+            .unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseTree);
+
+        app.handle_repo_browse_tree_input(press(KeyCode::Char('l')))
+            .unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().cursor_line,
+            10,
+            "re-entering the already-open file is a focus change, not a jump"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scenario_opening_a_different_file_still_starts_at_the_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let source: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let mut app =
+            browsing_app_on_disk(dir.path(), &[("a.rs", source.as_str()), ("b.rs", "one\n")]);
+        attach_open_file(&mut app, "a.rs", &source, Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        let mut terminal = test_terminal();
+
+        for _ in 0..10 {
+            app.handle_repo_browse_file_input(press(KeyCode::Char('j')), &mut terminal)
+                .unwrap();
+        }
+        app.handle_repo_browse_file_input(press(KeyCode::Char('h')), &mut terminal)
+            .unwrap();
+        app.handle_repo_browse_tree_input(press(KeyCode::Char('j')))
+            .unwrap();
+        app.handle_repo_browse_tree_input(press(KeyCode::Char('l')))
+            .unwrap();
+
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().cursor_line,
+            0,
+            "a different file opens at the top"
+        );
+    }
+
     #[tokio::test]
     async fn test_scenario_open_file_toggle_blame_on_poll_then_toggle_off() {
         let dir = tempfile::tempdir().unwrap();
@@ -1563,7 +1620,7 @@ mod tests {
             _ => panic!("blame fixture must be ready"),
         };
         let cache = crate::ui::diff_view::build_plain_diff_cache("+changed\n", 4);
-        let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+        let mut scroll = DiffScrollState::new(ScrollMode::Margin);
         scroll.set_line_count(cache.lines.len());
         app.browse_state.as_mut().unwrap().commit_diff = BrowseCommitDiffState::Ready {
             annotation,

@@ -405,11 +405,12 @@ fn render_commit_diff(
                     None,
                 )
             } else {
-                let visible_start = scroll
-                    .scroll_offset
-                    .saturating_sub(2)
-                    .min(cache.lines.len());
-                let visible_end = (scroll.scroll_offset + inner_height + 5).min(cache.lines.len());
+                // Margin mode can push the offset past the last page; clamp
+                // like the diff view does so no blank rows render.
+                let max_scroll = cache.lines.len().saturating_sub(inner_height);
+                let offset = scroll.scroll_offset.min(max_scroll);
+                let visible_start = offset.saturating_sub(2).min(cache.lines.len());
+                let visible_end = (offset + inner_height + 5).min(cache.lines.len());
                 let lines = crate::ui::diff_view::render_cached_lines(
                     cache,
                     visible_start..visible_end,
@@ -419,13 +420,12 @@ fn render_commit_diff(
                     None,
                     area.width.saturating_sub(2),
                 );
-                let adjusted_scroll = scroll.scroll_offset.saturating_sub(visible_start) as u16;
-                let max_scroll = cache.lines.len().saturating_sub(inner_height);
+                let adjusted_scroll = offset.saturating_sub(visible_start) as u16;
                 (
                     title,
                     lines,
                     adjusted_scroll,
-                    (max_scroll > 0).then_some((max_scroll, scroll.scroll_offset.min(max_scroll))),
+                    (max_scroll > 0).then_some((max_scroll, offset)),
                 )
             }
         }
@@ -1322,7 +1322,7 @@ mod tests {
                 &mut pool,
                 4,
             );
-            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            let mut scroll = DiffScrollState::new(ScrollMode::Margin);
             scroll.set_line_count(cache.lines.len());
             state.commit_diff = BrowseCommitDiffState::Ready {
                 annotation: Arc::clone(&annotation),
@@ -1343,7 +1343,7 @@ mod tests {
                 &mut pool,
                 4,
             );
-            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            let mut scroll = DiffScrollState::new(ScrollMode::Margin);
             scroll.set_line_count(cache.lines.len());
             state.commit_diff = BrowseCommitDiffState::Ready {
                 annotation: Arc::clone(&annotation),
@@ -1505,7 +1505,7 @@ mod tests {
         if let Some(state) = app.browse_state.as_mut() {
             open_file(state, "large.txt", "source\n");
             let cache = crate::ui::diff_view::build_plain_diff_cache(&diff, 4);
-            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            let mut scroll = DiffScrollState::new(ScrollMode::Margin);
             scroll.set_line_count(cache.lines.len());
             scroll.selected_line = cache.lines.len().saturating_sub(2);
             scroll.scroll_offset = cache.lines.len().saturating_sub(5);
@@ -1542,7 +1542,7 @@ mod tests {
         if let Some(state) = app.browse_state.as_mut() {
             open_file(state, "main.rs", "fn main() {}\n");
             let cache = crate::ui::diff_view::build_plain_diff_cache("+changed\n", 4);
-            let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+            let mut scroll = DiffScrollState::new(ScrollMode::Margin);
             scroll.set_line_count(cache.lines.len());
             state.commit_diff = BrowseCommitDiffState::Ready {
                 annotation: blame_annotation(PORCELAIN),
@@ -1930,10 +1930,10 @@ mod tests {
         │Repo Browse - demo  1 files  symbols: -                                       │
         └──────────────────────────────────────────────────────────────────────────────┘
         ┌Files─────────────────────┐┌src/long.rs (28/30)───────────────────────────────┐
-        │▼ src/                    ││   26 line 26                                     ║
-        │    long.rs               ││   27 line 27                                     ║
-        │                          ││   28 line 28                                     ║
-        │                          ││   29 line 29                                     █
+        │▼ src/                    ││   27 line 27                                     ║
+        │    long.rs               ││   28 line 28                                     ║
+        │                          ││   29 line 29                                     ║
+        │                          ││   30 line 30                                     █
         └──────────────────────────┘└──────────────────────────────────────────────────┘
          o outline | s search | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
         ");
@@ -1961,9 +1961,11 @@ mod tests {
         let small = render_scrolled(200);
         let huge = render_scrolled(30_000);
 
-        assert!(huge.contains("  101 line 101"), "{huge}");
-        assert!(huge.contains("  118 line 118"), "{huge}");
-        assert!(!huge.contains("line 119"), "{huge}");
+        // The margin clamp centres the cursor (line 101) in the 18-row
+        // viewport, so the window runs 93..=110.
+        assert!(huge.contains("   93 line 93"), "{huge}");
+        assert!(huge.contains("  110 line 110"), "{huge}");
+        assert!(!huge.contains("line 111"), "{huge}");
         assert!(huge.contains("(101/30000)"), "{huge}");
         assert!(small.contains("(101/200)"), "{small}");
     }

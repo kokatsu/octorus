@@ -325,7 +325,7 @@ impl App {
                         };
                         state.commit_diff = match delivery.result {
                             Ok(cache) => {
-                                let mut scroll = DiffScrollState::new(ScrollMode::Edge);
+                                let mut scroll = DiffScrollState::new(ScrollMode::Margin);
                                 scroll.set_line_count(cache.lines.len());
                                 BrowseCommitDiffState::Ready {
                                     annotation,
@@ -546,6 +546,20 @@ impl App {
         let Some(path) = state.selected_path().map(str::to_string) else {
             return;
         };
+        // Re-selecting the file that is already open (or still loading) is a
+        // focus change, not a jump: keep the cursor where it was. A failed
+        // load falls through so re-selecting retries it.
+        let already_open = match state.open_load {
+            OpenLoad::Pending {
+                path: ref pending, ..
+            } => *pending == path,
+            OpenLoad::Idle => state.open.as_ref().is_some_and(|open| open.path == path),
+            OpenLoad::Failed { .. } => false,
+        };
+        if already_open {
+            self.state = AppState::RepoBrowseFile;
+            return;
+        }
         self.browse_open_path(&path, 0);
     }
 
@@ -2484,7 +2498,8 @@ impl BrowseState {
         }
     }
 
-    /// Place the cursor on a 0-based line, clamped to the file.
+    /// Place the cursor on a 0-based line, clamped to the file. The next
+    /// render's `clamp_scroll` centres the viewport on it.
     pub fn focus_line(&mut self, line: usize) {
         let last = self
             .open
@@ -2492,21 +2507,28 @@ impl BrowseState {
             .map(|open| open.line_count().saturating_sub(1))
             .unwrap_or(0);
         self.cursor_line = line.min(last);
-        // Keep the target roughly a third down the viewport rather than glued
-        // to the top edge, which reads better when jumping into a definition.
-        self.scroll_offset = self.cursor_line.saturating_sub(8);
     }
 
-    /// Scroll so the cursor stays inside a viewport `height` rows tall.
+    /// Scroll so the cursor rides the centre of a viewport `height` rows
+    /// tall — the diff view's margin behaviour. The diff view clamps the
+    /// overscroll at render time; here the offset is consumed directly by
+    /// `content_window`, so the end-of-file clamp lives in the state.
     pub fn clamp_scroll(&mut self, height: usize) {
         if height == 0 {
             return;
         }
-        if self.cursor_line < self.scroll_offset {
-            self.scroll_offset = self.cursor_line;
-        } else if self.cursor_line >= self.scroll_offset + height {
-            self.scroll_offset = self.cursor_line + 1 - height;
-        }
+        let line_count = self
+            .open
+            .as_ref()
+            .map(|open| open.line_count())
+            .unwrap_or(0);
+        self.scroll_offset = crate::diff_store::margin_scroll_offset(
+            self.cursor_line,
+            self.scroll_offset,
+            line_count,
+            height,
+        )
+        .min(line_count.saturating_sub(height));
     }
 
     /// Move the cursor by `delta` lines, clamped to the file.
@@ -3337,16 +3359,40 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_scroll_follows_cursor_down_and_up() {
+    fn test_clamp_scroll_keeps_the_cursor_centred_like_the_diff_view() {
         let mut state = state_with_open_file(100);
         state.cursor_line = 40;
         state.scroll_offset = 0;
         state.clamp_scroll(10);
-        assert_eq!(state.scroll_offset, 31);
+        // margin = 10 / 2: the cursor rides the centre of the viewport, not
+        // its bottom edge (edge behaviour would leave the offset at 31).
+        assert_eq!(state.scroll_offset, 36);
 
         state.cursor_line = 5;
         state.clamp_scroll(10);
-        assert_eq!(state.scroll_offset, 5);
+        assert_eq!(state.scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_clamp_scroll_stops_at_the_end_so_the_cursor_walks_to_the_bottom() {
+        let mut state = state_with_open_file(100);
+        state.cursor_line = 99;
+        state.scroll_offset = 80;
+        state.clamp_scroll(10);
+        // The margin maths alone would put the offset at 95; the end-of-file
+        // clamp pins it to line_count - height so no blank rows render and the
+        // cursor descends to the bottom row, matching the diff view's
+        // render-side clamp.
+        assert_eq!(state.scroll_offset, 90);
+    }
+
+    #[test]
+    fn test_clamp_scroll_short_file_stays_pinned_to_the_top() {
+        let mut state = state_with_open_file(5);
+        state.cursor_line = 4;
+        state.scroll_offset = 3;
+        state.clamp_scroll(10);
+        assert_eq!(state.scroll_offset, 0);
     }
 
     #[test]
@@ -3358,20 +3404,26 @@ mod tests {
     }
 
     #[test]
-    fn test_focus_line_clamps_and_offsets_scroll() {
+    fn test_focus_line_clamps_the_cursor_and_the_render_clamp_centres_it() {
         let mut state = state_with_open_file(50);
         state.focus_line(30);
         assert_eq!(state.cursor_line, 30);
-        assert_eq!(state.scroll_offset, 22);
+        state.clamp_scroll(10);
+        assert_eq!(state.scroll_offset, 26);
 
         state.focus_line(999);
         assert_eq!(state.cursor_line, 49);
+        state.clamp_scroll(10);
+        // Jumping to the last line lands the cursor on the bottom row.
+        assert_eq!(state.scroll_offset, 40);
     }
 
     #[test]
     fn test_focus_line_near_top_does_not_underflow() {
         let mut state = state_with_open_file(50);
+        state.scroll_offset = 20;
         state.focus_line(2);
+        state.clamp_scroll(10);
         assert_eq!(state.scroll_offset, 0);
     }
 
@@ -4337,6 +4389,52 @@ mod tests {
                     line.spans.iter().any(|span| cache.resolve(span.content).contains("request 2"))
                 })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_commit_diff_scrolls_with_the_diff_view_margin_behaviour() {
+        const PORCELAIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n\
+             author Alice\n\
+             author-time 1700000000\n\
+             summary baseline\n\
+             \tone\n";
+        let gutter = BlameGutter::from_file(parse_porcelain(PORCELAIN), 1);
+        let annotation = Arc::clone(gutter.annotation_at(0).unwrap());
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(PathBuf::from("/repo"), AppState::FileList);
+        state.commit_diff = BrowseCommitDiffState::Loading {
+            request_id: 1,
+            annotation,
+            cancel: state.cancel_token.child_token(),
+        };
+        let (tx, rx) = mpsc::channel(1);
+        state.commit_diff_receiver = Some(rx);
+        app.browse_state = Some(state);
+
+        let patch: String = (0..100).map(|i| format!("+line {i}\n")).collect();
+        tx.send(CommitDiffLoadResult {
+            request_id: 1,
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            result: Ok(crate::ui::diff_view::build_plain_diff_cache(&patch, 4)),
+        })
+        .await
+        .unwrap();
+        app.poll_browse_updates();
+
+        let BrowseCommitDiffState::Ready { ref mut scroll, .. } =
+            app.browse_state.as_mut().unwrap().commit_diff
+        else {
+            panic!("commit diff must be ready");
+        };
+        scroll.set_visible_lines(10);
+        for _ in 0..40 {
+            scroll.move_down();
+        }
+        assert_eq!(scroll.selected_line, 40);
+        // Margin mode rides the centre: the offset tracks cursor - 4 for a
+        // 10-row viewport. Edge mode would sit at 31 with the cursor glued to
+        // the bottom row.
+        assert_eq!(scroll.scroll_offset, 36);
     }
 
     #[test]

@@ -419,6 +419,13 @@ frame becomes the two panes.
 
 - Tree pane: "loading spinner", "error", or "tree" according to `LoadState`
 - Content pane: nothing selected / the binary or oversized-file notice / the contents
+- The content pane cursor scrolls with the diff view's margin behaviour:
+  `clamp_scroll` calls the shared `margin_scroll_offset` (`src/diff_store.rs`),
+  so the cursor rides the viewport centre and only walks to the edge at file
+  boundaries. The diff view clamps overscroll at render time; the browser clamps
+  in state because `content_window` consumes the offset directly. The in-browser
+  commit diff pane uses `ScrollMode::Margin` with the same render-side clamp as
+  the diff view
 - The line-number gutter has a minimum width of `LINE_NUMBER_WIDTH = 5` columns,
   and `gutter_width()` widens it to match the digit count of the total line
   count. A 100,000-line file gets 6 digits, and if the cap is ever raised past
