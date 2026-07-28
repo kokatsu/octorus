@@ -70,6 +70,14 @@ pub struct KeybindingsConfig {
     pub tree_toggle: KeySequence,
     pub shell_command: KeySequence,
 
+    pub repo_browse: KeySequence,
+    pub symbol_outline: KeySequence,
+    pub symbol_search: KeySequence,
+    pub toggle_blame: KeySequence,
+    pub open_blame_commit: KeySequence,
+    pub open_blame_pr: KeySequence,
+    pub open_line_discussion: KeySequence,
+
     pub filter_open: KeySequence,
     pub filter_closed: KeySequence,
     pub filter_all: KeySequence,
@@ -147,6 +155,14 @@ impl Default for KeybindingsConfig {
             tree_toggle: KeySequence::single(KeyBinding::char('t')),
             shell_command: KeySequence::single(KeyBinding::char('!')),
 
+            repo_browse: KeySequence::single(KeyBinding::char('b')),
+            symbol_outline: KeySequence::single(KeyBinding::char('o')),
+            symbol_search: KeySequence::single(KeyBinding::char('s')),
+            toggle_blame: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('b')),
+            open_blame_commit: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('c')),
+            open_blame_pr: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('p')),
+            open_line_discussion: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('r')),
+
             filter_open: KeySequence::single(KeyBinding::char('o')),
             filter_closed: KeySequence::single(KeyBinding::char('c')),
             filter_all: KeySequence::single(KeyBinding::char('a')),
@@ -172,7 +188,8 @@ impl KeybindingsConfig {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         let mut single_keys: HashMap<KeyBinding, &str> = HashMap::new();
-        let mut sequence_prefixes: HashMap<KeyBinding, &str> = HashMap::new();
+        let mut sequence_prefixes: HashMap<KeyBinding, Vec<&str>> = HashMap::new();
+        let mut exact_sequences: HashMap<Vec<KeyBinding>, Vec<(&str, bool)>> = HashMap::new();
 
         let bindings: Vec<(&str, &KeySequence)> = vec![
             ("move_down", &self.move_down),
@@ -224,6 +241,13 @@ impl KeybindingsConfig {
             ("mark_viewed", &self.mark_viewed),
             ("mark_viewed_dir", &self.mark_viewed_dir),
             ("tree_toggle", &self.tree_toggle),
+            ("repo_browse", &self.repo_browse),
+            ("symbol_outline", &self.symbol_outline),
+            ("symbol_search", &self.symbol_search),
+            ("toggle_blame", &self.toggle_blame),
+            ("open_blame_commit", &self.open_blame_commit),
+            ("open_blame_pr", &self.open_blame_pr),
+            ("open_line_discussion", &self.open_line_discussion),
             ("shell_command", &self.shell_command),
             ("filter_open", &self.filter_open),
             ("filter_closed", &self.filter_closed),
@@ -241,6 +265,28 @@ impl KeybindingsConfig {
             if seq.keys.is_empty() {
                 errors.push(format!("keybinding '{}' is empty", name));
                 continue;
+            }
+
+            for (sequence_index, keys) in seq.all_sequences().enumerate() {
+                if keys.is_empty() {
+                    errors.push(format!("keybinding '{}' has an empty alternative", name));
+                    continue;
+                }
+                let is_primary_single = sequence_index == 0 && seq.is_single();
+                let owners = exact_sequences.entry(keys.to_vec()).or_default();
+                for (existing, existing_is_primary_single) in owners.iter() {
+                    if is_primary_single && *existing_is_primary_single {
+                        continue;
+                    }
+                    if !is_context_compatible(name, existing) {
+                        let display: String = keys.iter().map(KeyBinding::display).collect();
+                        errors.push(format!(
+                            "duplicate key sequence: '{}' and '{}' both use {}",
+                            name, existing, display
+                        ));
+                    }
+                }
+                owners.push((name, is_primary_single));
             }
 
             if seq.is_single() {
@@ -262,23 +308,25 @@ impl KeybindingsConfig {
             } else {
                 // For sequences, track the first key as a prefix
                 if let Some(first) = seq.first() {
-                    sequence_prefixes.insert(*first, name);
+                    sequence_prefixes.entry(*first).or_default().push(name);
                 }
             }
         }
 
         // Check for conflicts between single keys and sequence prefixes
         for (key, single_name) in &single_keys {
-            if let Some(seq_name) = sequence_prefixes.get(key) {
+            if let Some(seq_names) = sequence_prefixes.get(key) {
                 // Only warn if they're in the same context
-                if !is_context_compatible(single_name, seq_name) {
-                    errors.push(format!(
-                        "keybinding conflict: '{}' ({}) conflicts with sequence prefix for '{}' ({})",
-                        single_name,
-                        key.display(),
-                        seq_name,
-                        key.display()
-                    ));
+                for seq_name in seq_names {
+                    if !is_context_compatible(single_name, seq_name) {
+                        errors.push(format!(
+                            "keybinding conflict: '{}' ({}) conflicts with sequence prefix for '{}' ({})",
+                            single_name,
+                            key.display(),
+                            seq_name,
+                            key.display()
+                        ));
+                    }
                 }
             }
         }
@@ -323,6 +371,10 @@ fn is_context_compatible(name1: &str, name2: &str) -> bool {
         "retry",
         "confirm_yes",
         "confirm_no",
+        // Repository Browser keys are only live on the browse screen.
+        "repo_browse",
+        "symbol_outline",
+        "symbol_search",
     ];
 
     let context_groups: &[&[&str]] = &[
@@ -430,6 +482,16 @@ impl Serialize for KeybindingsConfig {
         map.serialize_entry("mark_viewed", &seq_to_value(&self.mark_viewed))?;
         map.serialize_entry("mark_viewed_dir", &seq_to_value(&self.mark_viewed_dir))?;
         map.serialize_entry("tree_toggle", &seq_to_value(&self.tree_toggle))?;
+        map.serialize_entry("repo_browse", &seq_to_value(&self.repo_browse))?;
+        map.serialize_entry("symbol_outline", &seq_to_value(&self.symbol_outline))?;
+        map.serialize_entry("symbol_search", &seq_to_value(&self.symbol_search))?;
+        map.serialize_entry("toggle_blame", &seq_to_value(&self.toggle_blame))?;
+        map.serialize_entry("open_blame_commit", &seq_to_value(&self.open_blame_commit))?;
+        map.serialize_entry("open_blame_pr", &seq_to_value(&self.open_blame_pr))?;
+        map.serialize_entry(
+            "open_line_discussion",
+            &seq_to_value(&self.open_line_discussion),
+        )?;
         map.serialize_entry("shell_command", &seq_to_value(&self.shell_command))?;
         map.serialize_entry("filter_open", &seq_to_value(&self.filter_open))?;
         map.serialize_entry("filter_closed", &seq_to_value(&self.filter_closed))?;

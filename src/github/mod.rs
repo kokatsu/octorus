@@ -1,6 +1,8 @@
+mod blame;
 mod client;
 pub mod comment;
 mod commit;
+mod commit_pr;
 mod dashboard;
 
 macro_rules! define_state_filter {
@@ -44,12 +46,18 @@ macro_rules! define_state_filter {
 mod issue;
 mod pr;
 
+pub use blame::{
+    blame_argv, blame_file, parse_porcelain, BlameError, BlameFile, BlameRef, BLAME_LINE_BYTES,
+    MAX_BLAME_LINES, MAX_BLAME_STDOUT_BYTES, UNCOMMITTED_SHA,
+};
+pub(crate) use blame::{blame_file_at_revision_range, short_sha};
 pub use client::{detect_repo, gh_command, DetectRepoError};
 pub use comment::{create_multiline_review_comment, create_reply_comment, create_review_comment};
 pub use commit::{
     fetch_commit_diff, fetch_local_commit_diff, fetch_local_commits, fetch_pr_commits,
     format_relative_time, CommitListPage, PrCommit,
 };
+pub use commit_pr::*;
 pub use dashboard::{fetch_mentioned_issues_count, fetch_review_requested_prs_count};
 
 pub use issue::{
@@ -64,3 +72,7 @@ pub use pr::{
     CheckItem, CiStatus, Label, PrListPage, PrStateFilter, PullRequest, PullRequestSummary,
     StatusCheckRollupItem, User,
 };
+
+pub(crate) fn format_relative_time_from_epoch(epoch_seconds: i64) -> String {
+    commit::format_relative_time_from_epoch(epoch_seconds)
+}

@@ -63,6 +63,10 @@ struct Args {
     #[arg(long, default_value = "false")]
     git_ops: bool,
 
+    /// Start in the Repository Browser directly
+    #[arg(long, default_value = "false")]
+    browse: bool,
+
     /// Auto-focus changed file when local diff updates (for local mode)
     #[arg(long, default_value = "false")]
     auto_focus: bool,
@@ -81,6 +85,24 @@ struct Args {
     /// Useful when running as a background task where stdout may not be captured.
     #[arg(long)]
     output: Option<String>,
+}
+
+fn is_no_args(args: &Args) -> bool {
+    args.pr.is_none()
+        && !args.local
+        && args.issue.is_none()
+        && !args.git_ops
+        && !args.browse
+        && !args.ai_rally
+}
+
+/// Repo detection is allowed to degrade to a repo-less session for local,
+/// Git Ops, Repository Browser, and no-entry-point sessions.
+///
+/// Consulted only when `--repo` is absent — an explicit repository is taken as
+/// given and never detected, so this predicate ignores [`Args::repo`].
+fn tolerates_missing_repo(args: &Args) -> bool {
+    args.local || args.git_ops || args.browse || is_no_args(args)
 }
 
 #[derive(Subcommand, Debug)]
@@ -326,13 +348,12 @@ async fn main() -> Result<()> {
         };
     }
 
-    let is_no_args =
-        args.pr.is_none() && !args.local && args.issue.is_none() && !args.git_ops && !args.ai_rally;
+    let is_no_args = is_no_args(&args);
 
     let (repo, repo_available) = match args.repo.clone() {
         Some(r) => (r, true),
         None => {
-            if args.local || is_no_args {
+            if tolerates_missing_repo(&args) {
                 match github::detect_repo().await {
                     Ok(r) => (r, true),
                     Err(_) => ("local".to_string(), false),
@@ -415,17 +436,27 @@ async fn main() -> Result<()> {
     }
 
     if args.local {
-        run_with_local_diff(&repo, &config, &args).await
+        run_with_local_diff(&repo, &config, &args, repo_available).await
     } else if let Some(pr) = args.pr.filter(|&n| n > 0) {
-        run_with_pr(&repo, pr, &config, &args).await
+        run_with_pr(&repo, pr, &config, &args, repo_available).await
     } else {
-        run_with_pr_list(&repo, config, &args, args.issue).await
+        run_with_pr_list(&repo, config, &args, args.issue, repo_available).await
     }
 }
 
-async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -> Result<()> {
+async fn run_with_local_diff(
+    repo: &str,
+    config: &config::Config,
+    args: &Args,
+    repo_available: bool,
+) -> Result<()> {
     let (retry_tx, mut retry_rx) = mpsc::channel::<RefreshRequest>(1);
-    let (mut app, tx) = app::App::new_loading(repo, 0, config.clone());
+    let repository_availability = if repo_available {
+        app::RepositoryAvailability::Available
+    } else {
+        app::RepositoryAvailability::Unavailable
+    };
+    let (mut app, tx) = app::App::new_loading(repo, 0, config.clone(), repository_availability);
     let working_dir = args.working_dir.clone();
     let refresh_pending = Arc::new(AtomicBool::new(false));
 
@@ -442,6 +473,9 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
     if args.git_ops {
         app.open_git_ops();
     }
+    if args.browse {
+        app.open_repo_browse();
+    }
 
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
@@ -454,8 +488,18 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
             _ = token_clone.cancelled() => {}
             _ = async {
                 while let Some(request) = retry_rx.recv().await {
-                    match request {
-                        RefreshRequest::LocalRefresh => {
+                    match local_startup_refresh_route(request) {
+                        LocalStartupRefreshRoute::PullRequest(pr_number) => {
+                            let tx_retry = tx.clone();
+                            loader::fetch_pr_data(
+                                repo.clone(),
+                                pr_number,
+                                loader::FetchMode::Fresh,
+                                tx_retry,
+                            )
+                            .await;
+                        }
+                        LocalStartupRefreshRoute::WatchedLocal => {
                             refresh_pending.store(false, Ordering::Release);
 
                             loop {
@@ -467,9 +511,8 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
                                 }
                             }
                         }
-                        RefreshRequest::PrRefresh { .. } => {
-                            // In local mode, pr_number == 0 is a dummy value that would
-                            // produce invalid API calls, so treat PrRefresh as LocalRefresh.
+                        LocalStartupRefreshRoute::LocalSentinel => {
+                            // PR zero is the local-mode sentinel, never a GitHub PR number.
                             let tx_retry = tx.clone();
                             loader::fetch_local_diff(repo.clone(), working_dir.clone(), tx_retry).await;
                         }
@@ -489,6 +532,23 @@ async fn run_with_local_diff(repo: &str, config: &config::Config, args: &Args) -
 
     let exit_code = if result.is_ok() { 0 } else { 1 };
     std::process::exit(exit_code);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalStartupRefreshRoute {
+    WatchedLocal,
+    LocalSentinel,
+    PullRequest(u32),
+}
+
+fn local_startup_refresh_route(request: RefreshRequest) -> LocalStartupRefreshRoute {
+    match request {
+        RefreshRequest::PrRefresh { pr_number } if pr_number > 0 => {
+            LocalStartupRefreshRoute::PullRequest(pr_number)
+        }
+        RefreshRequest::PrRefresh { .. } => LocalStartupRefreshRoute::LocalSentinel,
+        RefreshRequest::LocalRefresh => LocalStartupRefreshRoute::WatchedLocal,
+    }
 }
 
 fn setup_local_watch(
@@ -548,11 +608,22 @@ fn is_octorus_config_file(path: &Path) -> bool {
 }
 
 /// Run the app with a specific PR number (existing flow)
-async fn run_with_pr(repo: &str, pr: u32, config: &config::Config, args: &Args) -> Result<()> {
+async fn run_with_pr(
+    repo: &str,
+    pr: u32,
+    config: &config::Config,
+    args: &Args,
+    repo_available: bool,
+) -> Result<()> {
     let (retry_tx, mut retry_rx) = mpsc::channel::<RefreshRequest>(1);
     let refresh_pending = Arc::new(AtomicBool::new(false));
 
-    let (mut app, tx) = app::App::new_loading(repo, pr, config.clone());
+    let repository_availability = if repo_available {
+        app::RepositoryAvailability::Available
+    } else {
+        app::RepositoryAvailability::Unavailable
+    };
+    let (mut app, tx) = app::App::new_loading(repo, pr, config.clone(), repository_availability);
 
     app.set_retry_sender(retry_tx);
     start_update_check(&mut app);
@@ -563,6 +634,9 @@ async fn run_with_pr(repo: &str, pr: u32, config: &config::Config, args: &Args) 
     }
     if args.git_ops {
         app.open_git_ops();
+    }
+    if args.browse {
+        app.open_repo_browse();
     }
 
     let cancel_token = CancellationToken::new();
@@ -621,12 +695,18 @@ async fn run_with_pr_list(
     config: config::Config,
     args: &Args,
     issue_arg: Option<u32>,
+    repo_available: bool,
 ) -> Result<()> {
     // Retry channel also handles PR list → Local mode transitions.
     let (retry_tx, mut retry_rx) = mpsc::channel::<RefreshRequest>(1);
     let refresh_pending = Arc::new(AtomicBool::new(false));
 
-    let mut app = app::App::new_pr_list(repo, config);
+    let repository_availability = if repo_available {
+        app::RepositoryAvailability::Available
+    } else {
+        app::RepositoryAvailability::Unavailable
+    };
+    let mut app = app::App::new_pr_list(repo, config, repository_availability);
     app.set_retry_sender(retry_tx);
     start_update_check(&mut app);
     setup_working_dir(&mut app, args);
@@ -636,6 +716,9 @@ async fn run_with_pr_list(
     }
     if args.git_ops {
         app.open_git_ops();
+    }
+    if args.browse {
+        app.open_repo_browse();
     }
 
     match issue_arg {
@@ -919,6 +1002,90 @@ mod tests {
     }
 
     #[test]
+    fn test_no_args_tolerates_missing_repo() {
+        let args = Args::parse_from(["or"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    /// Every entry-point flag must exclude itself from `is_no_args`.
+    ///
+    /// `is_no_args` has a second consumer besides `tolerates_missing_repo`: the
+    /// Cockpit dispatch. Testing it only through `tolerates_missing_repo` cannot
+    /// see a broken conjunct, because `--local`, `--git-ops` and `--browse` each
+    /// have their own disjunct there that keeps the answer `true` either way —
+    /// so the flag would silently open Cockpit instead of its own screen while
+    /// every existing test stayed green.
+    ///
+    /// The end-to-end tests cannot close this either: `or --browse` writes the
+    /// alternate-screen escape and then fails on a non-tty before drawing a
+    /// single frame, so stdout never names the screen that opened.
+    #[test]
+    fn test_every_entry_point_flag_excludes_itself_from_is_no_args() {
+        assert!(is_no_args(&Args::parse_from(["or"])), "the baseline");
+
+        for argv in [
+            vec!["or", "--pr", "1"],
+            vec!["or", "--local"],
+            vec!["or", "--issue", "1"],
+            vec!["or", "--git-ops"],
+            vec!["or", "--browse"],
+            vec!["or", "--ai-rally"],
+        ] {
+            let flag = argv[1];
+            assert!(
+                !is_no_args(&Args::parse_from(argv.clone())),
+                "`or {flag}` is an entry point, so it is not a no-args session; \
+                 treating it as one dispatches Cockpit instead of its own screen"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browse_tolerates_missing_repo() {
+        let args = Args::parse_from(["or", "--browse"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_local_tolerates_missing_repo() {
+        let args = Args::parse_from(["or", "--local"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_pr_without_explicit_repo_does_not_tolerate_missing_repo() {
+        let args = Args::parse_from(["or", "--pr", "1"]);
+
+        assert!(!tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_git_ops_tolerates_missing_repo() {
+        let args = Args::parse_from(["or", "--git-ops"]);
+
+        assert!(tolerates_missing_repo(&args));
+    }
+
+    #[test]
+    fn test_local_startup_refresh_route_distinguishes_every_dispatch_target() {
+        assert_eq!(
+            local_startup_refresh_route(RefreshRequest::PrRefresh { pr_number: 42 }),
+            LocalStartupRefreshRoute::PullRequest(42)
+        );
+        assert_eq!(
+            local_startup_refresh_route(RefreshRequest::PrRefresh { pr_number: 0 }),
+            LocalStartupRefreshRoute::LocalSentinel
+        );
+        assert_eq!(
+            local_startup_refresh_route(RefreshRequest::LocalRefresh),
+            LocalStartupRefreshRoute::WatchedLocal
+        );
+    }
+
+    #[test]
     fn test_root_help_snapshot_includes_review_only_flag() {
         use clap::CommandFactory;
         use insta::assert_snapshot;
@@ -947,6 +1114,7 @@ mod tests {
               --local                      Show local git diff against current HEAD (no GitHub PR fetch)
           -i, --issue [<ISSUE>]            Issue number. Shows issue detail directly if provided, issue list if flag only
               --git-ops                    Start in Git Ops view directly
+              --browse                     Start in the Repository Browser directly
               --auto-focus                 Auto-focus changed file when local diff updates (for local mode)
               --working-dir <WORKING_DIR>  Working directory for AI agents (default: current directory)
               --accept-local-overrides     Accept local .octorus/ overrides for AI settings in headless mode. Without this flag, headless AI Rally will refuse to run if the local config overrides security-sensitive AI keys or local prompt files are detected in .octorus/prompts/

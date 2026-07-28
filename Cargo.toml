@@ -9,7 +9,7 @@ authors = ["ushironoko"]
 description = "A TUI tool for GitHub PR review, designed for Helix editor users"
 license = "MIT"
 repository = "https://github.com/ushironoko/octorus"
-exclude = ["benches/", ".github/", ".claude/", "assets/", "*.pending-snap", "**/snapshots/"]
+exclude = ["benches/", ".github/", ".claude/", "assets/", "docs/", "*.pending-snap", "**/snapshots/"]
 
 [[bin]]
 name = "or"
@@ -96,6 +96,14 @@ harness = false
 
 [[bench]]
 name = "symbol_search"
+harness = false
+
+[[bench]]
+name = "symbol_index"
+harness = false
+
+[[bench]]
+name = "blame_parse"
 harness = false
 
 [profile.release]

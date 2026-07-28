@@ -9,11 +9,15 @@ use serde::{Deserialize, Serialize};
 use xdg::BaseDirectories;
 
 use crate::github::comment::{DiscussionComment, ReviewComment};
-use crate::github::{ChangedFile, PullRequest};
+use crate::github::{ChangedFile, CommitPrResolution, PullRequest};
 
 /// セッションキャッシュが保持するPRデータの最大エントリ数。
 /// 超過時は最も古いエントリ（LRU）を削除してメモリ増加を防止する。
 const MAX_PR_CACHE_ENTRIES: usize = 5;
+/// Browser-only inline review-comment payloads are complete enough for line
+/// anchoring but intentionally separate from the normal comment screen's
+/// inline-comments-plus-review-summaries payload.
+const MAX_BROWSER_REVIEW_COMMENT_ENTRIES: usize = 5;
 
 /// Sanitize repository name to prevent path traversal attacks.
 /// Only allows alphanumeric characters, underscores, hyphens, and single dots (not ".." sequences).
@@ -276,7 +280,10 @@ pub struct SessionCache {
     /// アクセス順序リスト（末尾が最新）。LRU eviction に使用。
     access_order: Vec<PrCacheKey>,
     review_comments: HashMap<PrCacheKey, Vec<ReviewComment>>,
+    browser_review_comments: HashMap<PrCacheKey, Vec<ReviewComment>>,
+    browser_review_comment_order: Vec<PrCacheKey>,
     discussion_comments: HashMap<PrCacheKey, Vec<DiscussionComment>>,
+    commit_pr_resolutions: HashMap<String, CommitPrResolution>,
 }
 
 impl Default for SessionCache {
@@ -291,7 +298,10 @@ impl SessionCache {
             pr_data: HashMap::new(),
             access_order: Vec::new(),
             review_comments: HashMap::new(),
+            browser_review_comments: HashMap::new(),
+            browser_review_comment_order: Vec::new(),
             discussion_comments: HashMap::new(),
+            commit_pr_resolutions: HashMap::new(),
         }
     }
 
@@ -347,6 +357,37 @@ impl SessionCache {
         self.review_comments.remove(key);
     }
 
+    pub fn get_browser_review_comments(&mut self, key: &PrCacheKey) -> Option<&[ReviewComment]> {
+        if !self.browser_review_comments.contains_key(key) {
+            return None;
+        }
+        self.touch_browser_review_comments(key);
+        self.browser_review_comments.get(key).map(Vec::as_slice)
+    }
+
+    pub fn put_browser_review_comments(&mut self, key: PrCacheKey, comments: Vec<ReviewComment>) {
+        self.touch_browser_review_comments(&key);
+        self.browser_review_comments.insert(key, comments);
+        while self.browser_review_comments.len() > MAX_BROWSER_REVIEW_COMMENT_ENTRIES {
+            let Some(oldest) = self.browser_review_comment_order.first().cloned() else {
+                break;
+            };
+            self.browser_review_comment_order.remove(0);
+            self.browser_review_comments.remove(&oldest);
+        }
+    }
+
+    fn touch_browser_review_comments(&mut self, key: &PrCacheKey) {
+        if let Some(position) = self
+            .browser_review_comment_order
+            .iter()
+            .position(|candidate| candidate == key)
+        {
+            self.browser_review_comment_order.remove(position);
+        }
+        self.browser_review_comment_order.push(key.clone());
+    }
+
     pub fn get_discussion_comments(&self, key: &PrCacheKey) -> Option<&[DiscussionComment]> {
         self.discussion_comments.get(key).map(|v| v.as_slice())
     }
@@ -362,6 +403,14 @@ impl SessionCache {
         self.discussion_comments.remove(key);
     }
 
+    pub fn get_commit_pr_resolution(&self, sha: &str) -> Option<&CommitPrResolution> {
+        self.commit_pr_resolutions.get(sha)
+    }
+
+    pub fn put_commit_pr_resolution(&mut self, sha: String, resolution: CommitPrResolution) {
+        self.commit_pr_resolutions.insert(sha, resolution);
+    }
+
     /// 特定ファイルの patch を更新（lazy diff ロード結果の反映用）
     pub fn update_file_patch(&mut self, key: &PrCacheKey, filename: &str, patch: Option<String>) {
         if let Some(pr_data) = self.pr_data.get_mut(key) {
@@ -375,7 +424,10 @@ impl SessionCache {
         self.pr_data.clear();
         self.access_order.clear();
         self.review_comments.clear();
+        self.browser_review_comments.clear();
+        self.browser_review_comment_order.clear();
         self.discussion_comments.clear();
+        self.commit_pr_resolutions.clear();
     }
 
     #[cfg(test)]
@@ -387,12 +439,19 @@ impl SessionCache {
     pub fn is_empty(&self) -> bool {
         self.pr_data.is_empty()
     }
+
+    #[cfg(test)]
+    fn browser_review_comment_entry_count(&self) -> usize {
+        self.browser_review_comments.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{Branch, User};
+    use crate::github::{
+        Branch, CommitPrResolution, CommitPullRequest, CommitPullRequestState, User,
+    };
     use serial_test::serial;
     use tempfile::tempdir;
 
@@ -416,6 +475,18 @@ mod tests {
             },
             updated_at: updated_at.to_string(),
         }
+    }
+
+    fn make_review_comment(id: u64) -> ReviewComment {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "path": "src/lib.rs",
+            "line": 1,
+            "body": format!("comment {id}"),
+            "user": { "login": "reviewer" },
+            "created_at": "2026-07-28T00:00:00Z"
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -544,6 +615,7 @@ mod tests {
             },
             created_at: "2026-03-24T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         })];
 
         save_local_review_comments_with_base(
@@ -684,6 +756,7 @@ mod tests {
                 },
                 created_at: "2026-04-27T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             }),
             LocalReviewComment::new(ReviewComment {
                 id: 2,
@@ -696,6 +769,7 @@ mod tests {
                 },
                 created_at: "2026-04-27T00:01:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             }),
         ];
         save_local_review_comments_with_base(
@@ -802,6 +876,53 @@ mod tests {
     }
 
     #[test]
+    fn browser_inline_comments_are_bounded_without_pr_data_and_do_not_replace_complete_comments() {
+        let mut cache = SessionCache::new();
+        let complete_key = PrCacheKey {
+            repo: "owner/repo".to_string(),
+            pr_number: 1,
+        };
+        cache.put_pr_data(
+            complete_key.clone(),
+            PrData {
+                pr: Box::new(make_test_pr("test", "2024-01-01")),
+                files: vec![],
+                pr_updated_at: "2024-01-01".to_string(),
+            },
+        );
+        cache.put_review_comments(complete_key.clone(), vec![make_review_comment(1)]);
+        cache.put_browser_review_comments(complete_key.clone(), vec![make_review_comment(2)]);
+
+        assert_eq!(cache.get_review_comments(&complete_key).unwrap()[0].id, 1);
+        assert_eq!(
+            cache.get_browser_review_comments(&complete_key).unwrap()[0].id,
+            2
+        );
+
+        for number in 2..=(MAX_BROWSER_REVIEW_COMMENT_ENTRIES as u32 + 2) {
+            cache.put_browser_review_comments(
+                PrCacheKey {
+                    repo: "owner/repo".to_string(),
+                    pr_number: number,
+                },
+                vec![],
+            );
+        }
+
+        assert!(cache
+            .get_browser_review_comments(&PrCacheKey {
+                repo: "owner/repo".to_string(),
+                pr_number: 2,
+            })
+            .is_none());
+        assert_eq!(
+            cache.browser_review_comment_entry_count(),
+            MAX_BROWSER_REVIEW_COMMENT_ENTRIES
+        );
+        assert_eq!(cache.get_review_comments(&complete_key).unwrap()[0].id, 1);
+    }
+
+    #[test]
     fn test_session_cache_put_get_discussion_comments() {
         let mut cache = SessionCache::new();
         let key = PrCacheKey {
@@ -893,12 +1014,48 @@ mod tests {
         );
         cache.put_review_comments(key.clone(), vec![]);
         cache.put_discussion_comments(key.clone(), vec![]);
+        cache.put_commit_pr_resolution(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            CommitPrResolution::NotFound,
+        );
 
         cache.invalidate_all();
 
         assert!(cache.get_pr_data(&key).is_none());
         assert!(cache.get_review_comments(&key).is_none());
         assert!(cache.get_discussion_comments(&key).is_none());
+        assert!(cache
+            .get_commit_pr_resolution("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .is_none());
+    }
+
+    #[test]
+    fn test_session_cache_stores_confirmed_and_not_found_commit_pr_answers_per_sha() {
+        let mut cache = SessionCache::new();
+        let confirmed_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let not_found_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let confirmed = CommitPrResolution::Confirmed {
+            pulls: vec![CommitPullRequest {
+                number: 42,
+                title: "confirmed".to_string(),
+                state: CommitPullRequestState::Closed,
+            }],
+        };
+
+        cache.put_commit_pr_resolution(confirmed_sha.to_string(), confirmed.clone());
+        cache.put_commit_pr_resolution(not_found_sha.to_string(), CommitPrResolution::NotFound);
+
+        assert_eq!(
+            cache.get_commit_pr_resolution(confirmed_sha),
+            Some(&confirmed)
+        );
+        assert_eq!(
+            cache.get_commit_pr_resolution(not_found_sha),
+            Some(&CommitPrResolution::NotFound)
+        );
+        assert!(cache
+            .get_commit_pr_resolution("cccccccccccccccccccccccccccccccccccccccc")
+            .is_none());
     }
 
     #[test]

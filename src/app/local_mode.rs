@@ -50,11 +50,11 @@ impl App {
 
         if self.local_mode {
             // Local → PR: 切替可能かチェック（reset_view_state の前）
-            let has_valid_repo = self.repo.contains('/');
+            let has_valid_repo = self.repository_availability().is_available();
             let has_original_pr = self.original_pr_number.filter(|&n| n != 0).is_some();
 
             if !has_valid_repo && !has_original_pr {
-                // repo がダミー値（"local" 等）で復帰先PRもない → 切替不可
+                // GitHub repo を検出できず、復帰先 PR もない → 切替不可
                 self.cmt.submission_result = Some((false, "No PR to return to".to_string()));
                 self.cmt.submission_result_time = Some(Instant::now());
                 return;

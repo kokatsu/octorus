@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -279,10 +280,12 @@ async fn run_git_name_status(working_dir: Option<&str>) -> Result<String> {
 /// この関数は引用符を除去し、オクタルエスケープを UTF-8 バイト列に変換する。
 ///
 /// 引用符で囲まれていないパスはそのまま返す。
-fn unquote_git_path(path: &str) -> String {
-    // C-quoted 形式でなければそのまま返す
-    if !path.starts_with('"') || !path.ends_with('"') {
-        return path.to_string();
+pub(crate) fn unquote_git_path(path: &str) -> Cow<'_, str> {
+    // C-quoted 形式でなければそのまま返す。
+    // len >= 2 の判定が必要: `"` 一文字は starts_with と ends_with の両方を
+    // 同じ一文字で満たすので、下の [1..len-1] が [1..0] になり panic する。
+    if path.len() < 2 || !path.starts_with('"') || !path.ends_with('"') {
+        return Cow::Borrowed(path);
     }
 
     // 前後の引用符を除去
@@ -340,10 +343,10 @@ fn unquote_git_path(path: &str) -> String {
         }
     }
 
-    String::from_utf8(bytes).unwrap_or_else(|e| {
+    Cow::Owned(String::from_utf8(bytes).unwrap_or_else(|e| {
         // Fallback: lossy conversion
         String::from_utf8_lossy(e.as_bytes()).into_owned()
-    })
+    }))
 }
 
 /// name-status 出力をパース。rename/copy の3カラム形式にも対応:
@@ -369,7 +372,7 @@ fn parse_name_status_output(output: &str) -> Vec<(String, String)> {
             'R' | 'C' => {
                 // Rename/Copy: 3カラム形式 "R100\told\tnew" or "C100\tsrc\tdst"
                 if parts.len() >= 3 {
-                    let new_name = unquote_git_path(parts[2]);
+                    let new_name = unquote_git_path(parts[2]).into_owned();
                     let status = if first_char == 'R' {
                         "renamed"
                     } else {
@@ -379,21 +382,33 @@ fn parse_name_status_output(output: &str) -> Vec<(String, String)> {
                 }
             }
             'M' => {
-                result.push((unquote_git_path(parts[1]), "modified".to_string()));
+                result.push((
+                    unquote_git_path(parts[1]).into_owned(),
+                    "modified".to_string(),
+                ));
             }
             'A' => {
-                result.push((unquote_git_path(parts[1]), "added".to_string()));
+                result.push((unquote_git_path(parts[1]).into_owned(), "added".to_string()));
             }
             'D' => {
-                result.push((unquote_git_path(parts[1]), "removed".to_string()));
+                result.push((
+                    unquote_git_path(parts[1]).into_owned(),
+                    "removed".to_string(),
+                ));
             }
             'T' => {
                 // Type change
-                result.push((unquote_git_path(parts[1]), "modified".to_string()));
+                result.push((
+                    unquote_git_path(parts[1]).into_owned(),
+                    "modified".to_string(),
+                ));
             }
             _ => {
                 // Unknown status, treat as modified
-                result.push((unquote_git_path(parts[1]), "modified".to_string()));
+                result.push((
+                    unquote_git_path(parts[1]).into_owned(),
+                    "modified".to_string(),
+                ));
             }
         }
     }
@@ -495,7 +510,7 @@ fn parse_numstat_output(output: Option<&str>) -> HashMap<String, (u32, u32)> {
         if let (Some(added_raw), Some(deleted_raw), Some(path)) = (added_raw, deleted_raw, path) {
             let parse_count = |value: &str| -> u32 { value.parse().unwrap_or(0) };
             result.insert(
-                unquote_git_path(path),
+                unquote_git_path(path).into_owned(),
                 (parse_count(added_raw), parse_count(deleted_raw)),
             );
         }
@@ -507,7 +522,7 @@ fn parse_numstat_output(output: Option<&str>) -> HashMap<String, (u32, u32)> {
 fn parse_path_list(output: &str) -> Vec<String> {
     output
         .lines()
-        .map(|line| unquote_git_path(line.trim()))
+        .map(|line| unquote_git_path(line.trim()).into_owned())
         .filter(|line| !line.is_empty())
         .collect()
 }
@@ -1002,6 +1017,26 @@ index 1234567..abcdefg 100644
     #[test]
     fn test_unquote_git_path_plain() {
         assert_eq!(unquote_git_path("src/foo.rs"), "src/foo.rs");
+    }
+
+    #[test]
+    fn test_unquote_git_path_plain_is_borrowed() {
+        assert!(matches!(
+            unquote_git_path("src/foo.rs"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_unquote_git_path_degenerate_quotes_do_not_panic() {
+        // A single `"` satisfies both starts_with and ends_with with the same
+        // character. Slicing [1..len-1] would be [1..0].
+        assert_eq!(unquote_git_path("\""), "\"");
+        assert_eq!(unquote_git_path(""), "");
+        assert_eq!(unquote_git_path("\"\""), "");
+        // A lone quote at either end is not a quoted path.
+        assert_eq!(unquote_git_path("\"unterminated"), "\"unterminated");
+        assert_eq!(unquote_git_path("unopened\""), "unopened\"");
     }
 
     #[test]

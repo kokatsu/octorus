@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Plz read README.md.
 
+Design notes for the Repository Browser live in `docs/`. Read
+`docs/repo-browse-architecture.md` before changing the browser screen, and
+`docs/symbol-index.md` when the work touches symbol extraction or adds a
+language — it records the per-grammar quirks you will otherwise rediscover the
+hard way. `docs/README.md` indexes both.
+
 ## Build & Test Commands
 
 ```bash
@@ -17,7 +23,12 @@ cargo bench                  # Run all benchmarks (Criterion)
 cargo bench --bench ui_rendering
 cargo bench --bench diff_parsing
 cargo bench --bench symbol_search
+cargo bench --bench symbol_index
 ```
+
+`.github/workflows/benchmark.yml` runs only `ui_rendering` and `diff_parsing`, and only on
+`workflow_dispatch` or the weekly cron — with `fail-on-alert: false`. A benchmark regression
+never blocks a PR, so run the relevant bench locally when you touch a hot path.
 
 ## Principles
 
@@ -55,7 +66,7 @@ This project is Building/Development for 5 Principles.
 
 ## 4. Use a state machine for consistency instead of individual conditional branches.
 
-- All screen/mode transitions go through `AppState` enum (17 states). Never use ad-hoc boolean flags to track "which screen am I on."
+- All screen/mode transitions go through `AppState` enum (19 states). Never use ad-hoc boolean flags to track "which screen am I on."
 - Data loading lifecycle is modeled as `DataState` enum (`Loading` → `Loaded` → `Error`). Never use `Option<Data>` + `is_loading: bool` separately.
 - AI Rally transitions flow through `RallyState` enum with `RallyEvent`-driven transitions. Each state has explicit allowed transitions — invalid transitions are compile-time or runtime errors.
 - Input modes are modeled as `InputMode` enum variants with associated data (context, original code, etc.).

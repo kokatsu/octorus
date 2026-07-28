@@ -57,6 +57,7 @@ impl App {
                 CockpitMenuItem::IssueList => self.open_issue_list(),
                 CockpitMenuItem::LocalDiff => self.enter_local_mode_from_cockpit(),
                 CockpitMenuItem::GitOps => self.open_git_ops(),
+                CockpitMenuItem::RepoBrowse => self.open_repo_browse(),
             }
             return Ok(());
         }
@@ -229,11 +230,17 @@ mod tests {
             CockpitMenuItem::GitOps
         );
 
+        app.handle_cockpit_input(press(KeyCode::Char('j'))).unwrap();
+        assert_eq!(
+            app.cockpit_state.as_ref().unwrap().selected_item,
+            CockpitMenuItem::RepoBrowse
+        );
+
         // Clamp at last
         app.handle_cockpit_input(press(KeyCode::Char('j'))).unwrap();
         assert_eq!(
             app.cockpit_state.as_ref().unwrap().selected_item,
-            CockpitMenuItem::GitOps
+            CockpitMenuItem::RepoBrowse
         );
     }
 

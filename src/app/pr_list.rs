@@ -10,7 +10,7 @@ use crate::keybinding::{event_to_keybinding, SequenceMatch};
 use crate::github::CiStatus;
 
 use super::types::LoadState;
-use super::{App, AppState, DataState};
+use super::{App, AppState, DataState, PrOpenSource};
 
 impl App {
     pub(crate) async fn handle_pr_list_input(&mut self, key: event::KeyEvent) -> Result<()> {
@@ -264,6 +264,7 @@ impl App {
     }
     pub(crate) fn select_pr(&mut self, pr_number: u32) {
         self.pr_number = Some(pr_number);
+        self.pr_open_source = PrOpenSource::Standard;
         self.state = AppState::FileList;
         self.file_list_filter = None;
         self.cmt.pending_approve_body = None;

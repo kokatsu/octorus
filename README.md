@@ -11,7 +11,8 @@ High-performance code review in your terminal for GitHub PRs, issues, local diff
 
 ## Key Features
 - **Fast and smooth**: Handles 1,000,000+ diff lines and 6,000+ files
-- **Multifunctional**: PR review, issue view, local diff view, CI status, and Git operations are integrated into one system with search, filters, comments, suggestions, and more.
+- **Multifunctional**: Repository browsing, PR review, issue view, local diff view, CI status, and Git operations are integrated into one system with search, filters, comments, suggestions, and more.
+- **Code intelligence without an LSP**: tree-sitter symbol index powers file outlines, repository-wide symbol search, and Go to Definition — no language server to install, nothing to configure
 - **Automatic Review and Code Fix**: Automated review and fix workflows for Claude and Codex, while keeping the process under your control
 - **Customization**: Customize all settings, including keybindings, themes, and agent prompts
 
@@ -49,6 +50,9 @@ or --pr 123
 
 # 4. Preview local changes
 or --local
+
+# 5. Browse the repository (read any file, jump by symbol)
+or --browse
 ```
 
 ### Options
@@ -62,6 +66,7 @@ or --local
 | `--ai-rally` | Start AI Rally mode directly. Runs in headless mode when combined with `--pr <number>` or `--local` |
 | `--review-only[=BOOL]` | Force AI Rally proposal-iteration mode. Use with `--ai-rally`, for example `--review-only=true` |
 | `--git-ops` | Open Git Ops view directly on startup |
+| `--browse` | Open the Repository Browser directly on startup |
 | `--auto-focus` | Auto-focus changed file when local diff updates (local mode only) |
 | `--working-dir <DIR>` | Working directory for AI agents (default: current directory) |
 | `--accept-local-overrides` | Accept local `.octorus/` overrides for AI settings in headless mode |
@@ -96,9 +101,91 @@ octorus is an all-in-one review tool for the terminal UI. It shows GitHub PRs, i
 Running `or` with no flags opens the Cockpit — a dashboard that serves as the main entry point.
 
 - Live counts: issues mentioning you and PRs requesting your review
-- Navigation menu to PR List, Issue List, Local Diff, and Git Ops
+- Navigation menu to PR List, Issue List, Local Diff, Git Ops, and Repo Browse
 - Press `Enter` to navigate, `q` to quit, `?` for help, `r` to refresh counts
-- When no GitHub repo is detected, remote features (PR List, Issue List) are disabled; Local Diff and Git Ops remain available
+- When no GitHub repo is detected, remote features (PR List, Issue List) are disabled; Local Diff, Git Ops, and Repo Browse remain available
+
+### Repository Browser
+
+octorus is not only a review tool — `or --browse` (or `b` from the file list, or **Repo Browse** in the Cockpit) opens the whole repository read-only.
+
+- **Browse every file**, not just the ones a PR touched. The tree comes from `git ls-files -z --cached --others --exclude-standard`: ignored files stay out, a submodule is the single entry Git reports rather than its whole working tree, and a file an AI agent wrote thirty seconds ago is there before it is ever committed. The NUL-delimited form keeps paths containing spaces or newlines intact; a path whose bytes are not valid UTF-8 is left out and counted in the status line, since a lossily decoded name would no longer open the file Git named.
+- **Same highlighting as the diff view** — tree-sitter for 24 languages, your configured theme, injections for Vue/Svelte/Markdown. File content is rendered through the exact same cache the diff view uses, so there is no second rendering path to drift.
+- **Loading never blocks the UI.** Listing the repository, reading a file, and highlighting it are all background work: the pane shows `Loading…` until the content arrives, and selecting another file cancels the read still in flight. Highlighting is a second pass over the file that is already on screen, so a large file is readable before it is coloured.
+- **Blame links back to history and review.** Toggle the blame gutter with `gb`, place the cursor on a blamed line, and press `gc` to show that commit's diff in the browser content pane, or `gp` to open the pull request that introduced it. GitHub's commit-to-pulls API is authoritative; when it returns no PR, a strict trailing `(#123)` commit-subject reference is used as an explicitly labelled, unconfirmed fallback. The full commit SHA comes from the cursor line even when a repeated gutter row is visually blank. `q`, `Esc`, `h`, or `Ctrl-o` returns to the exact source line with blame still enabled. Uncommitted lines and unavailable/loading blame explain why no history target can be opened in the footer.
+- **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your editor (`editor` config → `$VISUAL` → `$EDITOR` → `vi`) at the cursor line when you actually want to change something.
+- **Files it will not render say why.** Over 8 MiB, over 100,000 lines, or a single line over 10,000 bytes each get a notice quoting the file's own figure against the limit that stopped it; binary content says `Binary file — no text preview.` — no wall of garbage either way. An empty file says `Empty file.`, and a path Git listed that is not on disk — a sparse checkout leaves index entries like that behind — shows the read error in place of the content.
+- **Empty and failed states are screens too.** A repository with no files says so. If `git ls-files` fails at all — including in a directory that is not a git repository — the browser still opens and shows what Git said, wrapped, in the preview pane.
+- **No GitHub repository required.** Without `--repo`, start-up asks `gh` which repository this is — but for `--browse` a failed answer is tolerated rather than fatal, so a repository with no GitHub remote opens the browser just the same. Only the PR- and issue-backed screens need that answer.
+
+```bash
+or --browse
+```
+
+#### Symbol Intelligence
+
+As soon as the file list arrives, octorus indexes exactly those files in the background using tree-sitter `tags.scm` queries — the same queries GitHub uses for its own code navigation. There is **no language server to install and nothing to configure**; the grammars are compiled into the binary.
+
+The header shows `symbols: indexing` while it builds, `symbols: ready` when it is done, and `symbols: unavailable` if it failed. Reading the repository never waits for it: the tree, the file pane, the keyword filter, `gf` and `Ctrl-o` all work throughout. The three features that do consult the index — `o`, `s` and `gd` — say `Symbol index is still building` in the footer until it is complete, rather than replying from a half-built one.
+
+There is a second message ahead of that one. `o` and `gd` answer questions about *the open file*, so they check the file first: while its content is still being read they say `Still opening this file`, whatever the index is doing. Otherwise a file that has not been read yet would be reported as having no symbols and no definitions. `s` searches the whole repository and does not depend on the open file, so it never shows that message. If indexing fails outright, the header turns red with `symbols: unavailable` but the footer still says `Symbol index is still building` — a known rough edge.
+
+| Feature | Key | Description |
+|---------|-----|-------------|
+| File outline | `o` | Symbols of the open file, indented by nesting depth, with the cursor's enclosing symbol pre-selected. Nesting follows the tags query: a Python method inside a class indents, a Rust method inside `impl` does not, because an `impl` block is not itself a tagged definition |
+| Symbol search | `s` | Fuzzy search across every symbol in the repository, best 200 matches listed; `Enter` opens the file at the definition |
+| Go to definition | `gd` | Resolve the cursor **line** against the index — a CST match, not a grep for `fn <name>` |
+| Jump back | `Ctrl-o` | Return to the position before the last jump |
+
+`gd` in the browser works at line granularity: the browser has a line cursor and no column cursor, so it reads the identifiers on the cursor line left to right and jumps to the first one the index knows. On `Config::helper()` that is `Config`. To land on `helper` instead, use `s` and search for it by name — and either way `Ctrl-o` puts you back, so a jump you did not mean costs one keystroke. (The diff view's `gd` does have a column-free candidate popup; the browser deliberately does not, because `s` already covers "not that one, the other one" across the whole repository rather than one line.)
+
+Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Ruby, C, C++, Java, C#, Lua, PHP, Swift, Bash, Zig, Haskell, MoonBit, and Markdown (headings become the outline of a README).
+
+#### Repository Browser Keybindings
+
+**Tree Focus:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `Ctrl-d` / `Ctrl-u` | Page down / up |
+| `gg` / `G` | Jump to first / last row |
+| `Enter` / `l` / `→` | Open file, or expand/collapse directory |
+| `Space /` | Filter paths by keyword |
+| `s` | Repository symbol search |
+| `Z` | Toggle zen mode |
+| `?` | Toggle help |
+| `q` / `Esc` | Back to the previous screen |
+
+**File Focus:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
+| `Ctrl-d` / `Ctrl-u`, `PageDown` / `PageUp` | Page down / up |
+| `gg` / `G` | Jump to first / last line |
+| `o` | File outline |
+| `s` | Repository symbol search |
+| `gb` | Toggle blame gutter |
+| `gc` | Open the blamed line's commit diff inside the browser |
+| `gp` | Open the PR that introduced the blamed line's commit |
+| `gd` | Go to definition |
+| `gf` | Open file in your editor at the cursor line |
+| `Ctrl-o` | Jump back |
+| `h` / `←` / `q` / `Esc` | Back to the tree |
+
+**Outline / Symbol search overlay:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move selection (outline only — in symbol search, letters type into the query) |
+| `↑` / `↓`, `Ctrl-p` / `Ctrl-n` | Move selection (symbol search) |
+| `Backspace` | Delete the last character of the query (symbol search) |
+| `Ctrl-u` | Clear the query |
+| `Enter` | Jump to the symbol |
+| `Esc` | Close |
 
 ### Pull Requests
 
@@ -197,6 +284,7 @@ or update-local-comment --reopen 3
 - Discard, undo, soft-reset with Y/n confirmation showing the exact git command
 - Push to origin
 - Infinite scroll commit history
+- Starts without a GitHub remote — `or --git-ops` reads status and commit history from the local repository alone
 
 ### Zen mode
 
@@ -583,6 +671,7 @@ PRs are loaded with infinite scroll — additional PRs are fetched automatically
 | `A` | Start AI Rally |
 | `S` | View CI checks status |
 | `G` | Open git ops view |
+| `b` | Open Repository Browser |
 | `I` | Open issue list |
 | `t` | Toggle file tree view |
 | `Space /` | Keyword filter |
@@ -929,6 +1018,13 @@ go_to_definition = ["g", "d"]
 | `go_to_file` | `gf` | Open file in $EDITOR |
 | `multiline_select` | `V` | Enter multiline selection mode |
 | `tree_toggle` | `t` | Toggle file tree view |
+| **Repository Browser** |||
+| `repo_browse` | `b` | Open the Repository Browser |
+| `symbol_outline` | `o` | File outline (browser only) |
+| `symbol_search` | `s` | Repository symbol search (browser only) |
+| `toggle_blame` | `gb` | Toggle blame gutter (browser file pane only) |
+| `open_blame_commit` | `gc` | Open the blamed line's commit diff (browser file pane only) |
+| `open_blame_pr` | `gp` | Open the PR for the blamed line's commit (browser file pane only) |
 | `toggle_zen_mode` | `Z` | Toggle zen mode (fullscreen diff) |
 | **Git Ops** |||
 | `git_ops_stage` | `Space` | Stage/unstage file or directory |
@@ -956,6 +1052,18 @@ Press `Space /` in the PR list or file list to activate keyword filtering. Type 
 | `Esc` | Cancel filter |
 
 **Note**: Arrow keys (`↑/↓/←/→`) always work as alternatives to Vim-style keys and cannot be remapped.
+
+## Design Docs
+
+Two technical reference documents for the Repository Browser and its symbol
+engine live in [`docs/`](docs/):
+
+| Document | What it holds |
+|----------|---------------|
+| [docs/symbol-index.md](docs/symbol-index.md) | Technical reference for the tree-sitter tags symbol engine — language matrix, per-grammar quirks, how to add a language, measured cost |
+| [docs/repo-browse-architecture.md](docs/repo-browse-architecture.md) | Architecture of the Repository Browser — state machine, module map, background tasks, extension points, known limitations |
+
+[`docs/README.md`](docs/README.md) indexes the same two documents from inside the directory.
 
 ## License
 

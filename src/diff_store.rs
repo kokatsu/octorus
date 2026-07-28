@@ -88,26 +88,12 @@ impl DiffScrollState {
 
     /// Margin モード: カーソルがビューポート中央付近を通過するとスクロール
     fn adjust_scroll_margin(&mut self, visible_lines: usize) {
-        if visible_lines == 0 {
-            return;
-        }
-        if self.line_count <= visible_lines {
-            self.scroll_offset = 0;
-            return;
-        }
-
-        let margin = visible_lines / 2;
-
-        // カーソルが上マージンより上
-        if self.selected_line < self.scroll_offset + margin {
-            self.scroll_offset = self.selected_line.saturating_sub(margin);
-        }
-        // カーソルが下マージンより下
-        if self.selected_line + margin >= self.scroll_offset + visible_lines {
-            self.scroll_offset = self
-                .selected_line
-                .saturating_sub(visible_lines.saturating_sub(margin + 1));
-        }
+        self.scroll_offset = margin_scroll_offset(
+            self.selected_line,
+            self.scroll_offset,
+            self.line_count,
+            visible_lines,
+        );
     }
 
     /// Edge モード: カーソルがビューポート端に到達した場合のみスクロール
@@ -158,6 +144,36 @@ impl DiffScrollState {
         }
         self.adjust_scroll(self.visible_lines);
     }
+}
+
+/// Margin モードのスクロール計算本体。`DiffScrollState` と Repo Browser の
+/// ファイルペイン（`BrowseState::clamp_scroll`）が同じ挙動を共有するための
+/// 1 実装 2 入口。margin = visible_lines / 2。
+pub fn margin_scroll_offset(
+    selected_line: usize,
+    scroll_offset: usize,
+    line_count: usize,
+    visible_lines: usize,
+) -> usize {
+    if visible_lines == 0 {
+        return scroll_offset;
+    }
+    if line_count <= visible_lines {
+        return 0;
+    }
+
+    let margin = visible_lines / 2;
+    let mut offset = scroll_offset;
+
+    // カーソルが上マージンより上
+    if selected_line < offset + margin {
+        offset = selected_line.saturating_sub(margin);
+    }
+    // カーソルが下マージンより下
+    if selected_line + margin >= offset + visible_lines {
+        offset = selected_line.saturating_sub(visible_lines.saturating_sub(margin + 1));
+    }
+    offset
 }
 
 // ========================================

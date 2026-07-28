@@ -20,6 +20,8 @@ pub struct ParserPool {
     parsers: HashMap<SupportedLanguage, Parser>,
     /// Cached compiled queries for highlight queries
     queries: HashMap<SupportedLanguage, Query>,
+    /// Cached compiled queries for tags (symbol) queries
+    tags_queries: HashMap<SupportedLanguage, Option<Query>>,
 }
 
 impl Default for ParserPool {
@@ -34,7 +36,24 @@ impl ParserPool {
         Self {
             parsers: HashMap::new(),
             queries: HashMap::new(),
+            tags_queries: HashMap::new(),
         }
+    }
+
+    /// Get or create a compiled tags query for the given language.
+    ///
+    /// Returns `None` when the language has no tags query or the query fails to
+    /// compile. The failure is cached as `None` so a broken query is compiled
+    /// at most once per pool instead of on every file.
+    pub fn get_or_create_tags_query(&mut self, lang: SupportedLanguage) -> Option<&Query> {
+        if let Entry::Vacant(e) = self.tags_queries.entry(lang) {
+            let compiled = lang
+                .tags_query()
+                .and_then(|src| Query::new(&lang.ts_language(), src).ok());
+            e.insert(compiled);
+        }
+
+        self.tags_queries.get(&lang)?.as_ref()
     }
 
     /// Get or create a compiled highlight query for the given language.

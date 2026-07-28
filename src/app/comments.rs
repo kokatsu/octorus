@@ -371,70 +371,77 @@ impl App {
             self.load_discussion_comments();
         }
     }
+}
 
-    /// Group flat review comments into threads using `in_reply_to_id`.
+/// Group flat review comments into threads using `in_reply_to_id`.
+pub(super) fn build_review_threads_for(comments: &[ReviewComment]) -> Vec<CommentThread> {
+    use std::collections::HashMap;
+    // Map comment id → index for lookup
+    let id_to_idx: HashMap<u64, usize> = comments
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id, i))
+        .collect();
+
+    // Group by root
+    let n = comments.len();
+    let mut threads = Vec::<CommentThread>::new();
+    let mut root_to_thread: HashMap<usize, usize> = HashMap::new();
+    for i in 0..n {
+        // Walk in_reply_to_id chain to find the thread root.
+        // Bounded by n to guard against cycles.
+        let mut root_idx = i;
+        for _ in 0..n {
+            match comments[root_idx]
+                .in_reply_to_id
+                .and_then(|pid| id_to_idx.get(&pid))
+            {
+                Some(&parent) if parent != root_idx => root_idx = parent,
+                _ => break,
+            }
+        }
+        if let Some(&thread_idx) = root_to_thread.get(&root_idx) {
+            if i != root_idx {
+                threads[thread_idx].replies.push(i);
+            }
+        } else {
+            let thread_idx = threads.len();
+            root_to_thread.insert(root_idx, thread_idx);
+            let mut thread = CommentThread {
+                root: root_idx,
+                replies: Vec::new(),
+            };
+            if i != root_idx {
+                thread.replies.push(i);
+            }
+            threads.push(thread);
+        }
+    }
+
+    // Sort replies within each thread by created_at
+    for thread in &mut threads {
+        thread
+            .replies
+            .sort_by(|&a, &b| comments[a].created_at.cmp(&comments[b].created_at));
+    }
+
+    // Sort threads by root comment's created_at
+    threads.sort_by(|a, b| {
+        comments[a.root]
+            .created_at
+            .cmp(&comments[b.root].created_at)
+    });
+    threads
+}
+
+impl App {
     pub(crate) fn build_review_threads(&mut self) {
-        use std::collections::HashMap;
-        self.cmt.review_threads.clear();
-
-        let Some(ref comments) = self.cmt.review_comments else {
-            return;
-        };
-
-        // Map comment id → index for lookup
-        let id_to_idx: HashMap<u64, usize> = comments
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.id, i))
-            .collect();
-
-        // Group by root
-        let n = comments.len();
-        let mut root_to_thread: HashMap<usize, usize> = HashMap::new();
-        for i in 0..n {
-            // Walk in_reply_to_id chain to find the thread root.
-            // Bounded by n to guard against cycles.
-            let mut root_idx = i;
-            for _ in 0..n {
-                match comments[root_idx]
-                    .in_reply_to_id
-                    .and_then(|pid| id_to_idx.get(&pid))
-                {
-                    Some(&parent) if parent != root_idx => root_idx = parent,
-                    _ => break,
-                }
-            }
-            if let Some(&thread_idx) = root_to_thread.get(&root_idx) {
-                if i != root_idx {
-                    self.cmt.review_threads[thread_idx].replies.push(i);
-                }
-            } else {
-                let thread_idx = self.cmt.review_threads.len();
-                root_to_thread.insert(root_idx, thread_idx);
-                let mut thread = CommentThread {
-                    root: root_idx,
-                    replies: Vec::new(),
-                };
-                if i != root_idx {
-                    thread.replies.push(i);
-                }
-                self.cmt.review_threads.push(thread);
-            }
-        }
-
-        // Sort replies within each thread by created_at
-        for thread in &mut self.cmt.review_threads {
-            thread
-                .replies
-                .sort_by(|&a, &b| comments[a].created_at.cmp(&comments[b].created_at));
-        }
-
-        // Sort threads by root comment's created_at
-        self.cmt.review_threads.sort_by(|a, b| {
-            comments[a.root]
-                .created_at
-                .cmp(&comments[b.root].created_at)
-        });
+        self.cmt.review_threads = self
+            .cmt
+            .review_comments
+            .as_deref()
+            .map(build_review_threads_for)
+            .unwrap_or_default();
     }
 
     /// Apply a fetched (or cached) set of review comments to the UI state:
@@ -617,6 +624,7 @@ impl App {
                                 user: review.user,
                                 created_at: review.submitted_at.unwrap_or_default(),
                                 in_reply_to_id: None,
+                                location: Default::default(),
                             });
                         }
                     }

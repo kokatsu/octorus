@@ -268,8 +268,10 @@ pub fn render_loading(frame: &mut Frame, app: &App) {
         );
     frame.render_widget(loading, chunks[1]);
 
-    let footer = Paragraph::new(format!("{} Please wait... (q: quit)", app.spinner_char()))
-        .block(Block::default().borders(Borders::ALL));
+    let footer_text = app
+        .pr_open_notice()
+        .unwrap_or_else(|| format!("{} Please wait... (q: quit)", app.spinner_char()));
+    let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 }
 
@@ -518,7 +520,10 @@ pub(crate) fn build_tree_row_item<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{App, PrOpenSource};
     use insta::assert_snapshot;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn col_text(count: usize, col_width: usize) -> String {
         let span = build_comment_column(count, col_width);
@@ -575,5 +580,41 @@ mod tests {
         assert_eq!(comment_col_width(100), 7);
         assert_eq!(comment_col_width(999), 7);
         assert_eq!(comment_col_width(1000), 7);
+    }
+
+    #[test]
+    fn inferred_commit_pr_notice_is_visible_while_pr_data_is_still_loading() {
+        let mut app = App::new_for_test();
+        app.pr_number = Some(123);
+        app.pr_open_source = PrOpenSource::InferredCommitSubject {
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+        let backend = TestBackend::new(90, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render_loading(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..9)
+            .map(|y| {
+                (0..90)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!(rendered, @"
+        ┌octorus─────────────────────────────────────────────────────────────────────────────────┐
+        │PR #123 - Loading...                                                                    │
+        └────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Changed Files───────────────────────────────────────────────────────────────────────────┐
+        │                                  ⠋ Loading PR data...                                  │
+        └────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌────────────────────────────────────────────────────────────────────────────────────────┐
+        │PR #123 inferred from commit subject; GitHub did not confirm it                         │
+        └────────────────────────────────────────────────────────────────────────────────────────┘
+        ");
     }
 }

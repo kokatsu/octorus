@@ -14,6 +14,28 @@ async fn fetch_and_parse<T: DeserializeOwned>(
     serde_json::from_value(json).context(error_context)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewCommentLocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewComment {
     pub id: u64,
@@ -26,6 +48,8 @@ pub struct ReviewComment {
     pub created_at: String,
     #[serde(default)]
     pub in_reply_to_id: Option<u64>,
+    #[serde(flatten)]
+    pub location: ReviewCommentLocation,
 }
 
 pub async fn fetch_review_comments(repo: &str, pr_number: u32) -> Result<Vec<ReviewComment>> {
@@ -174,6 +198,46 @@ mod tests {
         assert_eq!(comment.body, "Consider using a match expression here.");
         assert_eq!(comment.user.login, "reviewer1");
         assert_eq!(comment.created_at, "2025-01-15T10:30:00Z");
+        assert_eq!(comment.location.original_line, None);
+    }
+
+    #[test]
+    fn review_comment_deserializes_complete_rest_position_tolerantly() {
+        let json = serde_json::json!({
+            "id": 12346,
+            "path": "src/old.rs",
+            "line": null,
+            "start_line": null,
+            "original_line": 42,
+            "original_start_line": 40,
+            "side": "RIGHT",
+            "start_side": "RIGHT",
+            "position": 9,
+            "original_position": 7,
+            "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "original_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "subject_type": "line",
+            "body": "Outdated range",
+            "user": { "login": "reviewer1" },
+            "created_at": "2025-01-15T10:30:00Z"
+        });
+
+        let comment: ReviewComment = serde_json::from_value(json).unwrap();
+        assert_eq!(comment.location.original_line, Some(42));
+        assert_eq!(comment.location.original_start_line, Some(40));
+        assert_eq!(comment.location.side.as_deref(), Some("RIGHT"));
+        assert_eq!(comment.location.start_side.as_deref(), Some("RIGHT"));
+        assert_eq!(comment.location.position, Some(9));
+        assert_eq!(comment.location.original_position, Some(7));
+        assert_eq!(
+            comment.location.original_commit_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            comment.location.commit_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(comment.location.subject_type.as_deref(), Some("line"));
     }
 
     #[test]
@@ -204,6 +268,7 @@ mod tests {
             },
             created_at: "2025-03-01T12:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: ReviewCommentLocation::default(),
         };
         let serialized = serde_json::to_string(&original).unwrap();
         let deserialized: ReviewComment = serde_json::from_str(&serialized).unwrap();
@@ -322,7 +387,7 @@ mod tests {
             "created_at": "2025-01-01T00:00:00Z"
         });
         let comment: ReviewComment = serde_json::from_value(json).unwrap();
-        assert_snapshot!(format!("{:?}", comment), @r#"ReviewComment { id: 555, path: "src/app.rs", line: Some(100), start_line: None, body: "Snapshot test body", user: User { login: "snapshot_user" }, created_at: "2025-01-01T00:00:00Z", in_reply_to_id: None }"#);
+        assert_snapshot!(format!("{:?}", comment), @r#"ReviewComment { id: 555, path: "src/app.rs", line: Some(100), start_line: None, body: "Snapshot test body", user: User { login: "snapshot_user" }, created_at: "2025-01-01T00:00:00Z", in_reply_to_id: None, location: ReviewCommentLocation { original_line: None, original_start_line: None, side: None, start_side: None, position: None, original_position: None, commit_id: None, original_commit_id: None, subject_type: None } }"#);
     }
 
     #[test]
@@ -338,7 +403,8 @@ mod tests {
             },
             created_at: "2026-03-25T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: ReviewCommentLocation::default(),
         };
-        assert_snapshot!(format!("{:?}", comment), @r#"ReviewComment { id: 10, path: "src/app.rs", line: Some(50), start_line: Some(45), body: "Multiline review", user: User { login: "dacuna" }, created_at: "2026-03-25T00:00:00Z", in_reply_to_id: None }"#);
+        assert_snapshot!(format!("{:?}", comment), @r#"ReviewComment { id: 10, path: "src/app.rs", line: Some(50), start_line: Some(45), body: "Multiline review", user: User { login: "dacuna" }, created_at: "2026-03-25T00:00:00Z", in_reply_to_id: None, location: ReviewCommentLocation { original_line: None, original_start_line: None, side: None, start_side: None, position: None, original_position: None, commit_id: None, original_commit_id: None, subject_type: None } }"#);
     }
 }

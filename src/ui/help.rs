@@ -983,6 +983,69 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
         )),
         Line::from(""),
         Line::from(vec![Span::styled(
+            "Repo Browse",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(format!(
+            "{}  Open Repository Browser (from File List)",
+            fmt_key(&kb.repo_browse.display(), key_width)
+        )),
+        Line::from(vec![Span::styled(
+            "  Tree Focus:",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(format!(
+            "{}  Open file / expand directory",
+            fmt_key(&kb.open_panel.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Filter paths",
+            fmt_key(&kb.filter.display(), key_width)
+        )),
+        Line::from(vec![Span::styled(
+            "  File Focus:",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(format!(
+            "{}  File outline",
+            fmt_key(&kb.symbol_outline.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Repository symbol search",
+            fmt_key(&kb.symbol_search.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Toggle blame gutter",
+            fmt_key(&kb.toggle_blame.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Open commit diff for the blamed line",
+            fmt_key(&kb.open_blame_commit.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Open pull request for the blamed line",
+            fmt_key(&kb.open_blame_pr.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Open review discussion for the current line",
+            fmt_key(&kb.open_line_discussion.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Go to definition (tree-sitter index)",
+            fmt_key(&kb.go_to_definition.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Open file in $EDITOR",
+            fmt_key(&kb.go_to_file.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Jump back",
+            fmt_key(&kb.jump_back.display(), key_width)
+        )),
+        Line::from(""),
+        Line::from(vec![Span::styled(
             "Git Ops View",
             Style::default()
                 .fg(Color::Yellow)
@@ -1449,6 +1512,23 @@ mod tests {
         for key in ["Ctrl-A", "Ctrl-E", "Ctrl-W", "Ctrl-K", "Ctrl-U"] {
             assert!(joined.contains(key), "help missing binding: {key}");
         }
+    }
+
+    #[test]
+    fn test_build_help_lines_lists_all_blame_navigation_bindings() {
+        let lines = build_help_lines(&KeybindingsConfig::default());
+        let joined = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("gb"));
+        assert!(joined.contains("Toggle blame gutter"));
+        assert!(joined.contains("gc"));
+        assert!(joined.contains("Open commit diff for the blamed line"));
+        assert!(joined.contains("gp"));
+        assert!(joined.contains("Open pull request for the blamed line"));
     }
 
     #[test]

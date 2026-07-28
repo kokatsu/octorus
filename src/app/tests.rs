@@ -10,6 +10,57 @@ use crate::github::comment::ReviewComment;
 use crate::github::{ChangedFile, PrCommit, PullRequest};
 use crate::loader::DataLoadResult;
 
+#[test]
+fn test_repository_availability_is_explicit_and_not_inferred_from_repo_label() {
+    let mut placeholder_named_but_available = App::new_for_test();
+    placeholder_named_but_available.repo = "local".to_string();
+    placeholder_named_but_available.set_repository_availability(RepositoryAvailability::Available);
+
+    let mut owner_repo_but_unavailable = App::new_for_test();
+    owner_repo_but_unavailable.repo = "owner/repo".to_string();
+    owner_repo_but_unavailable.set_repository_availability(RepositoryAvailability::Unavailable);
+
+    assert_eq!(
+        placeholder_named_but_available.repository_availability(),
+        RepositoryAvailability::Available
+    );
+    assert_eq!(
+        owner_repo_but_unavailable.repository_availability(),
+        RepositoryAvailability::Unavailable
+    );
+}
+
+#[test]
+fn test_base_app_defaults_repository_availability_to_unavailable() {
+    assert_eq!(
+        App::new_for_test().repository_availability(),
+        RepositoryAvailability::Unavailable
+    );
+}
+
+#[test]
+fn test_startup_constructors_propagate_repository_availability() {
+    for availability in [
+        RepositoryAvailability::Available,
+        RepositoryAvailability::Unavailable,
+    ] {
+        let (loading, _) = App::new_loading("owner/repo", 1, Config::default(), availability);
+        assert_eq!(loading.repository_availability(), availability);
+
+        let pr_list = App::new_pr_list("owner/repo", Config::default(), availability);
+        assert_eq!(pr_list.repository_availability(), availability);
+    }
+
+    assert_eq!(
+        App::new_cockpit("owner/repo", Config::default(), true).repository_availability(),
+        RepositoryAvailability::Available
+    );
+    assert_eq!(
+        App::new_cockpit("local", Config::default(), false).repository_availability(),
+        RepositoryAvailability::Unavailable
+    );
+}
+
 struct ScopedCacheHome {
     old: Option<std::ffi::OsString>,
 }
@@ -69,7 +120,7 @@ fn test_find_diff_line_index_multi_hunk() {
 #[test]
 fn test_has_comment_at_current_line() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.file_comment_positions = vec![
         CommentPosition {
             diff_line_index: 5,
@@ -94,7 +145,7 @@ fn test_has_comment_at_current_line() {
 #[test]
 fn test_get_comment_indices_at_current_line() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     // Two comments on line 5, one on line 10
     app.cmt.file_comment_positions = vec![
         CommentPosition {
@@ -127,7 +178,7 @@ fn test_get_comment_indices_at_current_line() {
 #[test]
 fn test_jump_to_next_comment_basic() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.file_comment_positions = vec![
         CommentPosition {
             diff_line_index: 5,
@@ -157,7 +208,7 @@ fn test_jump_to_next_comment_basic() {
 #[test]
 fn test_jump_to_next_comment_no_wrap() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.file_comment_positions = vec![CommentPosition {
         diff_line_index: 5,
         comment_index: 0,
@@ -172,7 +223,7 @@ fn test_jump_to_next_comment_no_wrap() {
 #[test]
 fn test_jump_to_prev_comment_basic() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.file_comment_positions = vec![
         CommentPosition {
             diff_line_index: 5,
@@ -202,7 +253,7 @@ fn test_jump_to_prev_comment_basic() {
 #[test]
 fn test_jump_to_prev_comment_no_wrap() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.file_comment_positions = vec![CommentPosition {
         diff_line_index: 5,
         comment_index: 0,
@@ -217,7 +268,7 @@ fn test_jump_to_prev_comment_no_wrap() {
 #[test]
 fn test_jump_with_empty_positions() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.file_comment_positions = vec![];
 
     app.diff_scroll.selected_line = 10;
@@ -276,7 +327,8 @@ fn test_liststate_autoscroll_with_multiline_items() {
 #[test]
 fn test_back_to_pr_list_clears_view_receivers() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.started_from_pr_list = true;
 
     // data_receiver is already set by new_loading
@@ -323,7 +375,8 @@ fn test_back_to_pr_list_from_local_mode_resets_local_state() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 0, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 0, config, RepositoryAvailability::Available);
     app.started_from_pr_list = true;
     app.local_mode = true;
     app.pr_number = Some(0);
@@ -416,7 +469,8 @@ async fn test_pr_list_local_toggle_round_trip() {
 #[tokio::test]
 async fn test_poll_data_updates_discards_stale_pr_data() {
     let config = Config::default();
-    let (mut app, tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.started_from_pr_list = true;
 
     // Simulate switching to PR #2 while PR #1 data is in-flight
@@ -468,7 +522,8 @@ async fn test_poll_data_updates_discards_stale_pr_data() {
 #[tokio::test]
 async fn test_poll_comment_updates_discards_stale_pr_comments() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.started_from_pr_list = true;
 
     // Set up a comment receiver for PR #1
@@ -500,7 +555,8 @@ async fn test_poll_comment_updates_discards_stale_pr_comments() {
 #[tokio::test]
 async fn test_handle_data_result_clamps_selected_file_when_files_shrink() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     // Simulate initial state with 5 files, selected_file pointing to file index 4
     let make_file = |name: &str| ChangedFile {
@@ -565,7 +621,8 @@ async fn test_handle_data_result_clamps_selected_file_when_files_shrink() {
 #[tokio::test]
 async fn test_handle_data_result_resyncs_diff_state_when_selected_file_changes() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let make_file = |name: &str| ChangedFile {
         filename: name.to_string(),
@@ -654,7 +711,8 @@ async fn test_handle_data_result_resyncs_diff_state_when_selected_file_changes()
 #[tokio::test]
 async fn test_handle_data_result_resyncs_comment_positions_when_selected_file_changes() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let make_file = |name: &str| ChangedFile {
         filename: name.to_string(),
@@ -708,6 +766,7 @@ async fn test_handle_data_result_resyncs_comment_positions_when_selected_file_ch
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
 
     // Pre-populate stale comment positions for the old file
@@ -759,7 +818,8 @@ async fn test_handle_data_result_resyncs_comment_positions_when_selected_file_ch
 #[tokio::test]
 async fn test_handle_data_result_preserves_diff_state_when_selected_file_unchanged() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let make_file = |name: &str| ChangedFile {
         filename: name.to_string(),
@@ -841,7 +901,8 @@ async fn test_handle_data_result_preserves_diff_state_when_selected_file_unchang
 #[tokio::test]
 async fn test_handle_data_result_keeps_selected_file_by_filename() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(false);
 
@@ -904,7 +965,8 @@ async fn test_handle_data_result_keeps_selected_file_by_filename() {
 #[tokio::test]
 async fn test_handle_data_result_auto_focus_selects_next_changed_file() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(true);
     app.selected_file = 1;
@@ -973,7 +1035,8 @@ async fn test_handle_data_result_auto_focus_selects_next_changed_file() {
 #[tokio::test]
 async fn test_handle_data_result_auto_focus_prefers_nearest_changed_file() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(true);
     app.selected_file = 3;
@@ -1044,7 +1107,8 @@ async fn test_handle_data_result_auto_focus_prefers_nearest_changed_file() {
 #[tokio::test]
 async fn test_handle_data_result_auto_focus_prefers_next_when_distances_are_tie() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(true);
     app.selected_file = 2;
@@ -1115,7 +1179,8 @@ async fn test_handle_data_result_auto_focus_prefers_next_when_distances_are_tie(
 #[tokio::test]
 async fn test_handle_data_result_auto_focus_transitions_to_split_view_diff() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(true);
     app.state = AppState::FileList;
@@ -1284,6 +1349,7 @@ fn test_toggle_local_mode_pr_to_local_and_back() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let mut app = App::new_for_test();
+    app.set_repository_availability(RepositoryAvailability::Available);
     app.retry_sender = Some(retry_tx);
     app.data_receiver = Some((42, data_rx));
     app.original_pr_number = Some(42);
@@ -1316,6 +1382,7 @@ fn test_toggle_local_mode_roundtrip_preserves_pr_number() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let mut app = App::new_for_test();
+    app.set_repository_availability(RepositoryAvailability::Available);
     app.retry_sender = Some(retry_tx);
     app.data_receiver = Some((42, data_rx));
     app.original_pr_number = Some(42);
@@ -1338,6 +1405,7 @@ async fn test_toggle_local_mode_from_pr_list_without_selecting_pr() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let mut app = App::new_for_test();
+    app.set_repository_availability(RepositoryAvailability::Available);
     app.retry_sender = Some(retry_tx);
     app.data_receiver = Some((0, data_rx));
     app.original_pr_number = None;
@@ -1363,6 +1431,7 @@ async fn test_toggle_local_mode_roundtrip_from_pr_list() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let mut app = App::new_for_test();
+    app.set_repository_availability(RepositoryAvailability::Available);
     app.retry_sender = Some(retry_tx);
     app.data_receiver = Some((99, data_rx));
     app.original_pr_number = None;
@@ -1386,6 +1455,7 @@ async fn test_toggle_local_mode_from_local_startup_with_valid_repo() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let mut app = App::new_for_test(); // repo = "test/repo"（スラッシュあり）
+    app.set_repository_availability(RepositoryAvailability::Available);
     app.retry_sender = Some(retry_tx);
     app.data_receiver = Some((0, data_rx));
     app.original_pr_number = Some(0); // --local は new_loading(repo, 0) で起動
@@ -1405,6 +1475,7 @@ async fn test_toggle_local_mode_from_local_startup_with_valid_repo() {
 fn test_toggle_local_mode_from_local_startup_with_dummy_repo() {
     let mut app = App::new_for_test();
     app.repo = "local".to_string(); // detect_repo 失敗時のフォールバック
+    app.set_repository_availability(RepositoryAvailability::Unavailable);
     app.original_pr_number = Some(0);
     app.started_from_pr_list = false;
     app.local_mode = true;
@@ -1430,6 +1501,7 @@ async fn test_toggle_local_mode_roundtrip_from_local_startup() {
     let (retry_tx, _retry_rx) = mpsc::channel::<RefreshRequest>(4);
     let (_data_tx, data_rx) = mpsc::channel(2);
     let mut app = App::new_for_test(); // repo = "test/repo"
+    app.set_repository_availability(RepositoryAvailability::Available);
     app.retry_sender = Some(retry_tx);
     app.data_receiver = Some((0, data_rx));
     app.original_pr_number = Some(0);
@@ -1926,7 +1998,8 @@ fn test_toggle_markdown_rich_preserves_non_md_diff_cache() {
 
 fn make_app_with_patch(patch: &str) -> App {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     let pr = Box::new(PullRequest {
         number: 1,
         node_id: None,
@@ -2099,7 +2172,7 @@ fn make_ctrl_key(c: char) -> event::KeyEvent {
 #[test]
 fn test_help_scroll_j_increments_by_one() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     app.apply_help_scroll(make_key(KeyCode::Char('j')), 30);
     assert_eq!(app.help_scroll_offset, 1);
@@ -2110,7 +2183,7 @@ fn test_help_scroll_j_increments_by_one() {
 #[test]
 fn test_help_scroll_k_decrements_by_one_saturating() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 3;
     app.apply_help_scroll(make_key(KeyCode::Char('k')), 30);
     assert_eq!(app.help_scroll_offset, 2);
@@ -2123,7 +2196,7 @@ fn test_help_scroll_k_decrements_by_one_saturating() {
 #[test]
 fn test_help_scroll_page_down_j_uppercase() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     // terminal height 30 → visible_lines = 30 - 6 = 24
     app.apply_help_scroll(make_key(KeyCode::Char('J')), 30);
@@ -2133,7 +2206,7 @@ fn test_help_scroll_page_down_j_uppercase() {
 #[test]
 fn test_help_scroll_page_up_k_uppercase() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 50;
     // terminal height 30 → visible_lines = 24
     app.apply_help_scroll(make_key(KeyCode::Char('K')), 30);
@@ -2143,7 +2216,7 @@ fn test_help_scroll_page_up_k_uppercase() {
 #[test]
 fn test_help_scroll_ctrl_d_half_page() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     // terminal height 30 → visible_lines = 24, half_page = 12
     app.apply_help_scroll(make_ctrl_key('d'), 30);
@@ -2153,7 +2226,7 @@ fn test_help_scroll_ctrl_d_half_page() {
 #[test]
 fn test_help_scroll_ctrl_u_half_page() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 20;
     // terminal height 30 → visible_lines = 24, half_page = 12
     app.apply_help_scroll(make_ctrl_key('u'), 30);
@@ -2163,7 +2236,7 @@ fn test_help_scroll_ctrl_u_half_page() {
 #[test]
 fn test_help_scroll_ctrl_d_at_least_1_on_small_terminal() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     // terminal height 6 → visible_lines = 1, half_page = max(0, 1) = 1
     app.apply_help_scroll(make_ctrl_key('d'), 6);
@@ -2173,7 +2246,7 @@ fn test_help_scroll_ctrl_d_at_least_1_on_small_terminal() {
 #[test]
 fn test_help_scroll_ctrl_d_at_least_1_on_very_small_terminal() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     // terminal height 5 → visible_lines = 0, half_page = max(0, 1) = 1
     app.apply_help_scroll(make_ctrl_key('d'), 5);
@@ -2183,7 +2256,7 @@ fn test_help_scroll_ctrl_d_at_least_1_on_very_small_terminal() {
 #[test]
 fn test_help_scroll_gg_jumps_to_top() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 50;
     app.apply_help_scroll(make_key(KeyCode::Char('g')), 30);
     app.apply_help_scroll(make_key(KeyCode::Char('g')), 30);
@@ -2193,7 +2266,7 @@ fn test_help_scroll_gg_jumps_to_top() {
 #[test]
 fn test_help_scroll_g_uppercase_jumps_to_bottom() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     app.apply_help_scroll(make_key(KeyCode::Char('G')), 30);
     assert_eq!(app.help_scroll_offset, usize::MAX);
@@ -2202,7 +2275,7 @@ fn test_help_scroll_g_uppercase_jumps_to_bottom() {
 #[test]
 fn test_help_scroll_q_returns_to_previous_state() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.previous_state = AppState::FileList;
     app.state = AppState::Help;
     app.apply_help_scroll(make_key(KeyCode::Char('q')), 30);
@@ -2212,7 +2285,7 @@ fn test_help_scroll_q_returns_to_previous_state() {
 #[test]
 fn test_open_help_from_diff_view_sets_previous_state() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.open_help(AppState::DiffView);
     assert_eq!(app.state, AppState::Help);
     assert_eq!(app.previous_state, AppState::DiffView);
@@ -2221,7 +2294,7 @@ fn test_open_help_from_diff_view_sets_previous_state() {
 #[test]
 fn test_open_help_from_split_view_diff_sets_previous_state() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.open_help(AppState::SplitViewDiff);
     assert_eq!(app.state, AppState::Help);
     assert_eq!(app.previous_state, AppState::SplitViewDiff);
@@ -2249,7 +2322,7 @@ fn make_shift_key(c: char) -> event::KeyEvent {
 #[test]
 fn test_help_scroll_shift_j_page_down() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     // Shift+j should behave the same as J (page down)
     // terminal height 30 → visible_lines = 24
@@ -2260,7 +2333,7 @@ fn test_help_scroll_shift_j_page_down() {
 #[test]
 fn test_help_scroll_shift_k_page_up() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 50;
     // Shift+k should behave the same as K (page up)
     // terminal height 30 → visible_lines = 24
@@ -2271,7 +2344,7 @@ fn test_help_scroll_shift_k_page_up() {
 #[test]
 fn test_help_scroll_shift_g_jumps_to_bottom() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 0;
     // Shift+g should behave the same as G (jump to bottom)
     app.apply_help_scroll(make_shift_key('g'), 30);
@@ -2281,7 +2354,7 @@ fn test_help_scroll_shift_g_jumps_to_bottom() {
 #[test]
 fn test_help_scroll_gg_without_modifiers_jumps_to_top() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.help_scroll_offset = 50;
     app.apply_help_scroll(make_key(KeyCode::Char('g')), 30);
     app.apply_help_scroll(make_key(KeyCode::Char('g')), 30);
@@ -2293,7 +2366,7 @@ async fn test_help_from_pr_list_not_blocked_by_loading_guard() {
     // Regression: PR一覧(DataState::Loading)から?でヘルプを開いた後、
     // handle_inputのLoadingガードでキー入力がブロックされ戻れなくなるバグ
     let config = Config::default();
-    let mut app = App::new_pr_list("owner/repo", config);
+    let mut app = App::new_pr_list("owner/repo", config, RepositoryAvailability::Available);
     // PR一覧のロードが完了した状態をシミュレート
     // (LoadState::Loaded でないとキー入力を受け付けない)
     app.prs.pr_list = LoadState::Loaded(vec![]);
@@ -2315,7 +2388,8 @@ async fn test_help_from_pr_list_not_blocked_by_loading_guard() {
 #[tokio::test]
 async fn test_patch_signature_detects_same_numstat_different_patch() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(true);
     app.selected_file = 0;
@@ -3748,6 +3822,7 @@ fn test_build_seed_review_from_local_comments_uses_persisted_comments() {
                 },
                 created_at: "2026-03-24T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
         )],
     )
@@ -3799,6 +3874,7 @@ fn test_build_seed_review_from_local_comments_skips_resolved_comments() {
                 },
                 created_at: "2026-03-24T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             crate::cache::LocalCommentMeta {
                 is_resolved: true,
@@ -3842,6 +3918,7 @@ fn test_start_ai_rally_stashes_seed_review_while_waiting_for_confirmation() {
                 },
                 created_at: "2026-03-24T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
         )],
     )
@@ -4783,6 +4860,7 @@ fn test_load_review_comments_local_mode_refreshes_meta_from_disk() {
             },
             created_at: "2026-03-24T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
     )];
     crate::cache::save_local_review_comments(
@@ -4861,6 +4939,7 @@ fn test_load_review_comments_local_mode_builds_threads_and_counts() {
             },
             created_at: "2026-04-01T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         }),
         crate::cache::LocalReviewComment::new(crate::github::comment::ReviewComment {
             id: 2,
@@ -4873,6 +4952,7 @@ fn test_load_review_comments_local_mode_builds_threads_and_counts() {
             },
             created_at: "2026-04-01T01:00:00Z".to_string(),
             in_reply_to_id: Some(1),
+            location: Default::default(),
         }),
         crate::cache::LocalReviewComment::new(crate::github::comment::ReviewComment {
             id: 3,
@@ -4885,6 +4965,7 @@ fn test_load_review_comments_local_mode_builds_threads_and_counts() {
             },
             created_at: "2026-04-01T02:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         }),
     ];
     crate::cache::save_local_review_comments(
@@ -4968,6 +5049,7 @@ fn test_update_file_comment_positions_with_comments() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.update_file_comment_positions();
     assert_eq!(app.cmt.file_comment_positions.len(), 1);
@@ -4988,6 +5070,7 @@ fn test_update_file_comment_positions_stale_comment() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.update_file_comment_positions();
     assert!(app.cmt.file_comment_positions.is_empty());
@@ -5057,6 +5140,7 @@ fn test_enter_reply_input_sets_mode() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.cmt.file_comment_positions = vec![CommentPosition {
         diff_line_index: 1,
@@ -5145,6 +5229,7 @@ async fn test_jump_to_comment_sets_file_and_line() {
         },
         created_at: "2024-01-01T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
     app.cmt.selected_comment = 0;
 
@@ -5665,7 +5750,7 @@ async fn test_poll_discussion_comment_cross_pr_discards() {
 #[test]
 fn test_help_tab_switch_with_bracket_keys() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::Help;
 
     // Default tab is Keybindings
@@ -5691,7 +5776,7 @@ fn test_help_tab_switch_with_bracket_keys() {
 #[test]
 fn test_help_tab_independent_scroll_offsets() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::Help;
 
     // Scroll keybindings tab
@@ -5719,7 +5804,7 @@ fn test_help_tab_independent_scroll_offsets() {
 #[test]
 fn test_help_tab_switch_does_not_scroll() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::Help;
     app.help_scroll_offset = 5;
     app.config_scroll_offset = 10;
@@ -5733,7 +5818,7 @@ fn test_help_tab_switch_does_not_scroll() {
 #[test]
 fn test_help_reopen_resets_scroll_but_preserves_tab() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::Help;
 
     // Switch to Config tab and scroll
@@ -5761,7 +5846,7 @@ fn test_help_reopen_resets_scroll_but_preserves_tab() {
 #[test]
 fn test_config_tab_scroll_with_jk() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::Help;
     app.help_tab = HelpTab::Config;
 
@@ -5780,7 +5865,7 @@ fn test_config_tab_scroll_with_jk() {
 #[test]
 fn test_open_pr_description_state_transition() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -5815,7 +5900,7 @@ fn test_open_pr_description_state_transition() {
 #[test]
 fn test_open_pr_description_from_split_view() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -5848,7 +5933,7 @@ fn test_open_pr_description_from_split_view() {
 #[test]
 fn test_open_pr_description_body_none() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -5880,7 +5965,7 @@ fn test_open_pr_description_body_none() {
 #[test]
 fn test_open_pr_description_body_empty() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -5912,7 +5997,7 @@ fn test_open_pr_description_body_empty() {
 #[test]
 fn test_toggle_markdown_rich_clears_pr_description_cache() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -5947,7 +6032,7 @@ fn test_toggle_markdown_rich_clears_pr_description_cache() {
 #[test]
 fn test_pr_description_cache_reuse() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -6110,7 +6195,7 @@ async fn test_ensure_diff_cache_md_invalidates_on_markdown_rich_mismatch() {
 #[tokio::test]
 async fn test_pr_description_toggle_rich_preserves_prefetch_and_store() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -6184,7 +6269,7 @@ async fn test_pr_description_toggle_rich_preserves_prefetch_and_store() {
 #[test]
 fn test_rebuild_pr_description_cache_preserves_scroll() {
     let config = Config::default();
-    let (mut app, _) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let pr = Box::new(PullRequest {
         number: 1,
@@ -6747,7 +6832,8 @@ fn make_changed_file(name: &str) -> ChangedFile {
 
 fn make_app_with_files(filenames: &[&str]) -> App {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     let files: Vec<ChangedFile> = filenames.iter().map(|n| make_changed_file(n)).collect();
     app.data_state = DataState::Loaded {
         pr: make_test_pr(),
@@ -7193,7 +7279,8 @@ async fn test_select_pr_resets_tree_state() {
 #[test]
 fn test_toggle_file_tree_with_empty_files() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     // DataState::Loading — files() returns empty
     app.state = AppState::FileList;
 
@@ -7235,7 +7322,8 @@ fn render_top_lines(app: &mut App, height: u16, n: usize) -> String {
 
 fn make_loaded_app() -> App {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     let pr = Box::new(PullRequest {
         number: 1,
         node_id: None,
@@ -7426,7 +7514,8 @@ async fn test_zen_mode_auto_focus_transitions_to_diff_view() {
 
     let mut config = Config::default();
     config.layout.zen_mode = true;
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.set_local_mode(true);
     app.set_local_auto_focus(true);
     app.state = AppState::FileList;
@@ -7700,7 +7789,7 @@ async fn test_poll_issue_list_disconnect_recovers_from_loading_more() {
 #[test]
 fn test_try_open_comment_panel_in_local_mode() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("local", 0, config);
+    let (mut app, _tx) = App::new_loading("local", 0, config, RepositoryAvailability::Available);
     app.local_mode = true;
     app.cmt.review_comments = Some(vec![ReviewComment {
         id: 1,
@@ -7713,6 +7802,7 @@ fn test_try_open_comment_panel_in_local_mode() {
         },
         created_at: "2026-04-27T00:00:00Z".to_string(),
         in_reply_to_id: None,
+        location: Default::default(),
     }]);
 
     let kb = app.config.keybindings.clone();
@@ -7727,7 +7817,7 @@ fn test_try_open_comment_panel_in_local_mode() {
 #[test]
 fn test_try_open_comment_panel_ignores_non_matching_key() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("local", 0, config);
+    let (mut app, _tx) = App::new_loading("local", 0, config, RepositoryAvailability::Available);
     app.local_mode = true;
 
     let kb = app.config.keybindings.clone();
@@ -7757,11 +7847,13 @@ fn test_apply_review_comments_preserves_expanded_selection_by_id() {
             },
             created_at: created_at.to_string(),
             in_reply_to_id: parent,
+            location: Default::default(),
         }
     }
 
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     // Initial poll: one thread, root + 1 reply.
     app.apply_review_comments(vec![
@@ -7800,7 +7892,8 @@ fn test_apply_review_comments_preserves_expanded_selection_by_id() {
 #[test]
 fn test_apply_review_comments_populates_file_counts() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     app.apply_review_comments(vec![
         ReviewComment {
@@ -7814,6 +7907,7 @@ fn test_apply_review_comments_populates_file_counts() {
             },
             created_at: "2025-01-01T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
         ReviewComment {
             id: 2,
@@ -7826,6 +7920,7 @@ fn test_apply_review_comments_populates_file_counts() {
             },
             created_at: "2025-01-01T01:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
         ReviewComment {
             id: 3,
@@ -7838,6 +7933,7 @@ fn test_apply_review_comments_populates_file_counts() {
             },
             created_at: "2025-01-01T02:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         },
     ]);
 
@@ -7857,6 +7953,7 @@ fn pr157_rc(id: u64, parent: Option<u64>, path: &str, created_at: &str) -> Revie
         },
         created_at: created_at.to_string(),
         in_reply_to_id: parent,
+        location: Default::default(),
     }
 }
 
@@ -7866,7 +7963,7 @@ fn pr157_rc(id: u64, parent: Option<u64>, path: &str, created_at: &str) -> Revie
 #[test]
 fn test_local_comment_list_move_down_advances_thread() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("local", 0, config);
+    let (mut app, _tx) = App::new_loading("local", 0, config, RepositoryAvailability::Available);
     app.local_mode = true;
     app.apply_review_comments(vec![
         pr157_rc(1, None, "src/a.rs", "2025-01-01T00:00:00Z"),
@@ -7887,7 +7984,7 @@ fn test_local_comment_list_move_down_advances_thread() {
 #[test]
 fn test_local_comment_list_enter_expands_thread_with_replies() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("local", 0, config);
+    let (mut app, _tx) = App::new_loading("local", 0, config, RepositoryAvailability::Available);
     app.local_mode = true;
     app.apply_review_comments(vec![
         pr157_rc(1, None, "src/a.rs", "2025-01-01T00:00:00Z"),
@@ -7908,7 +8005,7 @@ fn test_local_comment_list_enter_expands_thread_with_replies() {
 #[test]
 fn test_local_comment_list_expanded_move_then_quit_collapses() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("local", 0, config);
+    let (mut app, _tx) = App::new_loading("local", 0, config, RepositoryAvailability::Available);
     app.local_mode = true;
     app.previous_state = AppState::FileList;
     app.state = AppState::CommentList;
@@ -7977,7 +8074,8 @@ fn test_submit_local_reply_links_parent_id() {
 #[test]
 fn test_needs_review_comment_load_respects_inflight_receiver() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.local_mode = false;
     app.cmt.review_comments = None;
     app.cmt.comment_receiver = None;
@@ -8012,7 +8110,8 @@ fn test_needs_review_comment_load_respects_inflight_receiver() {
 #[test]
 fn test_scroll_diff_page_down_advances_by_step() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.diff_scroll.line_count = 100;
     app.diff_scroll.selected_line = 0;
 
@@ -8027,7 +8126,8 @@ fn test_scroll_diff_page_down_advances_by_step() {
 #[test]
 fn test_scroll_diff_page_down_clamps_at_end() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.diff_scroll.line_count = 10;
     app.diff_scroll.selected_line = 5;
 
@@ -8039,7 +8139,8 @@ fn test_scroll_diff_page_down_clamps_at_end() {
 #[test]
 fn test_scroll_diff_page_down_no_op_on_empty_diff() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.diff_scroll.line_count = 0;
     app.diff_scroll.selected_line = 0;
 
@@ -8051,7 +8152,8 @@ fn test_scroll_diff_page_down_no_op_on_empty_diff() {
 #[test]
 fn test_scroll_diff_page_up_saturates_at_zero() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.diff_scroll.line_count = 100;
     app.diff_scroll.selected_line = 5;
 
@@ -8063,7 +8165,8 @@ fn test_scroll_diff_page_up_saturates_at_zero() {
 #[test]
 fn test_scroll_diff_page_up_full_step_when_room() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.diff_scroll.line_count = 100;
     app.diff_scroll.selected_line = 50;
 
@@ -8078,7 +8181,7 @@ fn test_scroll_diff_page_up_full_step_when_room() {
 #[test]
 fn test_diff_visible_lines_panel_closed_uses_term_minus_8() {
     let config = Config::default();
-    let (app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (app, _tx) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     assert!(!app.cmt.comment_panel_open);
 
     let lines = app.diff_visible_lines(50, super::types::DiffViewVariant::SplitPane);
@@ -8088,7 +8191,7 @@ fn test_diff_visible_lines_panel_closed_uses_term_minus_8() {
 #[test]
 fn test_diff_visible_lines_tiny_terminal_does_not_panic() {
     let config = Config::default();
-    let (app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (app, _tx) = App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
 
     let lines = app.diff_visible_lines(4, super::types::DiffViewVariant::SplitPane);
     assert_eq!(lines, 0);
@@ -8097,7 +8200,8 @@ fn test_diff_visible_lines_tiny_terminal_does_not_panic() {
 #[test]
 fn test_diff_visible_lines_panel_open_split_pane_pct() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.cmt.comment_panel_open = true;
 
     let term_h = 50usize;
@@ -8114,7 +8218,8 @@ fn test_diff_visible_lines_panel_open_split_pane_pct() {
 #[test]
 fn test_diff_page_down_in_split_file_list_advances_only_diff() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::SplitViewFileList;
     app.diff_scroll.line_count = 100;
     app.diff_scroll.selected_line = 0;
@@ -8132,7 +8237,8 @@ fn test_diff_page_down_in_split_file_list_advances_only_diff() {
 #[test]
 fn test_diff_page_up_in_split_file_list_does_not_change_file_selection() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::SplitViewFileList;
     app.diff_scroll.line_count = 100;
     app.diff_scroll.selected_line = 60;
@@ -8150,7 +8256,8 @@ fn test_diff_page_up_in_split_file_list_does_not_change_file_selection() {
 #[test]
 fn test_diff_page_down_works_with_filter_active() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::SplitViewFileList;
     app.file_list_filter = Some(crate::filter::ListFilter::new());
     app.diff_scroll.line_count = 100;
@@ -8167,7 +8274,8 @@ fn test_diff_page_down_works_with_filter_active() {
 #[test]
 fn test_diff_page_down_in_diff_focus_matches_page_down_step() {
     let config = Config::default();
-    let (mut app, _tx) = App::new_loading("owner/repo", 1, config);
+    let (mut app, _tx) =
+        App::new_loading("owner/repo", 1, config, RepositoryAvailability::Available);
     app.state = AppState::SplitViewDiff;
     app.diff_scroll.line_count = 200;
     app.diff_scroll.selected_line = 30;

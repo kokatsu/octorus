@@ -277,7 +277,6 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
         return;
     }
 
-    use crate::app::CommentThread;
     use std::collections::HashSet;
 
     // Resolved-state badges only apply in local mode; ignore any stale meta
@@ -316,18 +315,49 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
         return;
     };
 
+    render_review_thread_list_data(
+        frame,
+        area,
+        ReviewThreadListData {
+            comments: all_comments,
+            threads,
+            visible_threads: None,
+            selected: app.cmt.selected_thread,
+            resolved_ids: &resolved_ids,
+        },
+        &mut app.cmt.thread_scroll_offset,
+    );
+}
+
+pub(crate) struct ReviewThreadListData<'a> {
+    pub comments: &'a [crate::github::comment::ReviewComment],
+    pub threads: &'a [crate::app::CommentThread],
+    pub visible_threads: Option<&'a [usize]>,
+    pub selected: usize,
+    pub resolved_ids: &'a std::collections::HashSet<u64>,
+}
+
+pub(crate) fn render_review_thread_list_data(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    data: ReviewThreadListData<'_>,
+    scroll_offset: &mut usize,
+) {
     let available_width = area.width.saturating_sub(4) as usize;
     let body_width = available_width.saturating_sub(4);
+    let total_items = data
+        .visible_threads
+        .map_or(data.threads.len(), <[usize]>::len);
 
-    let items: Vec<ListItem> = threads
-        .iter()
-        .enumerate()
-        .map(|(i, thread): (usize, &CommentThread)| {
-            let is_selected = i == app.cmt.selected_thread;
-            let comment = &all_comments[thread.root];
+    let items: Vec<ListItem> = (0..total_items)
+        .filter_map(|i| {
+            let thread_index = data.visible_threads.map_or(i, |indices| indices[i]);
+            let thread = data.threads.get(thread_index)?;
+            let is_selected = i == data.selected;
+            let comment = &data.comments[thread.root];
             let prefix = if is_selected { "> " } else { "  " };
             let line_info = comment.line.map(|l| format!(":{}", l)).unwrap_or_default();
-            let resolved = resolved_ids.contains(&comment.id);
+            let resolved = data.resolved_ids.contains(&comment.id);
 
             let reply_count = thread.replies.len();
             let reply_info = if reply_count > 0 {
@@ -373,14 +403,13 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
             }
             lines.push(Line::from(""));
 
-            ListItem::new(lines)
+            Some(ListItem::new(lines))
         })
         .collect();
 
-    let total_items = threads.len();
     let mut list_state = ListState::default()
-        .with_offset(app.cmt.thread_scroll_offset)
-        .with_selected(Some(app.cmt.selected_thread));
+        .with_offset(*scroll_offset)
+        .with_selected(Some(data.selected));
 
     let block = Block::default().borders(Borders::ALL);
     let list = List::new(items).block(block).highlight_style(
@@ -390,7 +419,7 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
     );
     frame.render_stateful_widget(list, area, &mut list_state);
 
-    app.cmt.thread_scroll_offset = list_state.offset();
+    *scroll_offset = list_state.offset();
 
     if total_items > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -398,7 +427,7 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
             .end_symbol(Some("▼"));
 
         let mut scrollbar_state =
-            ScrollbarState::new(total_items.saturating_sub(1)).position(app.cmt.selected_thread);
+            ScrollbarState::new(total_items.saturating_sub(1)).position(data.selected);
 
         frame.render_stateful_widget(
             scrollbar,
@@ -438,6 +467,26 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
         HashSet::new()
     };
 
+    render_review_thread_data(
+        frame,
+        area,
+        all_comments,
+        thread,
+        app.cmt.expanded_selected,
+        &mut app.cmt.expanded_scroll_offset,
+        &resolved_ids,
+    );
+}
+
+pub(crate) fn render_review_thread_data(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    all_comments: &[crate::github::comment::ReviewComment],
+    thread: &crate::app::CommentThread,
+    selected: usize,
+    scroll_offset: &mut usize,
+    resolved_ids: &std::collections::HashSet<u64>,
+) {
     let available_width = area.width.saturating_sub(4) as usize;
     let body_width = available_width.saturating_sub(6);
 
@@ -451,7 +500,7 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
         .enumerate()
         .map(|(i, &ci)| {
             let comment = &all_comments[ci];
-            let is_selected = i == app.cmt.expanded_selected;
+            let is_selected = i == selected;
             let prefix = if is_selected { "> " } else { "  " };
             let is_root = i == 0;
             let resolved = resolved_ids.contains(&comment.id);
@@ -521,8 +570,8 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
     );
 
     let mut list_state = ListState::default()
-        .with_offset(app.cmt.expanded_scroll_offset)
-        .with_selected(Some(app.cmt.expanded_selected));
+        .with_offset(*scroll_offset)
+        .with_selected(Some(selected));
 
     let block = Block::default().borders(Borders::ALL).title(title);
     let list = List::new(items).block(block).highlight_style(
@@ -532,7 +581,7 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
     );
     frame.render_stateful_widget(list, area, &mut list_state);
 
-    app.cmt.expanded_scroll_offset = list_state.offset();
+    *scroll_offset = list_state.offset();
 
     if total_items > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -540,7 +589,7 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
             .end_symbol(Some("▼"));
 
         let mut scrollbar_state =
-            ScrollbarState::new(total_items.saturating_sub(1)).position(app.cmt.expanded_selected);
+            ScrollbarState::new(total_items.saturating_sub(1)).position(selected);
 
         frame.render_stateful_widget(
             scrollbar,
@@ -812,6 +861,7 @@ mod tests {
             },
             created_at: "2025-01-01T00:00:00Z".to_string(),
             in_reply_to_id: None,
+            location: Default::default(),
         }]);
         app.build_review_threads();
 
@@ -938,6 +988,7 @@ mod tests {
                 },
                 created_at: "2026-03-25T02:00:00+00:00".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 2,
@@ -950,6 +1001,7 @@ mod tests {
                 },
                 created_at: "2026-03-25T03:00:00+00:00".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
         ]);
         app.cmt.local_comment_meta.insert(
@@ -1041,6 +1093,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 101,
@@ -1053,6 +1106,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T01:00:00Z".to_string(),
                 in_reply_to_id: Some(100),
+                location: Default::default(),
             },
             ReviewComment {
                 id: 102,
@@ -1065,6 +1119,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T02:00:00Z".to_string(),
                 in_reply_to_id: Some(100),
+                location: Default::default(),
             },
             ReviewComment {
                 id: 200,
@@ -1077,6 +1132,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T03:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
         ]);
         app.build_review_threads();
@@ -1109,6 +1165,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 101,
@@ -1121,6 +1178,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T01:00:00Z".to_string(),
                 in_reply_to_id: Some(100),
+                location: Default::default(),
             },
         ]);
         app.build_review_threads();
@@ -1170,6 +1228,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 101,
@@ -1182,6 +1241,7 @@ mod tests {
                 },
                 created_at: "2025-01-02T00:00:00Z".to_string(),
                 in_reply_to_id: Some(100),
+                location: Default::default(),
             },
             ReviewComment {
                 id: 102,
@@ -1194,6 +1254,7 @@ mod tests {
                 },
                 created_at: "2025-01-03T00:00:00Z".to_string(),
                 in_reply_to_id: Some(100),
+                location: Default::default(),
             },
         ]);
         app.build_review_threads();
@@ -1251,6 +1312,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 401,
@@ -1263,6 +1325,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T01:00:00Z".to_string(),
                 in_reply_to_id: Some(400),
+                location: Default::default(),
             },
             ReviewComment {
                 id: 402,
@@ -1275,6 +1338,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T02:00:00Z".to_string(),
                 in_reply_to_id: Some(400),
+                location: Default::default(),
             },
         ]);
         // Root resolved, first reply resolved, second reply open.
@@ -1327,6 +1391,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 300,
@@ -1339,6 +1404,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T01:00:00Z".to_string(),
                 in_reply_to_id: None,
+                location: Default::default(),
             },
             ReviewComment {
                 id: 301,
@@ -1351,6 +1417,7 @@ mod tests {
                 },
                 created_at: "2025-01-01T02:00:00Z".to_string(),
                 in_reply_to_id: Some(300),
+                location: Default::default(),
             },
         ]);
         // Root of thread 1 is resolved; only the reply of thread 2 is resolved.

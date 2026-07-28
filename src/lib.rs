@@ -17,6 +17,7 @@ pub mod keybinding;
 pub mod language;
 pub mod loader;
 pub mod symbol;
+pub mod symbols;
 pub mod syntax;
 pub mod ui;
 
