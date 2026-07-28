@@ -1,187 +1,200 @@
-# Symbol Index — 技術リファレンス
+# Symbol Index — Technical Reference
 
-`src/symbols.rs` に実装した tree-sitter tags ベースのシンボルエンジンの詳細。
-言語追加やクエリ調整をするときはここを読む。
+The details of the tree-sitter-tags-based symbol engine implemented in
+`src/symbols.rs`. Read this when adding a language or adjusting queries.
 
-## 1. 何をしているか
+## 1. What it does
 
-tree-sitter の `tags.scm` クエリを CST に対して実行し、`@definition.*` キャプチャと
-`@name` キャプチャのペアからシンボルを取り出している。GitHub のコードナビゲーション
-（"Go to definition" / "Find all references"）が使っているのと同じクエリ資産である。
+It runs tree-sitter's `tags.scm` queries against the CST and extracts symbols
+from pairs of `@definition.*` captures and `@name` captures. This is the same
+query asset GitHub's code navigation ("Go to definition" / "Find all
+references") uses.
 
 ```
 source ──parse──> Tree ──Query(tags.scm)──> QueryMatch*
                                               │
                             ┌─────────────────┴──────────────────┐
-                            │ @name           → 名前とその位置    │
-                            │ @definition.xxx → 種別と包含範囲    │
+                            │ @name           → name and position │
+                            │ @definition.xxx → kind and range    │
                             └─────────────────┬──────────────────┘
                                               ↓
-                              collapse_duplicate_tags()   ← 同一 name ノードの重複排除
+                              collapse_duplicate_tags()   ← dedupe per name node
                                               ↓
-                              ソート（start_byte 昇順, end_byte 降順）
+                              sort (start_byte asc, end_byte desc)
                                               ↓
-                              包含スタックで depth を算出
+                              containment stack computes depth
                                               ↓
                                         Vec<Symbol>
 ```
 
-`Symbol` は `{ name, kind, line (1-based), column (0-based chars), depth }`。
+`Symbol` is `{ name, kind, line (1-based), column (0-based chars), depth }`.
 
-## 2. 言語別 tags クエリの供給元
+## 2. Where each language's tags query comes from
 
-`SupportedLanguage::tags_query()` (`src/language.rs`) が返す。
+Returned by `SupportedLanguage::tags_query()` (`src/language.rs`).
 
-| 言語 | 供給元 | 備考 |
-|------|--------|------|
-| Rust | `tree_sitter_rust::TAGS_QUERY` | 14 パターン |
-| TypeScript / TSX | **JS + TS の連結** (`TYPESCRIPT_COMBINED_TAGS_QUERY`) | 後述の落とし穴 2 |
-| JavaScript / JSX | `tree_sitter_javascript::TAGS_QUERY` | 11 パターン |
+| Language | Source | Notes |
+|----------|--------|-------|
+| Rust | `tree_sitter_rust::TAGS_QUERY` | 14 patterns |
+| TypeScript / TSX | **JS + TS concatenated** (`TYPESCRIPT_COMBINED_TAGS_QUERY`) | pitfall 2 below |
+| JavaScript / JSX | `tree_sitter_javascript::TAGS_QUERY` | 11 patterns |
 | Go | `tree_sitter_go::TAGS_QUERY` | |
 | Python | `tree_sitter_python::TAGS_QUERY` | |
 | Ruby | `tree_sitter_ruby::TAGS_QUERY` | |
 | C | `tree_sitter_c::TAGS_QUERY` | |
-| C++ | `tree_sitter_cpp::TAGS_QUERY` | **自己完結**。C との連結は不要（highlights とは違う） |
+| C++ | `tree_sitter_cpp::TAGS_QUERY` | **Self-contained**. No concatenation with C needed (unlike highlights) |
 | Java | `tree_sitter_java::TAGS_QUERY` | |
 | Lua | `tree_sitter_lua::TAGS_QUERY` | |
 | PHP | `tree_sitter_php::TAGS_QUERY` | |
 | Swift | `tree_sitter_swift::TAGS_QUERY` | |
-| C# | `src/queries/c_sharp/tags.scm` | クレートに `queries/tags.scm` はあるが定数を export していない |
-| Zig | `src/queries/zig/tags.scm` | 上流に tags.scm なし |
-| Bash | `src/queries/bash/tags.scm` | 上流に tags.scm なし |
-| Haskell | `src/queries/haskell/tags.scm` | 上流に tags.scm なし |
-| MoonBit | `src/queries/moonbit/tags.scm` | vendored 文法 |
-| Markdown | `src/queries/markdown/tags.scm` | 見出しをアウトラインにする |
-| Svelte / Vue / CSS / MarkdownInline | `None` | 意図的。SFC の `<script>` は埋め込み言語側の担当、CSS に名前付きエンティティは無い |
+| C# | `src/queries/c_sharp/tags.scm` | the crate ships `queries/tags.scm` but exports no constant |
+| Zig | `src/queries/zig/tags.scm` | no upstream tags.scm |
+| Bash | `src/queries/bash/tags.scm` | no upstream tags.scm |
+| Haskell | `src/queries/haskell/tags.scm` | no upstream tags.scm |
+| MoonBit | `src/queries/moonbit/tags.scm` | vendored grammar |
+| Markdown | `src/queries/markdown/tags.scm` | turns headings into an outline |
+| Svelte / Vue / CSS / MarkdownInline | `None` | deliberate. An SFC's `<script>` belongs to the embedded language; CSS has no named entities |
 
-`None` の集合はテスト `test_languages_without_tags_query_are_intentional` で固定して
-いる。言語を追加したらこのテストも更新すること — 「うっかり未対応のまま」を防ぐための
-ガードである。
+The `None` set is pinned by the test
+`test_languages_without_tags_query_are_intentional`. Update that test when you
+add a language — it is the guard against "accidentally left unsupported".
 
-## 3. 実装中に踏んだ落とし穴（重要）
+## 3. Pitfalls hit during implementation (important)
 
-### 3.1 `Query::new` は tags.scm のディレクティブを受け入れる
+### 3.1 `Query::new` accepts the tags.scm directives
 
-`tags.scm` には `#strip!` / `#select-adjacent!` / `#not-eq?` といった、`tree-sitter-tags`
-クレート固有のディレクティブが含まれる。`tree_sitter::Query::new` はこれらを
-general predicate として受理し、コンパイルエラーにならない。したがって
-**`tree-sitter-tags` クレートへの依存は不要**で、素の `Query` + `QueryCursor` で足りる。
+`tags.scm` files contain directives specific to the `tree-sitter-tags` crate,
+such as `#strip!` / `#select-adjacent!` / `#not-eq?`. `tree_sitter::Query::new`
+accepts these as general predicates and does not fail to compile. Therefore
+**no dependency on the `tree-sitter-tags` crate is needed** — a bare `Query` +
+`QueryCursor` suffices.
 
-（`#not-eq?` などのテキスト述語が実行時に評価されるかどうかには依存していない。
-評価されなくても余分なシンボルが 1 つ増えるだけで、壊れはしない。）
+(Nothing depends on whether text predicates like `#not-eq?` are evaluated at
+runtime. If they are not, the only consequence is one extra symbol — nothing
+breaks.)
 
-### 3.2 TypeScript の TAGS_QUERY は JavaScript を継承する前提
+### 3.2 TypeScript's TAGS_QUERY assumes it inherits JavaScript
 
-`tree_sitter_typescript::TAGS_QUERY` には TS 固有パターン（`function_signature`,
-`interface_declaration`, `module` 等）しか入っていない。`class_declaration` や
-`function_declaration` は JavaScript 側にある。
+`tree_sitter_typescript::TAGS_QUERY` contains only the TS-specific patterns
+(`function_signature`, `interface_declaration`, `module`, etc.).
+`class_declaration` and `function_declaration` live on the JavaScript side.
 
-連結しないと `export class Widget {}` から**シンボルが 1 つも取れない**。
-これは `HIGHLIGHTS_QUERY` の `TYPESCRIPT_COMBINED_QUERY` とまったく同じ構造なので、
-`TYPESCRIPT_COMBINED_TAGS_QUERY` を同じ場所に並べてある。
+Without concatenation, `export class Widget {}` yields **not a single symbol**.
+This has exactly the same structure as `TYPESCRIPT_COMBINED_QUERY` for
+`HIGHLIGHTS_QUERY`, so `TYPESCRIPT_COMBINED_TAGS_QUERY` sits right next to it.
 
-C++ は逆で、`tags.scm` は自己完結している（`class_specifier` も `struct_specifier` も
-自前で持っている）。`highlights` の癖から類推して連結すると重複が出るので注意。
+C++ is the opposite: its `tags.scm` is self-contained (it carries both
+`class_specifier` and `struct_specifier` itself). Concatenating by analogy with
+the `highlights` habit produces duplicates — beware.
 
-### 3.3 Rust: 同じノードが 2 パターンにマッチする
+### 3.3 Rust: the same node matches two patterns
 
-`tree-sitter-rust` の tags.scm は impl ブロック内の関数を 2 回マッチさせる。
+`tree-sitter-rust`'s tags.scm matches a function inside an impl block twice.
 
 ```scm
 (declaration_list (function_item name: (identifier) @name) @definition.method)
 (function_item     name: (identifier) @name)                @definition.function
 ```
 
-`@definition.method` と `@definition.function` が**同じ `function_item` ノード**に付く。
-素直に処理すると、
+`@definition.method` and `@definition.function` land on **the same
+`function_item` node**. Processed naively,
 
-- アウトラインに `new` が 2 行出る
-- 包含スタックが「自分自身を包含している」と判断して depth が 0 と 1 に割れる
+- the outline shows `new` twice
+- the containment stack decides the node "contains itself" and depth splits into 0 and 1
 
-対策が `collapse_duplicate_tags()`。**name ノードのバイトオフセットをキー**にして
-1 件だけ残す。優先順位は `(kind_specificity, definition ノードの幅)` の辞書順で、
-`Method` が `Function` より具体的、同種なら範囲が狭い方が勝つ。
+The countermeasure is `collapse_duplicate_tags()`. It keeps exactly one entry
+**keyed by the name node's byte offset**. Priority is the lexicographic order of
+`(kind_specificity, width of the definition node)`: `Method` is more specific
+than `Function`, and between equals the narrower range wins.
 
-### 3.4 Rust: `impl Foo` はアウトラインに出ない
+### 3.4 Rust: `impl Foo` does not appear in the outline
 
 `(impl_item type: (type_identifier) @name !trait) @reference.implementation` —
-上流が定義ではなく**参照**として扱っている。したがって `impl` ブロックの見出しは
-アウトラインに現れず、中のメソッドが直接並ぶ。これは上流の設計判断であり、
-octorus 側では変えていない（変えたければ Rust だけ自前クエリに差し替える）。
+upstream treats it as a **reference**, not a definition. So the heading of an
+`impl` block never shows up in the outline; the methods inside are listed
+directly. This is an upstream design decision and octorus does not override it
+(to change it, swap in a custom query for Rust alone).
 
-### 3.5 Markdown: 見出しは兄弟ノードなのでネストが取れない
+### 3.5 Markdown: headings are siblings, so nesting is lost
 
-`atx_heading` は互いに包含関係を持たない。ネストを持つのは `section` の方。
+`atx_heading` nodes do not contain one another. The nesting lives in `section`.
 
 ```scm
-; ✗ これだと全部 depth 0
+; ✗ this puts everything at depth 0
 (atx_heading heading_content: (inline) @name) @definition.heading
 
-; ✓ section を捕まえると `##` が `#` の下に入る
+; ✓ capturing the section puts `##` beneath `#`
 (section (atx_heading heading_content: (inline) @name)) @definition.heading
 ```
 
-### 3.6 Zig: `const Foo = struct {}` は variable_declaration
+### 3.6 Zig: `const Foo = struct {}` is a variable_declaration
 
-型らしきものが型宣言ノードではなく、初期化子にコンテナ宣言を持つ変数宣言として
-表現される。
+What looks like a type is expressed not as a type-declaration node but as a
+variable declaration whose initializer is a container declaration.
 
 ```scm
 (variable_declaration (identifier) @name (struct_declaration)) @definition.class
 ```
 
-### 3.7 Bash: トップレベル代入だけを拾う
+### 3.7 Bash: only top-level assignments are picked up
 
-`variable_assignment` を無条件に拾うと関数ローカル変数でアウトラインが埋まる。
-`(program ...)` でアンカーして、トップレベルのみに限定している。
+Capturing `variable_assignment` unconditionally floods the outline with
+function-local variables. The query is anchored with `(program ...)` to
+restrict it to the top level.
 
-### 3.8 Haskell: 定義式ごとに 1 マッチ
+### 3.8 Haskell: one match per defining equation
 
-複数の等式で定義された関数（`f [] = ...` / `f (x:xs) = ...`）は等式ごとにマッチする。
-depth 算出後に**隣接する同一 `(name, kind, depth)` を 1 つに畳む**処理で吸収している。
-「隣接のみ」なのが重要で、別の impl ブロックにある同名メソッドは別物として残る。
+A function defined by several equations (`f [] = ...` / `f (x:xs) = ...`)
+matches once per equation. This is absorbed after depth computation by
+**folding adjacent identical `(name, kind, depth)` entries into one**.
+"Adjacent only" is the important part: a method of the same name in a different
+impl block stays separate.
 
-### 3.9 tree-sitter の column はバイト単位
+### 3.9 tree-sitter columns are byte offsets
 
-`Node::start_position().column` はバイトオフセットを返す。octorus は表示幅計算も
-カーソル位置もすべて文字単位で扱うので、`char_column()` で変換している。
-CJK 識別子や、行頭に日本語コメントがあるケースで実際にズレる。
+`Node::start_position().column` returns a byte offset. octorus handles display
+width and cursor positions entirely in characters, so `char_column()` converts.
+It actually drifts with CJK identifiers, or when a line starts with a Japanese
+comment.
 
-## 4. 検索スコアリング
+## 4. Search scoring
 
-`fuzzy_score_lowered(lowered_name, needle)`。**private** で、**両引数とも小文字化済みが
-前提**である。`needle` 側は `LoweredNeedle` が構築時に保証し、名前側は `from_files()` が
-`lowered_names` として事前計算したものを渡す（キーストロークごとにシンボル 1 個ずつ
-小文字化を走らせないため）。公開 API から単体のスコアを取る手段はなく、`search()` の
-返却順として観測する。
+`fuzzy_score_lowered(lowered_name, needle)`. It is **private**, and **both
+arguments are assumed already lowercased**. On the needle side,
+`LoweredNeedle` guarantees this at construction; on the name side,
+`from_files()` passes the precomputed `lowered_names` (so a keystroke does not
+lowercase every symbol one by one). There is no public API for scoring a single
+name; scores are observed only as the ordering `search()` returns.
 
-| 層 | スコア | 例（needle = `parse`） |
-|----|--------|----------------------|
-| 完全一致 | 10,000 − 長さ | `parse` |
-| 前方一致 | 8,000 − 長さ | `parse_line` |
-| 単語境界の後の部分一致 | 6,000 − 位置 − 長さ | `do_parse`（`_` `-` `.` `:` の直後） |
-| 部分一致 | 4,000 − 位置 − 長さ | `reparsed` |
-| 部分列 | 2,000 − min(ギャップ, 1,000) − 長さ | `please_advance_rest_of_set` |
+| Tier | Score | Example (needle = `parse`) |
+|------|-------|---------------------------|
+| Exact match | 10,000 − length | `parse` |
+| Prefix match | 8,000 − length | `parse_line` |
+| Substring after a word boundary | 6,000 − position − length | `do_parse` (right after `_` `-` `.` `:`) |
+| Substring | 4,000 − position − length | `reparsed` |
+| Subsequence | 2,000 − min(gap, 1,000) − length | `please_advance_rest_of_set` |
 
-「長さ」は `chars().count()`（バイト数ではない）。部分列層のギャップに 1,000 の上限が
-あるのが層の分離を成立させている要で、これがないと散らばった部分列マッチが下の層まで
-落ちうる。同点は「名前が短い順 → パス順 → 行番号順」で決着させる（描画順が実行ごとに
-変わらないようにするため）。
+"Length" is `chars().count()` (not bytes). The 1,000 cap on the subsequence
+tier's gap is what keeps the tiers separated — without it, a scattered
+subsequence match could sink below the tier beneath it. Ties are broken by
+"shorter name → path order → line number" (so the rendered order does not change
+from run to run).
 
-`search(query, limit)` は全件をスコアリングしたあと、**全体ソートではなく
-`select_nth_unstable_by` による top-N 部分選択**で `limit` 件まで切ってから並べ替える
-（判断の根拠となる実測値は関数内のコメントに残してある）。さらに直近の
-`(needle, limit)` 1 組の結果をメモ化しているので、同じクエリを同じ limit で呼び直しても
-再スキャンは起きない。**limit が違えばメモは効かない** — 呼び口を複数持つと再計算に
-なるだけでなく、返る集合そのものが食い違う。UI 側の唯一の呼び口は
-`BrowseState::symbol_search_hits()` で、描画・選択クランプ・Enter 解決の 3 者がここを
-通る。
+`search(query, limit)` scores every entry, then cuts to `limit` entries with a
+**top-N partial selection via `select_nth_unstable_by`, not a full sort**,
+before ordering them (the measurements justifying this live in a comment inside
+the function). On top of that, the most recent `(needle, limit)` pair's result
+is memoized, so re-issuing the same query with the same limit does not rescan.
+**A different limit misses the memo** — adding extra call sites doesn't just
+recompute, the returned sets themselves diverge. The UI's single call site is
+`BrowseState::symbol_search_hits()`; rendering, selection clamping, and Enter
+resolution all go through it.
 
-`definitions()` の並びは別で、「どれにジャンプしたいか」の優先度:
-型（Class/Interface/Type） → 呼べるもの（Function/Method/Macro） →
-Constant/Module → Field/Property/Heading。
+The ordering of `definitions()` is separate — a priority of "which one do you
+want to jump to": types (Class/Interface/Type) → callables
+(Function/Method/Macro) → Constant/Module → Field/Property/Heading.
 
-## 5. インデックス構築
+## 5. Index construction
 
 ```rust
 SymbolIndex::build_cancellable(
@@ -191,125 +204,135 @@ SymbolIndex::build_cancellable(
 ) -> IndexBuild
 ```
 
-キャンセル不可の `build` は存在しない。戻り値も `SymbolIndex` ではなく `IndexBuild` で、
-呼び手が 3 通りを描き分けられるようにしてある。
+There is no non-cancellable `build`. The return type is `IndexBuild`, not
+`SymbolIndex`, so the caller can render the three outcomes distinctly.
 
-| バリアント | 意味 | 画面 |
+| Variant | Meaning | Screen |
 |---|---|---|
-| `Completed(SymbolIndex)` | 索引対象のパスを全部歩いた | `IndexState::Ready` |
-| `Cancelled { scanned_files }` | 途中で signal が立った（新しい build に追い越された） | 何も描かない。チャネルへ何も送らない |
-| `Failed { message }` | そもそも走れなかった。repo root が消えた／ワーカーが panic した | エラーバナー |
+| `Completed(SymbolIndex)` | every indexable path was walked | `IndexState::Ready` |
+| `Cancelled { scanned_files }` | the signal fired mid-run (overtaken by a newer build) | draw nothing; send nothing on the channel |
+| `Failed { message }` | it could not run at all — the repo root vanished / a worker panicked | error banner |
 
-`Failed` を持つのが要点で、ワーカーの panic を握り潰して「シンボルが少ないインデックス」
-として成功扱いすることを避けている。
+Having `Failed` is the point: it avoids swallowing a worker panic and passing
+off "an index with fewer symbols" as success.
 
-`cancel` が `tokio_util::sync::CancellationToken` ではなく `&dyn CancelSignal` なのは、
-**ポーリングの粒度をテストできるようにするため**である。「N 回ポーリングされたら立つ」
-テスト用シグナルを渡せば、キャンセルされた build が何ファイル触るかを実時間に依存せず
-確定できる。`CancellationToken` にはこのトレイトの実装が用意してある。
+`cancel` is a `&dyn CancelSignal` rather than a
+`tokio_util::sync::CancellationToken` **so that polling granularity is
+testable**. Pass a test signal that fires "after N polls" and you can pin down
+how many files a cancelled build touches without depending on wall-clock time.
+`CancellationToken` has an implementation of the trait.
 
-- ブロッキング CPU バウンド。**必ず `spawn_blocking` から呼ぶ**（描画ループから呼ばない）
-- 対象は `supports_symbols()` が真で、`MAX_INDEXED_FILE_BYTES = 2 MiB` 以下の通常ファイルのみ
-- ポーリング地点は 2 つ。metadata prefilter が `PREFILTER_CANCEL_POLL_INTERVAL` ごとに、
-  各ワーカーが `index_chunk` の中で。前者で止まると `scanned_files` は 0
-- ワーカー数は `available_parallelism().clamp(1, 8)` をさらに索引対象ファイル数で
-  抑えた値。`std::thread::scope` で分割し、ワーカーごとに `ParserPool` を 1 つ持つ
-  （パーサとコンパイル済みクエリの再利用のため）
-- チャンクの完了順は不定なのでパス順にソートし直す。スナップショットと検索結果を
-  決定的にするため
+- Blocking, CPU-bound. **Always call it from `spawn_blocking`** (never from the draw loop)
+- Eligible files: `supports_symbols()` is true, regular file, at most `MAX_INDEXED_FILE_BYTES = 2 MiB`
+- Two polling sites: the metadata prefilter every `PREFILTER_CANCEL_POLL_INTERVAL`,
+  and each worker inside `index_chunk`. Stopping at the former means `scanned_files` is 0
+- Worker count is `available_parallelism().clamp(1, 8)`, further capped by the
+  number of indexable files. Work is split under `std::thread::scope`, one
+  `ParserPool` per worker (to reuse parsers and compiled queries)
+- Chunks complete in arbitrary order, so results are re-sorted by path — to keep
+  snapshots and search results deterministic
 
-rayon などの並列ランタイムは追加していない。`thread::scope` で足りる。
+No parallel runtime like rayon was added. `thread::scope` is enough.
 
-## 6. 実測値
+## 6. Measured numbers
 
-**この表に載せるのは `benches/symbol_index.rs` で再現できる値だけにすること。** 以前は
-「octorus 自身を 1 回計測した」アドホックな数値が載っていたが、再現手順がないまま
-`search` の実装が全ソートから top-N 部分選択 + メモ化へ変わり、誰も追随できなかった。
+**Only values reproducible via `benches/symbol_index.rs` go in this table.** It
+used to carry ad-hoc numbers from "measured octorus itself once"; with no
+reproduction procedure, the `search` implementation then changed from a full
+sort to top-N partial selection + memoization and nobody could follow up.
 
-合成インデックス（5,000 ファイル × 20 シンボル = 100,000 シンボル、release ビルド、
-この環境で `--warm-up-time 1 --measurement-time 3` で計測。Criterion の中央推定）:
+Synthetic index (5,000 files × 20 symbols = 100,000 symbols, release build,
+measured on this machine with `--warm-up-time 1 --measurement-time 3`,
+Criterion median estimates):
 
-| 操作 | 実測 |
-|------|------|
-| `from_files`（5,000 ファイル / 100,000 シンボル） | 8.48 ms |
-| `definitions` ヒット | 39.6 ns |
-| `definitions` ミス | 27.0 ns |
-| `search_cached`（`h` / `handle` / `hrq`） | 462 / 462 / 465 ns |
-| `search_cached`（`handle_request_2500`） | 290 ns |
-| `search_cold`（`h` / `handle` / `hrq`） | 1.66 / 1.73 / 3.17 ms |
-| `search_cold`（`handle_request_2500`） | 6.99 ms |
+| Operation | Measured |
+|-----------|----------|
+| `from_files` (5,000 files / 100,000 symbols) | 8.48 ms |
+| `definitions` hit | 39.6 ns |
+| `definitions` miss | 27.0 ns |
+| `search_cached` (`h` / `handle` / `hrq`) | 462 / 462 / 465 ns |
+| `search_cached` (`handle_request_2500`) | 290 ns |
+| `search_cold` (`h` / `handle` / `hrq`) | 1.66 / 1.73 / 3.17 ms |
+| `search_cold` (`handle_request_2500`) | 6.99 ms |
 
-**`search_cached` と `search_cold` は別物なので混同しないこと。** メモ化は
-`(needle, limit)` で効くので、同じクエリを繰り返す `b.iter` はスキャンではなく
-「キャッシュ済み 200 件を `SymbolRef` へ復元するコスト」を測る。両方に意味がある —
-オーバーレイは毎フレーム cached 経路を通り、cold 経路はキーストロークごとに 1 回だけ
-通る。差は 3,500 倍あるので、名前を取り違えると回帰を丸ごと見落とす。`search_cold` は
-limit を 1 ずつ交互に振ってメモを外している。
+**`search_cached` and `search_cold` are different things — do not conflate
+them.** Memoization keys on `(needle, limit)`, so a `b.iter` that repeats the
+same query measures not a scan but "the cost of rehydrating the cached 200
+entries into `SymbolRef`s". Both are meaningful — the overlay takes the cached
+path every frame, and the cold path runs once per keystroke. The gap is
+3,500×, so mixing up the names means missing a regression entirely.
+`search_cold` defeats the memo by alternating the limit by 1.
 
-`handle_request_2500` が cold で最も遅いのは、needle が長いぶん 10 万シンボル全部に
-対する `find` と部分列走査が重くなるためで、ヒット数の少なさでは埋め合わない。
+`handle_request_2500` is the slowest cold case because a longer needle makes the
+`find` and the subsequence walk over all 100k symbols heavier, and the smaller
+hit count does not make up for it.
 
-### 自動ゲートで守られていない性質
+### Properties not protected by automated gates
 
-- **`lowered_names` の事前計算**: `from_files()` が小文字名をキャッシュしているのは、
-  `fuzzy_score_lowered` の中で毎回小文字化し直すと**候補 1 件につき String を 1 個確保**する
-  ためである。10 万シンボルのインデックスならキーストロークごとに 10 万アロケーションになる。
-  ところが**結果は完全に同一**なので、キャッシュを外してもテストは 1 本も落ちない
-  （revert 掃討で実測）。大小無視のマッチ自体は
-  `test_search_is_case_insensitive_in_both_directions` 系が固定しているが、守っているのは
-  正しさであってコストではない（`test_search_is_case_insensitive_for_queries` が見ているのは
-  マッチ結果である）。回帰を見るには `search_cold` ベンチを回すこと。
+- **The `lowered_names` precomputation**: `from_files()` caches the lowercased
+  names because re-lowercasing inside `fuzzy_score_lowered` would **allocate one
+  String per candidate**. On a 100k-symbol index that is 100k allocations per
+  keystroke. But **the results are exactly identical**, so removing the cache
+  fails not a single test (measured in a revert sweep). Case-insensitive
+  matching itself is pinned by the
+  `test_search_is_case_insensitive_in_both_directions` family, but what it
+  guards is correctness, not cost (what
+  `test_search_is_case_insensitive_for_queries` looks at is the match results).
+  To see the regression, run the `search_cold` bench.
 
-- **ワーカー panic がキャンセルより優先されること**: `build_cancellable` は `outcomes` を
-  走査する途中で join エラーを見つけた時点で `IndexBuild::Failed` を `return` し、
-  `stopped_early` の判定はループを抜けたあとにしかない。したがって panic は構造上つねに
-  キャンセルに勝つ。この順序を入れ替えると、キャンセルを伴う panic が `Cancelled` として
-  報告され、呼び手（`start_symbol_index_build` の空アーム）が捨てるためバナーが出ず
-  panic が完全に握り潰される。**この順序を固定するテストはない** — 決定的に再現するには
-  1 つのワーカーを panic させながら別のワーカーだけをキャンセルさせる必要があり、
-  どちらのワーカーがどの poll を消費するかがスレッド順序依存になるため。
-  並べ替えるときは自分で確かめること。
+- **Worker panics taking precedence over cancellation**: `build_cancellable`
+  `return`s `IndexBuild::Failed` the moment it finds a join error while walking
+  `outcomes`, and the `stopped_early` check happens only after that loop.
+  Structurally, a panic therefore always beats cancellation. Swap that order
+  and a panic that coincides with cancellation gets reported as `Cancelled`,
+  which the caller (the empty arm in `start_symbol_index_build`) throws away —
+  no banner, the panic fully swallowed. **No test pins this order** — a
+  deterministic reproduction would need one worker to panic while only another
+  gets cancelled, and which worker consumes which poll is thread-schedule
+  dependent. When reordering, verify it yourself.
 
-`benches/symbol_index.rs` に Criterion ベンチがある:
+`benches/symbol_index.rs` holds the Criterion benches:
 
 ```bash
 cargo bench --bench symbol_index
 ```
 
-計測対象は 4 グループ:
-- `extract_symbols_rust/{10,50,200,1000}` — ファイルサイズ別のスループット
-- `extract_symbols_language/{rust,typescript,markdown}` — 言語別
-- `from_files/{100,1000,5000}` — インデックス構築（100k シンボルまで）
-- `query/{definitions_hit,definitions_miss,search_cached/*,search_cold/*}` — クエリ遅延
+Four measured groups:
+- `extract_symbols_rust/{10,50,200,1000}` — throughput by file size
+- `extract_symbols_language/{rust,typescript,markdown}` — by language
+- `from_files/{100,1000,5000}` — index construction (up to 100k symbols)
+- `query/{definitions_hit,definitions_miss,search_cached/*,search_cold/*}` — query latency
 
-CI（`.github/workflows/benchmark.yml`）は現状 `ui_rendering` と `diff_parsing` しか
-回していない。`symbol_index` を回帰監視に載せるならここに足す。
+CI (`.github/workflows/benchmark.yml`) currently runs only `ui_rendering` and
+`diff_parsing`. To put `symbol_index` under regression watch, add it there.
 
-## 7. 言語を追加する手順
+## 7. How to add a language
 
-1. `Cargo.toml` に文法クレートを足し、`SupportedLanguage` にバリアントを追加
-   （`from_extension` / `default_extension` / `ts_language` / `highlights_query` /
-   `keywords` / `definition_prefixes` / `all()` をすべて埋める。コンパイラが漏れを教える）
-2. クレートが `TAGS_QUERY` を export していれば `tags_query()` でそれを返す
-3. していなければ `src/queries/<lang>/tags.scm` を書き、`include_str!` で埋め込む
-   - ノード名は `Parser::parse()` した木を `to_sexp()` で出して確認するのが速い
-   - `@definition.*` は `SymbolKind::from_capture()` が知っている名前を使う。
-     未知の名前は**黙って捨てられる**（誤ったアイコンより表示しない方がマシという判断）
-4. `test_all_tags_queries_compile` が通ることを確認（クエリのコンパイルエラーを検出する）
-5. `test_languages_without_tags_query_are_intentional` の期待値を更新
-6. 抽出結果のインラインスナップショットテストを 1 本足す
+1. Add the grammar crate to `Cargo.toml` and a variant to `SupportedLanguage`
+   (fill in all of `from_extension` / `default_extension` / `ts_language` /
+   `highlights_query` / `keywords` / `definition_prefixes` / `all()`; the
+   compiler reports what you missed)
+2. If the crate exports a `TAGS_QUERY`, return it from `tags_query()`
+3. If not, write `src/queries/<lang>/tags.scm` and embed it with `include_str!`
+   - The fastest way to check node names is `Parser::parse()` and dump the tree with `to_sexp()`
+   - Use `@definition.*` names that `SymbolKind::from_capture()` knows. Unknown
+     names are **silently dropped** (the judgement being that showing nothing
+     beats showing a wrong icon)
+4. Confirm `test_all_tags_queries_compile` passes (it catches query compile errors)
+5. Update the expectations of `test_languages_without_tags_query_are_intentional`
+6. Add one inline snapshot test for the extraction results
 
-## 8. 既存 `src/symbol.rs` との関係
+## 8. Relationship to the existing `src/symbol.rs`
 
-`src/symbol.rs` は削除していない。役割が違う:
+`src/symbol.rs` is not deleted. The roles differ:
 
-| | `src/symbol.rs`（既存） | `src/symbols.rs`（新規） |
+| | `src/symbol.rs` (existing) | `src/symbols.rs` (new) |
 |---|---|---|
-| 手法 | 定義キーワード前方一致 + `rg`/`grep` | CST 上の tags クエリ |
-| 対象 | PR の patch 内 / リポジトリ grep | インデックス済みリポジトリ全体 |
-| 使用箇所 | diff view の `gd` | Repo Browse の `gd` / `o` / `s` |
-| 誤検出 | コメント・文字列中の同名トークンに当たる | 当たらない |
-| 準備 | 不要（即時） | インデックス構築（バックグラウンド 数百 ms） |
+| Technique | definition-keyword prefix match + `rg`/`grep` | tags queries over the CST |
+| Scope | inside the PR's patch / repository grep | the whole indexed repository |
+| Used by | `gd` in the diff view | `gd` / `o` / `s` in Repo Browse |
+| False positives | hits same-named tokens in comments and strings | does not |
+| Preparation | none (instant) | index build (background, hundreds of ms) |
 
-将来的に diff view の `gd` もインデックス側へ寄せられるが、diff view は
-「インデックスが無くても即座に動く」ことに価値があるので、置き換えは慎重に。
+The diff view's `gd` could eventually lean on the index too, but the diff view's
+value is "works instantly with no index", so replace it with care.
