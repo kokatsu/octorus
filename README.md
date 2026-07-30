@@ -19,7 +19,7 @@ High-performance code review in your terminal for GitHub PRs, issues, local diff
 ## Requirements
 
 - [GitHub CLI (gh)](https://cli.github.com/) - Must be installed and authenticated
-- Rust 1.70+ (for building from source)
+- Rust 1.95+ (for building from source)
 - **For AI Rally feature** (optional, choose one or both):
   - [Claude Code](https://claude.ai/code) - Anthropic's CLI tool
   - [OpenAI Codex CLI](https://github.com/openai/codex) - OpenAI's CLI tool

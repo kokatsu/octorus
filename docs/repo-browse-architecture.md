@@ -8,15 +8,12 @@ Read this before adding features.
 | File | Role |
 |------|------|
 | `src/app/browse.rs` | State definitions, file loading, spawning and collecting async tasks |
-| `src/symbols.rs` | Symbol engine (independent of the screen, see [symbol-index.md](symbol-index.md)) |
+| `src/symbols.rs` | octorus compatibility facade over the Hearth symbol engine (independent of the screen, see [symbol-index.md](symbol-index.md)) |
 | `src/ui/browse.rs` | Rendering |
 | `src/app/input_browse.rs` | Key handling (2 panes + 2 overlays) |
 
-All four files are new, so their line counts are exactly this branch's added
-lines. **Do not put line counts in this table.** They used to be here, but every
-round that touched `src/app/browse.rs` and `src/symbols.rs` missed the update;
-the previous revision said 2,870 / 1,868 lines when the actual counts were
-3,018 / 1,942. Counting takes one command.
+Do not put line counts in this table; they become stale whenever the browser or
+its compatibility facade changes. Count the current checkout when needed.
 
 ```bash
 wc -l src/app/browse.rs src/symbols.rs src/ui/browse.rs src/app/input_browse.rs
@@ -32,16 +29,17 @@ Changes to existing files are kept minimal:
 - `src/main.rs` — the `--browse` flag
 - `src/ui/help.rs` — help entries
 - `src/app/cockpit.rs` / `src/ui/cockpit.rs` — the Cockpit menu item that opens the browser
-- `src/language.rs` — language detection for the added grammars
-- `src/lib.rs` — `pub mod symbols;`
-- `src/syntax/parser_pool.rs` — parser pool support for the added grammars
-- `src/queries/{bash,c_sharp,haskell,markdown,moonbit,zig}/tags.scm` — queries that extract symbols for each language
-- `Cargo.toml` — the `symbol_index` bench target, and excluding `docs/` from the package
-- `benches/ui_rendering.rs` — the `browse_render` group (8 sections) / `benches/symbol_index.rs` is new
-- `tests/cli.rs` — e2e tests that launch the binary (7 sections)
+- `src/language.rs` — highlighting-language detection plus the public tags-query compatibility accessor
+- `src/lib.rs` — `pub mod symbols;` and the public `ParserPool` re-export
+- `src/syntax/parser_pool.rs` — highlight caches plus the Hearth parser/query cache
+- `src/queries/moonbit/tags.scm` — the host-owned MoonBit symbol query; bundled-language queries are owned by Hearth
+- `Cargo.toml` / `Cargo.lock` — the exact `hearth-graph` dependency, Rust version, and the `symbol_index` bench target
+- `benches/ui_rendering.rs` — the `browse_render` group / `benches/symbol_index.rs` — facade extraction, build, and query benchmarks
+- `tests/cli.rs` — e2e tests that launch the binary
 
-No new dependency crates were added (the `Cargo.toml` diff is just the two
-points above).
+The symbol implementation depends on exact registry release `hearth-graph
+0.1.1` with only its `bundled-languages` and `fs` features. See
+[symbol-index.md](symbol-index.md) for ownership and compatibility boundaries.
 
 ## 2. State machine
 
@@ -50,27 +48,11 @@ conditional flags" — **not a single boolean flag representing a screen, a mode
 or a load state was added**. `BrowseState` has no `bool` fields; "which screen",
 "is it loading", and "is the index ready" are all answered by the enums below.
 
-This branch adds 3 `bool` **fields**, none of which stands in for a state
-machine. When counting, exclude function parameters (`focused` on
-`render_tree` / `render_content`, `selected` on `outline_row`, `bg_color` on
-`content_lines`) — an earlier revision conflated those and said 2.
-
-```bash
-git diff main -- src/ | grep -E '^\+[^+].*: *bool' | grep -v 'fn '
-```
-
-- `OpenFile::viewable` (`src/app/browse.rs`) — a property of a single file that
-  has finished reading, not a transition. The rendering side branches on the
-  presence of `notice`; the only reader of this value is the guard in
-  `start_browse_highlight()` (see §3). As an enum it would only ever be the two
-  values `Viewable | Unviewable`, with no transitions.
-- `ChunkOutcome::stopped_early` (`src/symbols.rs`) — part of the return value of
-  a single index-build worker. It is held by neither `App` nor `BrowseState`;
-  `build_cancellable` uses it to decide whether to return
-  `IndexBuild::Cancelled`, then discards it.
-- `Args::browse` (`src/main.rs`) — the clap flag for `--browse`. It is the CLI
-  argument representation, not running state; it is read once at startup and
-  collapses into the initial `AppState`.
+Persistent browser modes and loading transitions remain represented by enums,
+not boolean flags. `OpenFile::viewable` is a property of loaded content, and
+`Args::browse` is a one-shot CLI input rather than runtime state. The symbol
+facade introduces no persistent boolean state: cancellation is read through a
+stateless `CancelSignal` and Hearth returns an `IndexBuild` outcome.
 
 ```
 AppState
@@ -490,14 +472,14 @@ is "where are the tests for what", so that table stays:
 | Where | What |
 |-------|------|
 | `src/app/browse.rs` | `git ls-files` parsing, pseudo-patch conversion, tree, filter, cursor/scroll, file loading and its cancellation |
-| `src/symbols.rs` | per-language extraction snapshots, boundaries (empty/unsupported/syntax errors/CJK), the index, scoring, build cancellation |
+| `src/symbols.rs` | Hearth-registry extraction snapshots, compatibility boundaries (including C macro merging, empty files, duplicate paths, CJK and checked conversion), projected index refs, search, and build cancellation |
 | `src/ui/browse.rs` | inline rendering snapshots, tiny-terminal clipping, wide-glyph border repair |
 | `src/app/input_browse.rs` | **scenario tests** (tree navigation → open → scroll → back, filter → cancel, outline → jump → back, etc.) |
 | `src/main.rs` | the flag set allowed to start without a repository (including `--browse`) |
 | `tests/cli.rs` | e2e launching the binary via `assert_cmd` (non-git directory, git repo without a GitHub remote) |
 
-The top four files are new on this branch, so their per-module test counts are
-exactly the number of new tests. The counting command:
+Count the current per-module tests rather than relying on historical branch
+deltas:
 
 ```bash
 cargo test --lib -- --list | grep ': test$' | awk -F'::' '{print $1"::"$2}' | sort | uniq -c
@@ -584,18 +566,17 @@ test fails. Maintain this mapping when editing.
     `test_cancelled_ready_load_is_not_delivered`
 
 - **Cancellation of the index build**
-  - remove the `PREFILTER_CANCEL_POLL_INTERVAL` poll from
-    `SymbolIndex::build_cancellable`'s metadata prefilter →
-    `test_cancelled_build_stops_the_metadata_prefilter`
-  - remove the poll at the head of `index_chunk` → `test_cancelled_build_stops_scanning_early`
+  - stop adapting `CancelSignal` to the closure passed to
+    `hearth_graph::build_index` → `test_cancelled_build_stops_metadata_prefilter`,
+    `test_cancelled_build_stops_scanning_early`, and
+    `test_precancelled_build_scans_nothing`
   - remove `state.cancel_token.cancel()` in `open_repo_browse` (re-entry to a
     different root) →
     `test_open_repo_browse_replaces_different_root_and_cancels_old_session`
   - change `IndexBuild::Cancelled { .. } => {}` in `start_symbol_index_build` to
     "send something" → `test_pre_cancelled_real_symbol_index_build_delivers_nothing`.
-    This one runs the real `SymbolIndex::build_cancellable` through
-    `spawn_blocking` and checks all the way down to the cancelled session's
-    build delivering nothing on the channel (the receiver returns `None`)
+    This runs the real Hearth-backed build through `spawn_blocking` and checks
+    that a cancelled session delivers nothing on the channel
 
 - **Nothing reaches the highlighter**: §3's
   `test_unviewable_files_never_start_background_highlighting`

@@ -18,10 +18,10 @@ use crate::language::SupportedLanguage;
 /// This avoids the overhead of creating new parsers/compiling queries for each file.
 pub struct ParserPool {
     parsers: HashMap<SupportedLanguage, Parser>,
-    /// Cached compiled queries for highlight queries
+    /// Cached compiled queries for highlight queries.
     queries: HashMap<SupportedLanguage, Query>,
-    /// Cached compiled queries for tags (symbol) queries
-    tags_queries: HashMap<SupportedLanguage, Option<Query>>,
+    /// Hearth-owned parser and tags-query cache for symbol extraction.
+    symbol_parsers: hearth_graph::ParserPool<'static>,
 }
 
 impl Default for ParserPool {
@@ -36,24 +36,24 @@ impl ParserPool {
         Self {
             parsers: HashMap::new(),
             queries: HashMap::new(),
-            tags_queries: HashMap::new(),
+            symbol_parsers: hearth_graph::ParserPool::new(
+                crate::symbols::symbol_language_registry(),
+            ),
         }
     }
 
-    /// Get or create a compiled tags query for the given language.
-    ///
-    /// Returns `None` when the language has no tags query or the query fails to
-    /// compile. The failure is cached as `None` so a broken query is compiled
-    /// at most once per pool instead of on every file.
-    pub fn get_or_create_tags_query(&mut self, lang: SupportedLanguage) -> Option<&Query> {
-        if let Entry::Vacant(e) = self.tags_queries.entry(lang) {
-            let compiled = lang
-                .tags_query()
-                .and_then(|src| Query::new(&lang.ts_language(), src).ok());
-            e.insert(compiled);
-        }
+    /// Return the Hearth parser/query cache used by the symbol facade.
+    pub(crate) fn symbol_parser_pool(&mut self) -> &mut hearth_graph::ParserPool<'static> {
+        &mut self.symbol_parsers
+    }
 
-        self.tags_queries.get(&lang)?.as_ref()
+    /// Get or create the compiled tags query for a supported symbol language.
+    ///
+    /// This preserves the public octorus API while delegating query ownership
+    /// and caching to Hearth. Languages without symbol support return `None`.
+    pub fn get_or_create_tags_query(&mut self, lang: SupportedLanguage) -> Option<&Query> {
+        let id = crate::symbols::symbol_language_id(lang.default_extension())?;
+        self.symbol_parsers.tags_query(id)
     }
 
     /// Get or create a compiled highlight query for the given language.

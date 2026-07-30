@@ -92,6 +92,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
@@ -128,6 +130,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       - name: Cache cargo dependencies
@@ -211,6 +214,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
 
       - name: Obtain token via trusted publishing
         uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1

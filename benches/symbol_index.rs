@@ -1,10 +1,10 @@
 //! Symbol index benchmarks for the Repository Browser.
 //!
-//! These measure the tree-sitter tags pipeline that backs the file outline,
-//! workspace symbol search and Go to Definition:
-//! - `extract_symbols` — per-file outline extraction across languages and sizes
-//! - `SymbolIndex::from_files` — building the name lookup table
-//! - `SymbolIndex::definitions` / `search` — query latency on a large index
+//! These measure the `hearth-graph` pipeline through the octorus compatibility
+//! facade that backs file outline, workspace symbol search, and Go to Definition:
+//! - `extract_symbols` — Hearth extraction plus conversion to octorus public types
+//! - `SymbolIndex::from_files` — facade conversion and Hearth index construction
+//! - `SymbolIndex::definitions` / `search` — Hearth queries plus ref projection
 //!
 //! Index build time is what the user waits on when opening the browser, and
 //! search latency is what they feel on every keystroke of a symbol query.
@@ -154,9 +154,9 @@ fn bench_index_queries(c: &mut Criterion) {
         b.iter(|| black_box(index.definitions(black_box("no_such_symbol_anywhere"))));
     });
 
-    // `search` memoises the last (needle, limit) pair, so repeating one query
-    // measures rebuilding `SymbolRef`s from the cache — not the scan. Both
-    // paths matter and the names must say which is which: the overlay redraws
+    // Hearth memoises the last (needle, limit) pair, so repeating one query
+    // measures rebuilding and projecting `SymbolRef`s from the cache — not the
+    // scan. Both paths matter and the names must say which is which: the overlay redraws
     // through the cached path on every frame, and takes the cold path once per
     // keystroke.
     for query in ["h", "handle", "handle_request_2500", "hrq"] {
