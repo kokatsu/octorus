@@ -96,8 +96,10 @@ fn assert_browse_frames_are_comparable(small: &[String], huge: &[String]) {
     let huge_lines = visible_file_lines(huge);
     assert_eq!(small_lines, huge_lines);
     assert_eq!(small_lines.len(), 18);
-    assert_eq!(small_lines.first(), Some(&101));
-    assert_eq!(small_lines.last(), Some(&118));
+    // Browse scrolling keeps the cursor (line 101) inside the configured
+    // margin, so an 18-row viewport starts eight lines above it.
+    assert_eq!(small_lines.first(), Some(&93));
+    assert_eq!(small_lines.last(), Some(&110));
 
     let small_title_row = small
         .iter()

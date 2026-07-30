@@ -1,200 +1,220 @@
 # Symbol Index — Technical Reference
 
-The details of the tree-sitter-tags-based symbol engine implemented in
-`src/symbols.rs`. Read this when adding a language or adjusting queries.
+The Repository Browser symbol engine is exposed by `src/symbols.rs`, an
+octorus-owned compatibility facade over the exact crates.io dependency
+`hearth-graph = "=0.1.1"`.
 
-## 1. What it does
+Read this document when changing the facade, adding a symbol language, or
+upgrading Hearth. The browser architecture and task lifecycle remain documented
+in [`repo-browse-architecture.md`](repo-browse-architecture.md).
 
-It runs tree-sitter's `tags.scm` queries against the CST and extracts symbols
-from pairs of `@definition.*` captures and `@name` captures. This is the same
-query asset GitHub's code navigation ("Go to definition" / "Find all
-references") uses.
+## 1. Ownership and data flow
 
-```
-source ──parse──> Tree ──Query(tags.scm)──> QueryMatch*
-                                              │
-                            ┌─────────────────┴──────────────────┐
-                            │ @name           → name and position │
-                            │ @definition.xxx → kind and range    │
-                            └─────────────────┬──────────────────┘
-                                              ↓
-                              collapse_duplicate_tags()   ← dedupe per name node
-                                              ↓
-                              sort (start_byte asc, end_byte desc)
-                                              ↓
-                              containment stack computes depth
-                                              ↓
-                                        Vec<Symbol>
-```
+Hearth owns parsing, tags-query execution, duplicate collapse, nesting,
+repository index construction, search scoring, search memoization, and
+definition ranking. octorus owns the public API consumed by the browser:
 
-`Symbol` is `{ name, kind, line (1-based), column (0-based chars), depth }`.
-
-## 2. Where each language's tags query comes from
-
-Returned by `SupportedLanguage::tags_query()` (`src/language.rs`).
-
-| Language | Source | Notes |
-|----------|--------|-------|
-| Rust | `tree_sitter_rust::TAGS_QUERY` | 14 patterns |
-| TypeScript / TSX | **JS + TS concatenated** (`TYPESCRIPT_COMBINED_TAGS_QUERY`) | pitfall 2 below |
-| JavaScript / JSX | `tree_sitter_javascript::TAGS_QUERY` | 11 patterns |
-| Go | `tree_sitter_go::TAGS_QUERY` | |
-| Python | `tree_sitter_python::TAGS_QUERY` | |
-| Ruby | `tree_sitter_ruby::TAGS_QUERY` | |
-| C | `tree_sitter_c::TAGS_QUERY` | |
-| C++ | `tree_sitter_cpp::TAGS_QUERY` | **Self-contained**. No concatenation with C needed (unlike highlights) |
-| Java | `tree_sitter_java::TAGS_QUERY` | |
-| Lua | `tree_sitter_lua::TAGS_QUERY` | |
-| PHP | `tree_sitter_php::TAGS_QUERY` | |
-| Swift | `tree_sitter_swift::TAGS_QUERY` | |
-| C# | `src/queries/c_sharp/tags.scm` | the crate ships `queries/tags.scm` but exports no constant |
-| Zig | `src/queries/zig/tags.scm` | no upstream tags.scm |
-| Bash | `src/queries/bash/tags.scm` | no upstream tags.scm |
-| Haskell | `src/queries/haskell/tags.scm` | no upstream tags.scm |
-| MoonBit | `src/queries/moonbit/tags.scm` | vendored grammar |
-| Markdown | `src/queries/markdown/tags.scm` | turns headings into an outline |
-| Svelte / Vue / CSS / MarkdownInline | `None` | deliberate. An SFC's `<script>` belongs to the embedded language; CSS has no named entities |
-
-The `None` set is pinned by the test
-`test_languages_without_tags_query_are_intentional`. Update that test when you
-add a language — it is the guard against "accidentally left unsupported".
-
-## 3. Pitfalls hit during implementation (important)
-
-### 3.1 `Query::new` accepts the tags.scm directives
-
-`tags.scm` files contain directives specific to the `tree-sitter-tags` crate,
-such as `#strip!` / `#select-adjacent!` / `#not-eq?`. `tree_sitter::Query::new`
-accepts these as general predicates and does not fail to compile. Therefore
-**no dependency on the `tree-sitter-tags` crate is needed** — a bare `Query` +
-`QueryCursor` suffices.
-
-(Nothing depends on whether text predicates like `#not-eq?` are evaluated at
-runtime. If they are not, the only consequence is one extra symbol — nothing
-breaks.)
-
-### 3.2 TypeScript's TAGS_QUERY assumes it inherits JavaScript
-
-`tree_sitter_typescript::TAGS_QUERY` contains only the TS-specific patterns
-(`function_signature`, `interface_declaration`, `module`, etc.).
-`class_declaration` and `function_declaration` live on the JavaScript side.
-
-Without concatenation, `export class Widget {}` yields **not a single symbol**.
-This has exactly the same structure as `TYPESCRIPT_COMBINED_QUERY` for
-`HIGHLIGHTS_QUERY`, so `TYPESCRIPT_COMBINED_TAGS_QUERY` sits right next to it.
-
-C++ is the opposite: its `tags.scm` is self-contained (it carries both
-`class_specifier` and `struct_specifier` itself). Concatenating by analogy with
-the `highlights` habit produces duplicates — beware.
-
-### 3.3 Rust: the same node matches two patterns
-
-`tree-sitter-rust`'s tags.scm matches a function inside an impl block twice.
-
-```scm
-(declaration_list (function_item name: (identifier) @name) @definition.method)
-(function_item     name: (identifier) @name)                @definition.function
+```text
+source + path
+    │
+    ▼
+octorus ParserPool ──borrows──> hearth_graph::ParserPool
+    │
+    ▼
+hearth_graph::extract_symbols
+    │  CompactString / u32 / u16 + byte ranges
+    ▼
+src/symbols.rs compatibility conversion
+    │  String / usize
+    ▼
+Vec<octorus::symbols::Symbol>
 ```
 
-`@definition.method` and `@definition.function` land on **the same
-`function_item` node**. Processed naively,
+Repository construction follows the same boundary:
 
-- the outline shows `new` twice
-- the containment stack decides the node "contains itself" and depth splits into 0 and 1
-
-The countermeasure is `collapse_duplicate_tags()`. It keeps exactly one entry
-**keyed by the name node's byte offset**. Priority is the lexicographic order of
-`(kind_specificity, width of the definition node)`: `Method` is more specific
-than `Function`, and between equals the narrower range wins.
-
-### 3.4 Rust: `impl Foo` does not appear in the outline
-
-`(impl_item type: (type_identifier) @name !trait) @reference.implementation` —
-upstream treats it as a **reference**, not a definition. So the heading of an
-`impl` block never shows up in the outline; the methods inside are listed
-directly. This is an upstream design decision and octorus does not override it
-(to change it, swap in a custom query for Rust alone).
-
-### 3.5 Markdown: headings are siblings, so nesting is lost
-
-`atx_heading` nodes do not contain one another. The nesting lives in `section`.
-
-```scm
-; ✗ this puts everything at depth 0
-(atx_heading heading_content: (inline) @name) @definition.heading
-
-; ✓ capturing the section puts `##` beneath `#`
-(section (atx_heading heading_content: (inline) @name)) @definition.heading
+```text
+repo root + paths + local CancelSignal
+    │
+    ├─ FsLoader / BuildOptions / cancellation closure
+    ▼
+hearth_graph::build_index
+    │
+    ▼
+Hearth SymbolIndex + octorus projection
+    │
+    ├─ definitions(name)
+    ├─ search(query, limit)
+    └─ file_symbols(path)
 ```
 
-### 3.6 Zig: `const Foo = struct {}` is a variable_declaration
+The facade deliberately prevents Hearth storage choices from leaking into
+browser state, tests, or benchmarks.
 
-What looks like a type is expressed not as a type-declaration node but as a
-variable declaration whose initializer is a container declaration.
+## 2. Compatibility types and conversion rules
 
-```scm
-(variable_declaration (identifier) @name (struct_declaration)) @definition.class
+The octorus-facing types remain:
+
+```rust
+Symbol {
+    name: String,
+    kind: SymbolKind,
+    line: usize,
+    column: usize,
+    depth: usize,
+}
+
+FileSymbols {
+    path: String,
+    symbols: Vec<Symbol>,
+}
 ```
 
-### 3.7 Bash: only top-level assignments are picked up
+Hearth stores `CompactString`, `u32` line/column/byte offsets, and `u16` depth.
+Conversions from Hearth widen into octorus types. Conversions from synthetic or
+host-provided octorus fixtures use `u32::try_from` / `u16::try_from` and panic
+with a stable explanation when a value cannot be represented. Never replace
+these with `as`: truncation must not differ between debug and release builds.
 
-Capturing `variable_assignment` unconditionally floods the outline with
-function-local variables. The query is anchored with `(program ...)` to
-restrict it to the top level.
+`SymbolIndex` retains both:
 
-### 3.8 Haskell: one match per defining equation
+- the Hearth index used for every query;
+- an octorus-owned projection used to return `SymbolRef<'_>` with the original
+  `&str` / `&Symbol` API.
 
-A function defined by several equations (`f [] = ...` / `f (x:xs) = ...`)
-matches once per equation. This is absorbed after depth computation by
-**folding adjacent identical `(name, kind, depth)` entries into one**.
-"Adjacent only" is the important part: a method of the same name in a different
-impl block stays separate.
+Hearth query refs point into stable per-file symbol vectors. The facade records
+each Hearth symbol address in an `FxHashMap` whose value is the parallel
+`(file, symbol)` position, so hits are projected in O(1) without comparing names,
+hashing paths, or scanning a file outline. `SymbolIndex::from_files` fixtures
+have no source ranges, so their source-order position becomes a coherent
+synthetic one-byte range.
 
-### 3.9 tree-sitter columns are byte offsets
+## 3. Language registry
 
-`Node::start_position().column` returns a byte offset. octorus handles display
-width and cursor positions entirely in characters, so `char_column()` converts.
-It actually drifts with CJK identifiers, or when a line starts with a Japanese
-comment.
+`symbol_language_registry()` starts with `LanguageRegistry::bundled()` and then
+registers MoonBit through the public host API:
 
-## 4. Search scoring
+```rust
+LanguageSpec::new("moonbit", tree_sitter_moonbit::LANGUAGE.into(), ["mbt"])
+    .with_tags_query(MOONBIT_TAGS_QUERY)
+```
 
-`fuzzy_score_lowered(lowered_name, needle)`. It is **private**, and **both
-arguments are assumed already lowercased**. On the needle side,
-`LoweredNeedle` guarantees this at construction; on the name side,
-`from_files()` passes the precomputed `lowered_names` (so a keystroke does not
-lowercase every symbol one by one). There is no public API for scoring a single
-name; scores are observed only as the ordering `search()` returns.
+Last registration wins for an extension. MoonBit therefore remains an octorus
+host grammar without requiring a private Hearth field or a struct literal.
+`LanguageSpec` is non-exhaustive; always use its constructor/builders.
 
-| Tier | Score | Example (needle = `parse`) |
-|------|-------|---------------------------|
-| Exact match | 10,000 − length | `parse` |
-| Prefix match | 8,000 − length | `parse_line` |
-| Substring after a word boundary | 6,000 − position − length | `do_parse` (right after `_` `-` `.` `:`) |
-| Substring | 4,000 − position − length | `reparsed` |
-| Subsequence | 2,000 − min(gap, 1,000) − length | `please_advance_rest_of_set` |
+### Bundled by Hearth
 
-"Length" is `chars().count()` (not bytes). The 1,000 cap on the subsequence
-tier's gap is what keeps the tiers separated — without it, a scattered
-subsequence match could sink below the tier beneath it. Ties are broken by
-"shorter name → path order → line number" (so the rendered order does not change
-from run to run).
+| Language | Extensions used for symbols | Query ownership |
+|---|---|---|
+| Rust | `.rs` | Hearth / grammar crate |
+| TypeScript | `.ts`, `.mts`, `.cts` | Hearth combines JavaScript + TypeScript |
+| TSX | `.tsx` | Hearth combines JavaScript + TypeScript |
+| JavaScript | `.js`, `.mjs`, `.cjs` | Hearth / grammar crate |
+| JSX | `.jsx` | Hearth / grammar crate |
+| Go | `.go` | Hearth / grammar crate |
+| Python | `.py` | Hearth / grammar crate |
+| Ruby | `.rb`, `.rake`, `.gemspec` | Hearth / grammar crate |
+| C | `.c`, `.h` | Hearth / grammar crate |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` | Hearth / grammar crate |
+| Java | `.java` | Hearth / grammar crate |
+| C# | `.cs` | Hearth-bundled query |
+| Zig | `.zig` | Hearth-bundled query |
+| Bash | `.sh`, `.bash`, `.zsh` | Hearth-bundled query |
+| Haskell | `.hs`, `.lhs` | Hearth-bundled query |
+| Lua | `.lua` | Hearth / grammar crate |
+| PHP | `.php` | Hearth / grammar crate |
+| Swift | `.swift` | Hearth / grammar crate |
+| Markdown | `.md`, `.markdown` | Hearth-bundled query |
 
-`search(query, limit)` scores every entry, then cuts to `limit` entries with a
-**top-N partial selection via `select_nth_unstable_by`, not a full sort**,
-before ordering them (the measurements justifying this live in a comment inside
-the function). On top of that, the most recent `(needle, limit)` pair's result
-is memoized, so re-issuing the same query with the same limit does not rescan.
-**A different limit misses the memo** — adding extra call sites doesn't just
-recompute, the returned sets themselves diverge. The UI's single call site is
-`BrowseState::symbol_search_hits()`; rendering, selection clamping, and Enter
-resolution all go through it.
+### Registered by octorus
 
-The ordering of `definitions()` is separate — a priority of "which one do you
-want to jump to": types (Class/Interface/Type) → callables
-(Function/Method/Macro) → Constant/Module → Field/Property/Heading.
+| Language | Extensions | Query ownership |
+|---|---|---|
+| MoonBit | `.mbt` | `src/queries/moonbit/tags.scm` |
 
-## 5. Index construction
+Svelte, Vue, CSS, and MarkdownInline remain highlighting/injection languages,
+not standalone symbol languages. Their handling in `SupportedLanguage` is
+independent of the Hearth symbol registry.
+
+## 4. Parser and query reuse
+
+The existing `crate::syntax::ParserPool` still owns highlighting parsers and
+queries. It now also contains a `hearth_graph::ParserPool<'static>` tied to the
+static symbol registry. `extract_symbols` borrows that cache rather than
+constructing a registry, parser, or query for each call.
+
+Repository builds use Hearth's worker-local parser pools. They remain blocking
+and CPU-bound and must be called from `spawn_blocking`, never from the draw loop.
+
+## 5. Extraction behavior and grammar quirks
+
+These behaviors are implemented upstream but remain user-visible contracts for
+octorus.
+
+### TypeScript inherits JavaScript tags
+
+The TypeScript tags query contains only TypeScript-specific patterns. Hearth
+combines it with the JavaScript query; otherwise ordinary classes and functions
+would disappear. C++ is the opposite: its tags query is self-contained and must
+not be concatenated with C.
+
+### Rust duplicate captures
+
+A function inside an `impl` can match both `@definition.method` and
+`@definition.function`. Hearth collapses captures by the name node byte offset,
+preferring the more specific kind and then the narrower definition span.
+`impl Foo` itself remains an upstream reference rather than an outline
+definition, so methods appear at top level.
+
+### Haskell equations
+
+Haskell is registered with
+`with_merge_adjacent_same_name_definitions(true)`. Consecutive equations such as
+`describe 0 = ...` and `describe value = ...` become one logical symbol.
+Ordinary sibling overloads in other languages are preserved.
+
+### Markdown nesting
+
+Markdown headings capture their enclosing `section`, not only the heading node.
+That gives `##` and `###` their expected outline depth.
+
+### Character columns
+
+tree-sitter reports byte columns. Hearth converts the prefix to characters, so
+CJK and accented identifiers agree with octorus cursor coordinates. The facade
+widens the resulting `u32` character column to `usize`.
+
+### Deterministic ordering
+
+Hearth sorts raw tags by definition start, outer definition first, line, name,
+and finally name-byte offset. The final key is an intentional difference from
+the former `HashMap` iteration corner case and guarantees deterministic output.
+
+## 6. Search and definitions
+
+`SymbolIndex::search(query, limit)` delegates ranking and top-N selection to
+Hearth. The observable tiers remain:
+
+| Tier | Example for `parse` |
+|---|---|
+| Exact | `parse` |
+| Prefix | `parse_line` |
+| Boundary substring | `do_parse` |
+| Other substring | `reparsed` |
+| Subsequence | `please_advance_rest_of_set` |
+
+Ties use shorter name, path, line, and stable index position. Hearth performs a
+top-N partial selection before sorting and memoizes the latest `(needle, limit)`
+pair. The octorus facade only projects the returned refs; it must not rescore or
+resort them.
+
+`definitions(name)` remains case-insensitive and prefers types, then callables,
+then constants/modules, then fields/properties/headings, followed by depth,
+path, and line.
+
+## 7. Repository build and cancellation
+
+The compatibility entry point remains:
 
 ```rust
 SymbolIndex::build_cancellable(
@@ -204,135 +224,76 @@ SymbolIndex::build_cancellable(
 ) -> IndexBuild
 ```
 
-There is no non-cancellable `build`. The return type is `IndexBuild`, not
-`SymbolIndex`, so the caller can render the three outcomes distinctly.
+The local trait is adapted with a closure, so browser code does not expose
+Hearth's cancellation trait. `CancellationToken` continues to implement the
+local seam.
 
-| Variant | Meaning | Screen |
-|---|---|---|
-| `Completed(SymbolIndex)` | every indexable path was walked | `IndexState::Ready` |
-| `Cancelled { scanned_files }` | the signal fired mid-run (overtaken by a newer build) | draw nothing; send nothing on the channel |
-| `Failed { message }` | it could not run at all — the repo root vanished / a worker panicked | error banner |
+Build options retain the octorus limits:
 
-Having `Failed` is the point: it avoids swallowing a worker panic and passing
-off "an index with fewer symbols" as success.
+- maximum file size: `MAX_INDEXED_FILE_BYTES = 2 MiB`;
+- maximum workers: 8;
+- maximum symbols per file: Hearth's `MAX_SYMBOLS_PER_FILE = 10,000`.
 
-`cancel` is a `&dyn CancelSignal` rather than a
-`tokio_util::sync::CancellationToken` **so that polling granularity is
-testable**. Pass a test signal that fires "after N polls" and you can pin down
-how many files a cancelled build touches without depending on wall-clock time.
-`CancellationToken` has an implementation of the trait.
+Outcomes remain `Completed`, `Cancelled { scanned_files }`, and
+`Failed { message }`. Unsupported, oversized, missing, and unreadable individual
+files are skipped. Root verification and worker panics are failures.
 
-- Blocking, CPU-bound. **Always call it from `spawn_blocking`** (never from the draw loop)
-- Eligible files: `supports_symbols()` is true, regular file, at most `MAX_INDEXED_FILE_BYTES = 2 MiB`
-- Two polling sites: the metadata prefilter every `PREFILTER_CANCEL_POLL_INTERVAL`,
-  and each worker inside `index_chunk`. Stopping at the former means `scanned_files` is 0
-- Worker count is `available_parallelism().clamp(1, 8)`, further capped by the
-  number of indexable files. Work is split under `std::thread::scope`, one
-  `ParserPool` per worker (to reuse parsers and compiled queries)
-- Chunks complete in arbitrary order, so results are re-sorted by path — to keep
-  snapshots and search results deterministic
+## 8. Intentional compatibility differences
 
-No parallel runtime like rayon was added. `thread::scope` is enough.
+These differences are accepted by issue #177 and must remain explicit:
 
-## 6. Measured numbers
+- duplicate input paths are last-wins;
+- successfully analyzed files with no symbols remain addressable as `Some(&[])`;
+- Hearth uses `parking_lot`, so there is no mutex-poison recovery contract;
+- raw symbol ordering includes the name-byte tie breaker;
+- `.mjs`, `.cjs`, `.mts`, and `.cts` are symbol-indexable;
+- root error wording may refer to a source root rather than a repository root;
+- direct extraction of source larger than `u32::MAX` bytes returns no symbols;
+- checked facade narrowing rejects synthetic values outside Hearth's integer
+  ranges instead of truncating them.
 
-**Only values reproducible via `benches/symbol_index.rs` go in this table.** It
-used to carry ad-hoc numbers from "measured octorus itself once"; with no
-reproduction procedure, the `search` implementation then changed from a full
-sort to top-N partial selection + memoization and nobody could follow up.
+Any additional divergence requires a compatibility test and an update here.
 
-Synthetic index (5,000 files × 20 symbols = 100,000 symbols, release build,
-measured on this machine with `--warm-up-time 1 --measurement-time 3`,
-Criterion median estimates):
+## 9. Benchmarks
 
-| Operation | Measured |
-|-----------|----------|
-| `from_files` (5,000 files / 100,000 symbols) | 8.48 ms |
-| `definitions` hit | 39.6 ns |
-| `definitions` miss | 27.0 ns |
-| `search_cached` (`h` / `handle` / `hrq`) | 462 / 462 / 465 ns |
-| `search_cached` (`handle_request_2500`) | 290 ns |
-| `search_cold` (`h` / `handle` / `hrq`) | 1.66 / 1.73 / 3.17 ms |
-| `search_cold` (`handle_request_2500`) | 6.99 ms |
+`benches/symbol_index.rs` measures the public facade, not Hearth directly:
 
-**`search_cached` and `search_cold` are different things — do not conflate
-them.** Memoization keys on `(needle, limit)`, so a `b.iter` that repeats the
-same query measures not a scan but "the cost of rehydrating the cached 200
-entries into `SymbolRef`s". Both are meaningful — the overlay takes the cached
-path every frame, and the cold path runs once per keystroke. The gap is
-3,500×, so mixing up the names means missing a regression entirely.
-`search_cold` defeats the memo by alternating the limit by 1.
+- `extract_symbols_rust/{10,50,200,1000}`;
+- `extract_symbols_language/{rust,typescript,markdown}`;
+- `from_files/{100,1000,5000}`;
+- `query/{definitions_hit,definitions_miss,search_cached/*,search_cold/*}`.
 
-`handle_request_2500` is the slowest cold case because a longer needle makes the
-`find` and the subsequence walk over all 100k symbols heavier, and the smaller
-hit count does not make up for it.
+`search_cached` includes Hearth cache lookup plus octorus ref projection.
+`search_cold` alternates the limit to force rescoring. Do not compare these two
+as if they measured the same path.
 
-### Properties not protected by automated gates
-
-- **The `lowered_names` precomputation**: `from_files()` caches the lowercased
-  names because re-lowercasing inside `fuzzy_score_lowered` would **allocate one
-  String per candidate**. On a 100k-symbol index that is 100k allocations per
-  keystroke. But **the results are exactly identical**, so removing the cache
-  fails not a single test (measured in a revert sweep). Case-insensitive
-  matching itself is pinned by the
-  `test_search_is_case_insensitive_in_both_directions` family, but what it
-  guards is correctness, not cost (what
-  `test_search_is_case_insensitive_for_queries` looks at is the match results).
-  To see the regression, run the `search_cold` bench.
-
-- **Worker panics taking precedence over cancellation**: `build_cancellable`
-  `return`s `IndexBuild::Failed` the moment it finds a join error while walking
-  `outcomes`, and the `stopped_early` check happens only after that loop.
-  Structurally, a panic therefore always beats cancellation. Swap that order
-  and a panic that coincides with cancellation gets reported as `Cancelled`,
-  which the caller (the empty arm in `start_symbol_index_build`) throws away —
-  no banner, the panic fully swallowed. **No test pins this order** — a
-  deterministic reproduction would need one worker to panic while only another
-  gets cancelled, and which worker consumes which poll is thread-schedule
-  dependent. When reordering, verify it yourself.
-
-`benches/symbol_index.rs` holds the Criterion benches:
+Run:
 
 ```bash
 cargo bench --bench symbol_index
 ```
 
-Four measured groups:
-- `extract_symbols_rust/{10,50,200,1000}` — throughput by file size
-- `extract_symbols_language/{rust,typescript,markdown}` — by language
-- `from_files/{100,1000,5000}` — index construction (up to 100k symbols)
-- `query/{definitions_hit,definitions_miss,search_cached/*,search_cold/*}` — query latency
+Historic timings from the octorus-owned implementation are not baseline values
+for the facade because conversion and projection changed the measured boundary.
+Record new numbers only from a reproducible Criterion run and include the exact
+Hearth version.
 
-CI (`.github/workflows/benchmark.yml`) currently runs only `ui_rendering` and
-`diff_parsing`. To put `symbol_index` under regression watch, add it there.
+## 10. Adding a symbol language
 
-## 7. How to add a language
+1. Prefer adding the grammar/query to Hearth when it is generally useful.
+2. For an octorus-only grammar, add the grammar dependency and query asset.
+3. Register it after `LanguageRegistry::bundled()` with `LanguageSpec` builders.
+4. Add extraction and `supports_symbols` compatibility tests.
+5. Confirm every registered query compiles through Hearth's `ParserPool`.
+6. Update the language tables and run `cargo bench --bench symbol_index`.
 
-1. Add the grammar crate to `Cargo.toml` and a variant to `SupportedLanguage`
-   (fill in all of `from_extension` / `default_extension` / `ts_language` /
-   `highlights_query` / `keywords` / `definition_prefixes` / `all()`; the
-   compiler reports what you missed)
-2. If the crate exports a `TAGS_QUERY`, return it from `tags_query()`
-3. If not, write `src/queries/<lang>/tags.scm` and embed it with `include_str!`
-   - The fastest way to check node names is `Parser::parse()` and dump the tree with `to_sexp()`
-   - Use `@definition.*` names that `SymbolKind::from_capture()` knows. Unknown
-     names are **silently dropped** (the judgement being that showing nothing
-     beats showing a wrong icon)
-4. Confirm `test_all_tags_queries_compile` passes (it catches query compile errors)
-5. Update the expectations of `test_languages_without_tags_query_are_intentional`
-6. Add one inline snapshot test for the extraction results
+Do not restore tags-query ownership to `SupportedLanguage`; highlighting and
+symbol registration intentionally have separate owners now.
 
-## 8. Relationship to the existing `src/symbol.rs`
+## 11. Relationship to `src/symbol.rs`
 
-`src/symbol.rs` is not deleted. The roles differ:
-
-| | `src/symbol.rs` (existing) | `src/symbols.rs` (new) |
-|---|---|---|
-| Technique | definition-keyword prefix match + `rg`/`grep` | tags queries over the CST |
-| Scope | inside the PR's patch / repository grep | the whole indexed repository |
-| Used by | `gd` in the diff view | `gd` / `o` / `s` in Repo Browse |
-| False positives | hits same-named tokens in comments and strings | does not |
-| Preparation | none (instant) | index build (background, hundreds of ms) |
-
-The diff view's `gd` could eventually lean on the index too, but the diff view's
-value is "works instantly with no index", so replace it with care.
+`src/symbol.rs` still provides the lightweight keyword/grep navigation used by
+the diff view. `src/symbols.rs` is the repository-wide CST index used by Repo
+Browse (`gd`, outline, and symbol search). Replacing the former with the latter
+would remove the diff view's instant no-index fallback and is outside this
+integration.

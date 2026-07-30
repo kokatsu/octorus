@@ -63,20 +63,6 @@ static TYPESCRIPT_COMBINED_QUERY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// Combined TypeScript tags query (JavaScript base + TypeScript-specific).
-///
-/// Mirrors [`TYPESCRIPT_COMBINED_QUERY`]: `tree-sitter-typescript`'s tags query
-/// only declares signatures, interfaces and modules, and inherits classes and
-/// functions from JavaScript. Without the JavaScript half, `class Widget {}`
-/// produces no symbol at all.
-static TYPESCRIPT_COMBINED_TAGS_QUERY: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{}\n{}",
-        tree_sitter_javascript::TAGS_QUERY,
-        tree_sitter_typescript::TAGS_QUERY
-    )
-});
-
 /// Combined C++ highlights query (C base + C++-specific).
 ///
 /// C++'s HIGHLIGHT_QUERY only contains C++-specific patterns (class, virtual, etc.)
@@ -121,14 +107,6 @@ static VUE_COMBINED_QUERY: LazyLock<String> = LazyLock::new(|| {
 
 /// C# highlights query (bundled as tree-sitter-c-sharp doesn't export it).
 const CSHARP_HIGHLIGHTS_QUERY: &str = include_str!("queries/c_sharp/highlights.scm");
-
-/// Tags queries bundled by octorus for grammars that ship none upstream.
-const CSHARP_TAGS_QUERY: &str = include_str!("queries/c_sharp/tags.scm");
-const ZIG_TAGS_QUERY: &str = include_str!("queries/zig/tags.scm");
-const BASH_TAGS_QUERY: &str = include_str!("queries/bash/tags.scm");
-const HASKELL_TAGS_QUERY: &str = include_str!("queries/haskell/tags.scm");
-const MOONBIT_TAGS_QUERY: &str = include_str!("queries/moonbit/tags.scm");
-const MARKDOWN_TAGS_QUERY: &str = include_str!("queries/markdown/tags.scm");
 
 /// All definition prefixes from all supported languages, deduplicated.
 static ALL_DEFINITION_PREFIXES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -352,44 +330,6 @@ impl SupportedLanguage {
             // Phase 4: Markdown (block + inline)
             Self::Markdown => tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
             Self::MarkdownInline => tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
-        }
-    }
-
-    /// Get the tags query for this language, if symbol extraction is supported.
-    ///
-    /// Tags queries drive the symbol index (file outline, workspace symbol
-    /// search, Go to Definition). Most grammars ship a `tags.scm` upstream and
-    /// export it as `TAGS_QUERY`; for the rest octorus bundles its own under
-    /// `src/queries/<lang>/tags.scm`.
-    ///
-    /// Returns `None` for languages with no meaningful named entities (CSS) or
-    /// where the grammar is only used as an injection target
-    /// (`MarkdownInline`) or an SFC wrapper (Svelte/Vue — their `<script>`
-    /// blocks are handled by the embedded language).
-    pub fn tags_query(&self) -> Option<&'static str> {
-        match self {
-            Self::Rust => Some(tree_sitter_rust::TAGS_QUERY),
-            Self::TypeScript | Self::TypeScriptReact => {
-                Some(TYPESCRIPT_COMBINED_TAGS_QUERY.as_str())
-            }
-            Self::JavaScript | Self::JavaScriptReact => Some(tree_sitter_javascript::TAGS_QUERY),
-            Self::Go => Some(tree_sitter_go::TAGS_QUERY),
-            Self::Python => Some(tree_sitter_python::TAGS_QUERY),
-            Self::Ruby => Some(tree_sitter_ruby::TAGS_QUERY),
-            Self::C => Some(tree_sitter_c::TAGS_QUERY),
-            Self::Cpp => Some(tree_sitter_cpp::TAGS_QUERY),
-            Self::Java => Some(tree_sitter_java::TAGS_QUERY),
-            Self::Lua => Some(tree_sitter_lua::TAGS_QUERY),
-            Self::Php => Some(tree_sitter_php::TAGS_QUERY),
-            Self::Swift => Some(tree_sitter_swift::TAGS_QUERY),
-            // Bundled locally: upstream ships no tags.scm (or does not export it)
-            Self::CSharp => Some(CSHARP_TAGS_QUERY),
-            Self::Zig => Some(ZIG_TAGS_QUERY),
-            Self::Bash => Some(BASH_TAGS_QUERY),
-            Self::Haskell => Some(HASKELL_TAGS_QUERY),
-            Self::MoonBit => Some(MOONBIT_TAGS_QUERY),
-            Self::Markdown => Some(MARKDOWN_TAGS_QUERY),
-            Self::Svelte | Self::Vue | Self::Css | Self::MarkdownInline => None,
         }
     }
 
