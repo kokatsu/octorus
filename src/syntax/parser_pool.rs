@@ -47,6 +47,15 @@ impl ParserPool {
         &mut self.symbol_parsers
     }
 
+    /// Get or create the compiled tags query for a supported symbol language.
+    ///
+    /// This preserves the public octorus API while delegating query ownership
+    /// and caching to Hearth. Languages without symbol support return `None`.
+    pub fn get_or_create_tags_query(&mut self, lang: SupportedLanguage) -> Option<&Query> {
+        let id = crate::symbols::symbol_language_id(lang.default_extension())?;
+        self.symbol_parsers.tags_query(id)
+    }
+
     /// Get or create a compiled highlight query for the given language.
     ///
     /// Queries are cached to avoid recompilation overhead on each use.

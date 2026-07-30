@@ -333,6 +333,17 @@ impl SupportedLanguage {
         }
     }
 
+    /// Get the tags query for this language, if symbol extraction is supported.
+    ///
+    /// This compatibility accessor reads from the Hearth language registry, so
+    /// symbol-query ownership remains centralized there. It returns `None` for
+    /// highlighting-only languages such as CSS and SFC wrappers.
+    pub fn tags_query(&self) -> Option<&'static str> {
+        let registry = crate::symbols::symbol_language_registry();
+        let id = crate::symbols::symbol_language_id(self.default_extension())?;
+        registry.get(id)?.tags_query.as_deref()
+    }
+
     /// Get the definition keyword prefixes for this language.
     ///
     /// Each entry is a keyword (including trailing space) that precedes a symbol

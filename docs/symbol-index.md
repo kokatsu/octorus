@@ -48,7 +48,11 @@ Hearth SymbolIndex + octorus projection
 ```
 
 The facade deliberately prevents Hearth storage choices from leaking into
-browser state, tests, or benchmarks.
+browser state, tests, or benchmarks. The previously public
+`SupportedLanguage::tags_query` and `ParserPool::get_or_create_tags_query`
+methods remain available as compatibility accessors; both resolve through this
+same registry and Hearth query cache rather than restoring local query
+ownership.
 
 ## 2. Compatibility types and conversion rules
 
@@ -91,16 +95,23 @@ synthetic one-byte range.
 ## 3. Language registry
 
 `symbol_language_registry()` starts with `LanguageRegistry::bundled()` and then
-registers MoonBit through the public host API:
+applies two host registrations through the public API:
 
 ```rust
+LanguageSpec::new("c", tree_sitter_c::LANGUAGE.into(), ["c", "h"])
+    .with_tags_query(tree_sitter_c::TAGS_QUERY)
+    .with_merge_adjacent_same_name_definitions(true)
+
 LanguageSpec::new("moonbit", tree_sitter_moonbit::LANGUAGE.into(), ["mbt"])
     .with_tags_query(MOONBIT_TAGS_QUERY)
 ```
 
-Last registration wins for an extension. MoonBit therefore remains an octorus
-host grammar without requiring a private Hearth field or a struct literal.
-`LanguageSpec` is non-exhaustive; always use its constructor/builders.
+Last registration wins for an extension. The C override preserves the former
+octorus behavior for function-like macro definitions whose query captures the
+same macro identifier on adjacent definitions; ordinary non-adjacent symbols
+remain distinct. MoonBit remains an octorus host grammar without requiring a
+private Hearth field or a struct literal. `LanguageSpec` is non-exhaustive;
+always use its constructor/builders.
 
 ### Bundled by Hearth
 
@@ -114,7 +125,7 @@ host grammar without requiring a private Hearth field or a struct literal.
 | Go | `.go` | Hearth / grammar crate |
 | Python | `.py` | Hearth / grammar crate |
 | Ruby | `.rb`, `.rake`, `.gemspec` | Hearth / grammar crate |
-| C | `.c`, `.h` | Hearth / grammar crate |
+| C | `.c`, `.h` | grammar-crate query, re-registered by octorus to enable legacy adjacent-definition merging |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` | Hearth / grammar crate |
 | Java | `.java` | Hearth / grammar crate |
 | C# | `.cs` | Hearth-bundled query |

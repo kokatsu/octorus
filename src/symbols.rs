@@ -10,8 +10,8 @@ use std::sync::LazyLock;
 
 use hearth_graph::{
     BuildOptions, FileSymbols as HearthFileSymbols, FsLoader, IndexBuild as HearthIndexBuild,
-    LanguageRegistry, LanguageSpec, Symbol as HearthSymbol, SymbolIndex as HearthSymbolIndex,
-    SymbolKind as HearthSymbolKind, SymbolRef as HearthSymbolRef,
+    LanguageId, LanguageRegistry, LanguageSpec, Symbol as HearthSymbol,
+    SymbolIndex as HearthSymbolIndex, SymbolKind as HearthSymbolKind, SymbolRef as HearthSymbolRef,
 };
 use rustc_hash::FxHashMap;
 
@@ -28,6 +28,16 @@ const MOONBIT_TAGS_QUERY: &str = include_str!("queries/moonbit/tags.scm");
 /// Hearth's bundled registry plus the host-owned MoonBit grammar.
 static SYMBOL_LANGUAGES: LazyLock<LanguageRegistry> = LazyLock::new(|| {
     let mut registry = LanguageRegistry::bundled();
+
+    // The former octorus extractor merged adjacent same-name definitions for
+    // every language. C needs that compatibility behavior for function-like
+    // macro declarations such as tree_sitter_external_scanner(reset), whose
+    // tags query captures the macro identifier for each generated function.
+    registry.register(
+        LanguageSpec::new("c", tree_sitter_c::LANGUAGE.into(), ["c", "h"])
+            .with_tags_query(tree_sitter_c::TAGS_QUERY)
+            .with_merge_adjacent_same_name_definitions(true),
+    );
     registry.register(
         LanguageSpec::new("moonbit", tree_sitter_moonbit::LANGUAGE.into(), ["mbt"])
             .with_tags_query(MOONBIT_TAGS_QUERY),
@@ -38,6 +48,24 @@ static SYMBOL_LANGUAGES: LazyLock<LanguageRegistry> = LazyLock::new(|| {
 /// Registry shared by the facade and the symbol parser cache.
 pub(crate) fn symbol_language_registry() -> &'static LanguageRegistry {
     &SYMBOL_LANGUAGES
+}
+
+/// Resolve an extension to its last-registered symbol language.
+///
+/// Iterating rather than constructing a synthetic path keeps compatibility
+/// accessors allocation-free while preserving the registry's last-wins rule.
+pub(crate) fn symbol_language_id(extension: &str) -> Option<LanguageId> {
+    let mut found = None;
+    for (id, spec) in SYMBOL_LANGUAGES.iter() {
+        if spec
+            .extensions
+            .iter()
+            .any(|candidate| candidate.as_str() == extension)
+        {
+            found = Some(id);
+        }
+    }
+    found
 }
 
 /// A cooperative cancellation signal used by octorus background work.
@@ -568,6 +596,32 @@ func (c *Config) Load() {}
 func main() {}
 ";
         assert_eq!(names(source, "main.go"), ["Config", "Load", "main"]);
+    }
+
+    #[test]
+    fn test_extract_c_merges_macro_generated_function_names() {
+        let scanner = include_str!("../crates/tree-sitter-moonbit/src/scanner.c");
+        let generated: Vec<_> = outline(scanner, "scanner.c")
+            .into_iter()
+            .filter(|(name, ..)| name == "tree_sitter_external_scanner")
+            .collect();
+
+        insta::assert_debug_snapshot!(generated, @r#"
+        [
+            (
+                "tree_sitter_external_scanner",
+                Function,
+                63,
+                0,
+            ),
+            (
+                "tree_sitter_external_scanner",
+                Function,
+                396,
+                0,
+            ),
+        ]
+        "#);
     }
 
     #[test]
