@@ -5,6 +5,7 @@
 pub mod ai;
 pub mod app;
 pub mod cache;
+pub mod code_index;
 pub mod config;
 pub mod diff;
 pub mod diff_store;
@@ -16,6 +17,7 @@ pub mod headless;
 pub mod keybinding;
 pub mod language;
 pub mod loader;
+pub mod module_graph;
 pub mod symbol;
 pub mod symbols;
 pub mod syntax;

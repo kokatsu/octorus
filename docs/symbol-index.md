@@ -30,7 +30,7 @@ src/symbols.rs compatibility conversion
 Vec<octorus::symbols::Symbol>
 ```
 
-Repository construction follows the same boundary:
+The public symbols-only compatibility build follows the same boundary:
 
 ```text
 repo root + paths + local CancelSignal
@@ -46,6 +46,14 @@ Hearth SymbolIndex + octorus projection
     ├─ search(query, limit)
     └─ file_symbols(path)
 ```
+
+The Repository Browser itself uses `src/code_index.rs` instead: one
+`hearth_graph::analyze_paths` pass extracts symbols and imports from the same
+syntax trees, then feeds `SymbolIndex::from_analyses_cancellable` and the module
+graph.
+Never replace that path with separate `build_index` + `analyze_paths` calls;
+that would parse the repository twice. Import ownership and guarantees are in
+[`module-graph.md`](module-graph.md).
 
 The facade deliberately prevents Hearth storage choices from leaking into
 browser state, tests, or benchmarks. The previously public
@@ -154,8 +162,10 @@ queries. It now also contains a `hearth_graph::ParserPool<'static>` tied to the
 static symbol registry. `extract_symbols` borrows that cache rather than
 constructing a registry, parser, or query for each call.
 
-Repository builds use Hearth's worker-local parser pools. They remain blocking
-and CPU-bound and must be called from `spawn_blocking`, never from the draw loop.
+Repository builds use Hearth's worker-local parser pools. Both the public
+symbols-only build and the Browser's combined symbol/import build remain
+blocking and CPU-bound and must be called from `spawn_blocking`, never from the
+draw loop.
 
 ## 5. Extraction behavior and grammar quirks
 
@@ -249,6 +259,11 @@ Outcomes remain `Completed`, `Cancelled { scanned_files }`, and
 `Failed { message }`. Unsupported, oversized, missing, and unreadable individual
 files are skipped. Root verification and worker panics are failures.
 
+`CodeIndex::build_cancellable` adapts the same local cancellation seam to
+`analyze_paths`. It polls cancellation again while folding completed analyses
+into graph nodes. Cancellation at either stage publishes neither index; the UI
+channel has no partial-result variant.
+
 ## 8. Intentional compatibility differences
 
 These differences are accepted by issue #177 and must remain explicit:
@@ -283,6 +298,10 @@ Run:
 ```bash
 cargo bench --bench symbol_index
 ```
+
+The Browser's combined parse/build boundary and module queries are measured
+separately by `benches/module_graph.rs`; see
+[`module-graph.md`](module-graph.md#7-performance).
 
 Historic timings from the octorus-owned implementation are not baseline values
 for the facade because conversion and projection changed the measured boundary.

@@ -73,6 +73,7 @@ pub struct KeybindingsConfig {
     pub repo_browse: KeySequence,
     pub symbol_outline: KeySequence,
     pub symbol_search: KeySequence,
+    pub module_graph: KeySequence,
     pub toggle_blame: KeySequence,
     pub open_blame_commit: KeySequence,
     pub open_blame_pr: KeySequence,
@@ -158,6 +159,7 @@ impl Default for KeybindingsConfig {
             repo_browse: KeySequence::single(KeyBinding::char('b')),
             symbol_outline: KeySequence::single(KeyBinding::char('o')),
             symbol_search: KeySequence::single(KeyBinding::char('s')),
+            module_graph: KeySequence::single(KeyBinding::char('i')),
             toggle_blame: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('b')),
             open_blame_commit: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('c')),
             open_blame_pr: KeySequence::double(KeyBinding::char('g'), KeyBinding::char('p')),
@@ -187,7 +189,7 @@ impl KeybindingsConfig {
     /// - Duplicate keybindings for different actions
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        let mut single_keys: HashMap<KeyBinding, &str> = HashMap::new();
+        let mut single_keys: HashMap<KeyBinding, Vec<&str>> = HashMap::new();
         let mut sequence_prefixes: HashMap<KeyBinding, Vec<&str>> = HashMap::new();
         let mut exact_sequences: HashMap<Vec<KeyBinding>, Vec<(&str, bool)>> = HashMap::new();
 
@@ -244,6 +246,7 @@ impl KeybindingsConfig {
             ("repo_browse", &self.repo_browse),
             ("symbol_outline", &self.symbol_outline),
             ("symbol_search", &self.symbol_search),
+            ("module_graph", &self.module_graph),
             ("toggle_blame", &self.toggle_blame),
             ("open_blame_commit", &self.open_blame_commit),
             ("open_blame_pr", &self.open_blame_pr),
@@ -267,15 +270,17 @@ impl KeybindingsConfig {
                 continue;
             }
 
-            for (sequence_index, keys) in seq.all_sequences().enumerate() {
+            for keys in seq.all_sequences() {
                 if keys.is_empty() {
                     errors.push(format!("keybinding '{}' has an empty alternative", name));
                     continue;
                 }
-                let is_primary_single = sequence_index == 0 && seq.is_single();
-                let owners = exact_sequences.entry(keys.to_vec()).or_default();
-                for (existing, existing_is_primary_single) in owners.iter() {
-                    if is_primary_single && *existing_is_primary_single {
+                let is_single = keys.len() == 1;
+                let exact_owners = exact_sequences.entry(keys.to_vec()).or_default();
+                for (existing, existing_is_single) in exact_owners.iter() {
+                    // Single-key duplicates are diagnosed once by `single_keys`,
+                    // including alternatives. Multi-key exact collisions stay here.
+                    if is_single && *existing_is_single {
                         continue;
                     }
                     if !is_context_compatible(name, existing) {
@@ -286,46 +291,45 @@ impl KeybindingsConfig {
                         ));
                     }
                 }
-                owners.push((name, is_primary_single));
-            }
+                exact_owners.push((name, is_single));
 
-            if seq.is_single() {
-                let key = seq.keys[0];
-                if let Some(existing) = single_keys.get(&key) {
-                    // Allow same key for different contexts (e.g., 'r' for reply and request_changes)
-                    // This is intentional - context determines which action is triggered
-                    if !is_context_compatible(name, existing) {
-                        errors.push(format!(
-                            "duplicate keybinding: '{}' and '{}' both use {}",
-                            name,
-                            existing,
-                            key.display()
-                        ));
+                if is_single {
+                    let key = keys[0];
+                    let owners = single_keys.entry(key).or_default();
+                    for existing in owners.iter() {
+                        // Tracking every primary and alternative owner prevents an
+                        // earlier disjoint-context action from hiding a later collision.
+                        if !is_context_compatible(name, existing) {
+                            errors.push(format!(
+                                "duplicate keybinding: '{}' and '{}' both use {}",
+                                name,
+                                existing,
+                                key.display()
+                            ));
+                        }
                     }
-                } else {
-                    single_keys.insert(key, name);
-                }
-            } else {
-                // For sequences, track the first key as a prefix
-                if let Some(first) = seq.first() {
+                    owners.push(name);
+                } else if let Some(first) = keys.first() {
                     sequence_prefixes.entry(*first).or_default().push(name);
                 }
             }
         }
 
         // Check for conflicts between single keys and sequence prefixes
-        for (key, single_name) in &single_keys {
+        for (key, single_names) in &single_keys {
             if let Some(seq_names) = sequence_prefixes.get(key) {
-                // Only warn if they're in the same context
-                for seq_name in seq_names {
-                    if !is_context_compatible(single_name, seq_name) {
-                        errors.push(format!(
-                            "keybinding conflict: '{}' ({}) conflicts with sequence prefix for '{}' ({})",
-                            single_name,
-                            key.display(),
-                            seq_name,
-                            key.display()
-                        ));
+                // Only warn if they're in the same context.
+                for single_name in single_names {
+                    for seq_name in seq_names {
+                        if !is_context_compatible(single_name, seq_name) {
+                            errors.push(format!(
+                                "keybinding conflict: '{}' ({}) conflicts with sequence prefix for '{}' ({})",
+                                single_name,
+                                key.display(),
+                                seq_name,
+                                key.display()
+                            ));
+                        }
                     }
                 }
             }
@@ -375,6 +379,7 @@ fn is_context_compatible(name1: &str, name2: &str) -> bool {
         "repo_browse",
         "symbol_outline",
         "symbol_search",
+        "module_graph",
     ];
 
     let context_groups: &[&[&str]] = &[
@@ -387,6 +392,40 @@ fn is_context_compatible(name1: &str, name2: &str) -> bool {
         &["retry", "reply", "request_changes"],
         &["confirm_no", "next_comment"],
     ];
+
+    // The module-graph action is file-pane specific, but these actions are
+    // active in that same pane. Treating every screen-specific key as a
+    // wildcard made valid-looking custom bindings unreachable at runtime.
+    const MODULE_GRAPH_OVERLAPS: &[&str] = &[
+        "move_down",
+        "move_up",
+        "move_left",
+        "move_right",
+        "page_down",
+        "page_up",
+        "jump_to_first",
+        "jump_to_last",
+        "jump_back",
+        "quit",
+        "help",
+        "go_to_definition",
+        "go_to_file",
+        "toggle_zen_mode",
+        "symbol_outline",
+        "symbol_search",
+        "toggle_blame",
+        "open_blame_commit",
+        "open_blame_pr",
+        "open_line_discussion",
+    ];
+    if name1 == "module_graph" || name2 == "module_graph" {
+        let other = if name1 == "module_graph" {
+            name2
+        } else {
+            name1
+        };
+        return !MODULE_GRAPH_OVERLAPS.contains(&other);
+    }
 
     // git ops 固有キーは git ops 画面でのみ有効なので、他の全キーと context compatible
     if SCREEN_SPECIFIC_KEYS.contains(&name1) || SCREEN_SPECIFIC_KEYS.contains(&name2) {
@@ -485,6 +524,7 @@ impl Serialize for KeybindingsConfig {
         map.serialize_entry("repo_browse", &seq_to_value(&self.repo_browse))?;
         map.serialize_entry("symbol_outline", &seq_to_value(&self.symbol_outline))?;
         map.serialize_entry("symbol_search", &seq_to_value(&self.symbol_search))?;
+        map.serialize_entry("module_graph", &seq_to_value(&self.module_graph))?;
         map.serialize_entry("toggle_blame", &seq_to_value(&self.toggle_blame))?;
         map.serialize_entry("open_blame_commit", &seq_to_value(&self.open_blame_commit))?;
         map.serialize_entry("open_blame_pr", &seq_to_value(&self.open_blame_pr))?;

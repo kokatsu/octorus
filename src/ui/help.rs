@@ -1017,6 +1017,10 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             fmt_key(&kb.symbol_search.display(), key_width)
         )),
         Line::from(format!(
+            "{}  Show imports and importers",
+            fmt_key(&kb.module_graph.display(), key_width)
+        )),
+        Line::from(format!(
             "{}  Toggle blame gutter",
             fmt_key(&kb.toggle_blame.display(), key_width)
         )),

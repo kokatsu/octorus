@@ -8,9 +8,11 @@ Read this before adding features.
 | File | Role |
 |------|------|
 | `src/app/browse.rs` | State definitions, file loading, spawning and collecting async tasks |
-| `src/symbols.rs` | octorus compatibility facade over the Hearth symbol engine (independent of the screen, see [symbol-index.md](symbol-index.md)) |
+| `src/code_index.rs` | One-pass Hearth symbol/import repository analysis |
+| `src/symbols.rs` | octorus compatibility facade over the Hearth symbol engine (see [symbol-index.md](symbol-index.md)) |
+| `src/module_graph.rs` | octorus compatibility facade over Hearth import resolution and graph queries (see [module-graph.md](module-graph.md)) |
 | `src/ui/browse.rs` | Rendering |
-| `src/app/input_browse.rs` | Key handling (2 panes + 2 overlays) |
+| `src/app/input_browse.rs` | Key handling (2 panes + 3 browser overlays, plus PR/discussion modals) |
 
 Do not put line counts in this table; they become stale whenever the browser or
 its compatibility facade changes. Count the current checkout when needed.
@@ -25,7 +27,7 @@ Changes to existing files are kept minimal:
 - `src/app/mod.rs` — module declarations for `browse` / `input_browse`, the `browse_state: Option<BrowseState>` field, `poll_browse_updates()` added to the polling loop
 - `src/app/input.rs` — 2 dispatch arms, the `b` branch in the file list
 - `src/ui/mod.rs` — module declaration and 1 dispatch line
-- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `toggle_blame` / `open_blame_commit` / `open_blame_pr` / `open_line_discussion`
+- `src/config/keybindings.rs` — `repo_browse` / `symbol_outline` / `symbol_search` / `module_graph` / `toggle_blame` / `open_blame_commit` / `open_blame_pr` / `open_line_discussion`
 - `src/main.rs` — the `--browse` flag
 - `src/ui/help.rs` — help entries
 - `src/app/cockpit.rs` / `src/ui/cockpit.rs` — the Cockpit menu item that opens the browser
@@ -37,9 +39,11 @@ Changes to existing files are kept minimal:
 - `benches/ui_rendering.rs` — the `browse_render` group / `benches/symbol_index.rs` — facade extraction, build, and query benchmarks
 - `tests/cli.rs` — e2e tests that launch the binary
 
-The symbol implementation depends on exact registry release `hearth-graph
-0.1.1` with only its `bundled-languages` and `fs` features. See
-[symbol-index.md](symbol-index.md) for ownership and compatibility boundaries.
+The code-intelligence implementation depends on exact registry release
+`hearth-graph 0.1.1` with `bundled-languages`, `fs`, `resolve-js`, and
+`resolve-rust`, with default features disabled. See
+[symbol-index.md](symbol-index.md) and [module-graph.md](module-graph.md) for
+ownership and compatibility boundaries.
 
 ## 2. State machine
 
@@ -69,6 +73,12 @@ paths:     LoadState<Vec<String>>
 index:     IndexState
            Idle → Building → Ready(Arc<SymbolIndex>) | Failed
 
+graph:     ModuleGraphState
+           Idle → Building → Ready(Arc<ModuleGraph>) | Failed
+
+universe:  SourceUniverse
+           Partial | Complete
+
 open_load: OpenLoad
            Idle → Pending { path, line, scroll, cancel } → Idle | Failed { path, message }
 
@@ -88,14 +98,21 @@ PR lookup: PrLookupState
 
 overlay:   BrowseOverlay
            None | Outline { selected } | SymbolSearch { query, selected }
+                | ModuleGraphLoading { request_id, path }
+                | ModuleGraph(ModuleGraphPanel)
 
 filter:    Option<ListFilter>   ← reuses the existing list filter
 ```
 
-The point is that `IndexState` is an independent enum: **the index is an
-accelerator, not a precondition**. While it is `Building`, tree browsing, file
-viewing, and filtering all keep working. Only the three index consumers —
-`o` / `s` / `gd` — put the reason into the footer instead of opening an overlay.
+`IndexState` and `ModuleGraphState` remain independent typed lifecycles even
+though one `CodeIndex` worker transitions them together. Code intelligence is
+an accelerator, not a precondition: while it is building, tree browsing, file
+viewing, and filtering all keep working. Symbol consumers `o` / `s` / `gd` and
+the graph consumer `i` put the reason into the footer instead of opening an
+overlay. A ready graph does not make a high-fan-in query synchronous:
+`i` transitions to `ModuleGraphLoading`, runs both directions in
+`spawn_blocking`, and installs `ModuleGraph` only when the request id and open
+path still match.
 
 More than one message can come out. `o` and `gd` **check `open_is_pending()`
 first**, so while a file is loading, `Still opening this file` wins regardless
@@ -113,6 +130,7 @@ does not carry this check.
 | `o` | `Still opening this file` | `Symbol index is still building` | `No symbols in this file` if the target file has none, otherwise opens the outline |
 | `s` | (not checked) | `Symbol index is still building` | opens the search overlay |
 | `gd` | `Still opening this file` | `Symbol index is still building` | `No definition found` when it cannot resolve |
+| `i` | `Still opening this file` | `Module graph is still building` | enters a cancellable loading overlay, or reports unsupported/unavailable analysis |
 
 `Symbol index is still building` is emitted on `index.ready().is_none()`.
 `IndexState::Failed` also satisfies that condition, so after a failed build the
@@ -156,10 +174,16 @@ AppState::RepoBrowseTree                                        poll_browse_upda
                                                                            │
                                                               start_symbol_index_build()
                                                                            │
-                                                     spawn_blocking: SymbolIndex::build_cancellable
+                                                       spawn_blocking: CodeIndex::build_cancellable
+                                                                           │
+                                                        hearth_graph::analyze_paths (one parse pass)
+                                                                   ┌───────┴────────┐
+                                                                   ▼                ▼
+                                                           SymbolIndex         ModuleGraph
+                                                                   └───────┬────────┘
                                                                            │ index_receiver
                                                                            ▼
-                                                                 IndexState::Ready(Arc<..>)
+                                                         IndexState::Ready + ModuleGraphState::Ready
                                                                            │
                                                                  refresh_open_file_symbols()
 ```
@@ -331,9 +355,13 @@ means:
 The same trick was already in use in `build_pr_description_patch()`, and this
 follows it.
 
-`paths_receiver` / `index_receiver` / `file_receiver` / `highlight_receiver` /
-`blame_receiver` / `commit_diff_receiver` are all drained with `try_recv()` in
-`poll_browse_updates()`. The draw loop never blocks.
+`paths_receiver` / `index_receiver` / `module_graph_query_receiver` /
+`file_receiver` / `highlight_receiver` / `blame_receiver` /
+`commit_diff_receiver` are all drained with `try_recv()` in
+`poll_browse_updates()`. `index_receiver` carries the combined symbol/module
+build result, so no second parser task or graph-build channel exists. The
+separate module-graph receiver carries only request-scoped, already-projected
+panels. The draw loop never blocks.
 
 ## 4. Key-handling layers
 
@@ -341,7 +369,7 @@ At the top of `handle_repo_browse_{tree,file}_input`, input is fed through the
 layers from the top down.
 
 ```
-1. Overlays (Outline / SymbolSearch)   ← modal; consume everything while open
+1. Overlays (Outline / SymbolSearch / ModuleGraphLoading / ModuleGraph) ← modal; consume everything while open
 2. commit diff mode (file pane only)   ← blocks the source-file actions
 3. Filter input bar (tree pane only)   ← consumes all character input while open
 4. Shared by both panes (s / ? / Z / Ctrl-o)
@@ -359,6 +387,12 @@ list / diff view.
 `Ctrl-n` (clear the whole query with `Ctrl-u`). A search UI where you cannot
 type `j` is infuriating, so this is deliberate.
 
+**Input rules for the module graph overlay**: while loading, only `Esc` / the
+configured quit key cancels the request. Once ready it has no text input. `j/k`
+and arrows move, `Tab` or `h/l` switches Imports / Imported by, and `Enter`
+opens only a target represented in the original Git listing. Rows without a
+jump stay visible and report why they cannot be opened.
+
 ## 5. Keybinding registration caveats
 
 `KeybindingsConfig::validate()` detects exact duplicates between single keys and
@@ -369,10 +403,16 @@ with existing ones easily:
 - `b` … collides with `rally_background`
 - `o` … collides with `filter_open`
 - `s` … collides with `suggestion` / `git_ops_stage_all`
+- `i` … is reserved for the browser module graph and may collide with future input actions
 
-All three are dodged by registering them in `is_context_compatible()`'s
-`SCREEN_SPECIFIC_KEYS` (the treatment for "keys that are only live on their own
-screen"). When adding a key, touch all of:
+The defaults are separated by registering screen-specific actions in
+`is_context_compatible()`'s `SCREEN_SPECIFIC_KEYS`. `module_graph` is not a
+wildcard inside the browser file pane: validation explicitly rejects overlaps
+with outline, search, movement, and active browser sequence prefixes. The
+single-key ownership map retains every primary and alternative owner, and every
+multi-key alternative contributes its prefix, so an earlier action from another
+context cannot hide a later same-pane collision. When adding a key, touch all
+of:
 
 1. the `KeybindingsConfig` field
 2. the `Default` impl
@@ -446,8 +486,8 @@ double-width glyph (CJK etc.), replaces that cell with a space. When a
 double-width glyph straddles the left border, ratatui's buffer diff skips the
 next cell and the border line never reaches the terminal. The right edge needs
 no such repair: overwriting the leading cell already leaves a space in the
-continuation cell. `render_outline` (60%×70%) and `render_symbol_search`
-(80%×70%) both go through it. Any new overlay added to `src/ui/browse.rs` must
+continuation cell. `render_outline` (60%×70%), `render_symbol_search`, and
+`render_module_graph` (both 80%×70%) all go through it. Any new overlay added to `src/ui/browse.rs` must
 also use `clear_overlay_area()` rather than a bare `Clear`. A continuation cell
 is a space at the text level, so text snapshots alone cannot catch this mistake.
 Removing the repair fails
@@ -456,9 +496,20 @@ Removing the repair fails
 `overlay_rect()`'s centring and staying in bounds are verified by
 `test_overlay_rect_is_centred_and_bounded`. On 100×40, an 80%×50% rect becomes
 80×20 at (10, 10), and even on 10×4 it stays inside the terminal.
-`test_symbol_search_overlay_is_reviewably_clipped_in_a_tiny_terminal` actually
-renders the symbol search overlay at 20×5 and pins the clipped result as a
-snapshot.
+`test_symbol_search_overlay_is_reviewably_clipped_in_a_tiny_terminal` and
+`test_empty_module_graph_overlay_clips_in_a_tiny_terminal` render their overlays
+at 20×5 and pin the clipped results as snapshots.
+
+The module graph overlay never queries Hearth from the input or draw path.
+`open_browse_module_graph()` starts a request-scoped blocking task; its delivery
+converts direct and reverse results into a `ModuleGraphPanel` only if the
+request/path context is still current. Each direction retains at most 200 rows
+plus the full edge count; components are capped at 512 Unicode scalars and final
+labels at 240 terminal cells. `render_module_graph()` borrows label spans from
+only `skip(offset).take(inner_height)`, preserving O(viewport) redraw cost even
+when the repository graph is large. Hearth 0.1.1 still materializes and sorts all
+matching edges inside the blocking task before octorus can truncate them; see
+[module-graph.md](module-graph.md).
 
 ## 7. Tests
 
@@ -471,10 +522,12 @@ is "where are the tests for what", so that table stays:
 
 | Where | What |
 |-------|------|
-| `src/app/browse.rs` | `git ls-files` parsing, pseudo-patch conversion, tree, filter, cursor/scroll, file loading and its cancellation |
+| `src/app/browse.rs` | `git ls-files` parsing, pseudo-patch conversion, tree, filter, cursor/scroll, file loading/cancellation, graph query failure/high-fan/label bounds |
 | `src/symbols.rs` | Hearth-registry extraction snapshots, compatibility boundaries (including C macro merging, empty files, duplicate paths, CJK and checked conversion), projected index refs, search, and build cancellation |
-| `src/ui/browse.rs` | inline rendering snapshots, tiny-terminal clipping, wide-glyph border repair |
-| `src/app/input_browse.rs` | **scenario tests** (tree navigation → open → scroll → back, filter → cancel, outline → jump → back, etc.) |
+| `src/code_index.rs` | one-pass combined symbol/import result and cancellation |
+| `src/module_graph.rs` | JS/TS/Rust import extraction and resolution, listed non-source navigation, path projection, direct/reverse guarantees, cancellation |
+| `src/ui/browse.rs` | inline rendering snapshots, graph loading/outgoing/incoming/truncated/long-CJK/empty/tiny states, wide-glyph border repair |
+| `src/app/input_browse.rs` | **scenario tests** (tree navigation, outline/search, graph cancel/stale/CJK JSON/empty/switch/jump/back, blame/history) |
 | `src/main.rs` | the flag set allowed to start without a repository (including `--browse`) |
 | `tests/cli.rs` | e2e launching the binary via `assert_cmd` (non-git directory, git repo without a GitHub remote) |
 
@@ -544,7 +597,10 @@ source — but that is not the default procedure.
 | No horizontal scrolling | Long lines are cut off | Add horizontal scroll to ratatui's `Paragraph` |
 | No intra-line wrapping | Same as above | Wrapping makes cursor-line arithmetic visual-line-based (the same problem as `pr_description`) |
 | `gd` jumps to the first identifier that resolves | Columns are ignored; identifiers are scanned from the start of the line, minus duplicates and common keywords. For `foo.bar()`, if `foo` has a definition it jumps there, otherwise it tries `bar` | Show the existing `SymbolPopupState` when there are several candidates |
-| symbol references unimplemented | The `@reference.*` captures present in the queries are dropped at extraction, because `SymbolKind::from_capture` handles only `definition.`. C/C++/Swift and the 6 queries bundled in the repo have no such captures at all | Rust/TS/JS/Go/Python/Ruby/Java/Lua/PHP can extend the same machinery with their existing captures. C/C++/Swift and the bundled `c_sharp`/`zig`/`bash`/`haskell`/`moonbit`/`markdown` need query extensions; until then support would cover only a subset of languages. `gr` is already taken by `open_line_discussion` (line-anchored review comments), so the feature also needs a different default key |
+| symbol references unimplemented | The `@reference.*` captures present in the tags queries are still dropped; the module graph models file imports, not arbitrary symbol references | Keep import navigation file-level, or add a separate reference index with explicit per-language coverage |
+| Module graph is built once | Imports and resolver configuration become stale after external edits; no watcher-driven upsert or re-resolution exists | Re-analyze changed files and use Hearth incremental graph APIs; clear resolver caches when config dependencies change |
+| Rust graph answers are approximate | Hearth 0.1.1 does not model Cargo targets, `cfg`, `#[path]`, macros, or inline modules completely | Supply Cargo metadata and a declaration-tree model upstream |
+| Only a root JS config is selected explicitly | Complex workspaces may need package-local tsconfig policy beyond current `oxc_resolver` behavior | Discover project configs and define deterministic ownership before building resolvers |
 | Only one file-contents cache | Going through `OpenLoad` keeps the UI thread free, but every revisit re-reads the whole file | Give it an LRU like `DiffCacheStore` |
 | `o` / `s` / `gd` keep saying "building" after a failed index build | All three test `index.ready().is_none()`, so `IndexState::Failed` falls into the same branch. The header shows `symbols: unavailable` in red, so two places on the same screen disagree | Match on `IndexState` in the footer too, and on `Failed` show the actual failure reason held in `BrowseState::status` |
 
@@ -669,7 +725,11 @@ test fails. Maintain this mapping when editing.
 
 - **A new overlay**: add a variant to `BrowseOverlay` and fill in the matches in
   `handle_browse_overlay_input` and `render_overlay`. The compiler reports what
-  you missed
+  you missed. Precompute graph-sized data before opening; rendering should own
+  only viewport work
+- **A new import language**: register its `ImportSpec` and resolver in Hearth or
+  the host registry, add facade projection/guarantee tests, and update
+  [module-graph.md](module-graph.md). Never infer exactness in the UI
 - **A new in-pane action**: add a `matches_single_key` branch to
   `handle_repo_browse_file_input`. The borrow of `self` and the mutable borrow
   of `browse_state` collide, so **decide into a bool first, then take the

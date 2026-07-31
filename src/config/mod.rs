@@ -1304,6 +1304,7 @@ timeout_secs = 3600
             "mark_viewed",
             "mark_viewed_dir",
             "tree_toggle",
+            "module_graph",
             "toggle_blame",
             "open_blame_commit",
             "open_blame_pr",
@@ -1324,6 +1325,54 @@ timeout_secs = 3600
             serialized, reserialized,
             "Serialize roundtrip mismatch — a field may be missing from Serialize or Default impl"
         );
+    }
+
+    #[test]
+    fn test_module_graph_keybinding_defaults_and_roundtrips() {
+        let config = KeybindingsConfig::default();
+        assert_eq!(config.module_graph.display(), "i");
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("module_graph"));
+        let parsed: KeybindingsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.module_graph.display(), "i");
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn test_module_graph_rejects_overlapping_browser_bindings() {
+        for (binding, conflicting_name) in [
+            ("o", "symbol_outline"),
+            ("s", "symbol_search"),
+            ("g", "toggle_blame"),
+        ] {
+            let source = format!("[keybindings]\nmodule_graph = \"{binding}\"\n");
+            let config: Config = toml::from_str(&source).unwrap();
+            let errors = config.keybindings.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| {
+                    error.contains("module_graph") && error.contains(conflicting_name)
+                }),
+                "{binding:?} did not conflict with {conflicting_name}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_module_graph_rejects_an_alternative_browser_sequence_prefix() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            module_graph = "i/g"
+            "#,
+        )
+        .unwrap();
+
+        let errors = config.keybindings.validate().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("module_graph")
+                && error.contains("toggle_blame")
+                && error.contains("conflicts with sequence prefix")
+        }));
     }
 
     /// validate() の bindings リストが全フィールドを含むことを検証。

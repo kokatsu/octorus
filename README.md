@@ -134,12 +134,15 @@ There is a second message ahead of that one. `o` and `gd` answer questions about
 |---------|-----|-------------|
 | File outline | `o` | Symbols of the open file, indented by nesting depth, with the cursor's enclosing symbol pre-selected. Nesting follows the tags query: a Python method inside a class indents, a Rust method inside `impl` does not, because an `impl` block is not itself a tagged definition |
 | Symbol search | `s` | Fuzzy search across every symbol in the repository, best 200 matches listed; `Enter` opens the file at the definition |
+| Imports / imported by | `i` | Show direct imports and reverse dependencies of the open Rust, JavaScript, or TypeScript file. `Tab` or `h/l` switches direction; `Enter` opens a listed local file |
 | Go to definition | `gd` | Resolve the cursor **line** against the index — a CST match, not a grep for `fn <name>` |
 | Jump back | `Ctrl-o` | Return to the position before the last jump |
 
 `gd` in the browser works at line granularity: the browser has a line cursor and no column cursor, so it reads the identifiers on the cursor line left to right and jumps to the first one the index knows. On `Config::helper()` that is `Config`. To land on `helper` instead, use `s` and search for it by name — and either way `Ctrl-o` puts you back, so a jump you did not mean costs one keystroke. (The diff view's `gd` does have a column-free candidate popup; the browser deliberately does not, because `s` already covers "not that one, the other one" across the whole repository rather than one line.)
 
 Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Ruby, C, C++, Java, C#, Lua, PHP, Swift, Bash, Zig, Haskell, MoonBit, and Markdown (headings become the outline of a README).
+
+The same background parse pass also extracts imports for Rust, TypeScript, TSX, JavaScript, and JSX. JavaScript/TypeScript resolution handles relative paths, packages, and a root `tsconfig.json` or `jsconfig.json`; Rust module resolution is deliberately best-effort. Dependency queries run off the UI thread; each direction retains up to 200 rows and shows the full edge count when truncated. The overlay labels every answer `exact` or `approximate`. Rust answers are approximate, as are reverse dependencies when the repository listing was truncated, a non-UTF-8 path was omitted, or an import-supporting file could not be analyzed.
 
 #### Repository Browser Keybindings
 
@@ -168,6 +171,7 @@ Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Rub
 | `gg` / `G` | Jump to first / last line |
 | `o` | File outline |
 | `s` | Repository symbol search |
+| `i` | Show imports / imported by |
 | `gb` | Toggle blame gutter |
 | `gc` | Open the blamed line's commit diff inside the browser |
 | `gp` | Open the PR that introduced the blamed line's commit |
@@ -185,6 +189,15 @@ Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Rub
 | `Backspace` | Delete the last character of the query (symbol search) |
 | `Ctrl-u` | Clear the query |
 | `Enter` | Jump to the symbol |
+| `Esc` | Close |
+
+**Imports / imported by overlay:**
+
+| Key | Action |
+|-----|--------|
+| `Tab`, `h` / `l`, `←` / `→` | Switch between outgoing imports and incoming importers |
+| `j` / `k`, `↑` / `↓` | Move selection |
+| `Enter` | Open a listed local target/importer; external, unresolved, and unlisted targets stay visible but do not open |
 | `Esc` | Close |
 
 ### Pull Requests
@@ -1022,6 +1035,7 @@ go_to_definition = ["g", "d"]
 | `repo_browse` | `b` | Open the Repository Browser |
 | `symbol_outline` | `o` | File outline (browser only) |
 | `symbol_search` | `s` | Repository symbol search (browser only) |
+| `module_graph` | `i` | Show direct imports and reverse dependencies (browser file pane only) |
 | `toggle_blame` | `gb` | Toggle blame gutter (browser file pane only) |
 | `open_blame_commit` | `gc` | Open the blamed line's commit diff (browser file pane only) |
 | `open_blame_pr` | `gp` | Open the PR for the blamed line's commit (browser file pane only) |
@@ -1055,12 +1069,13 @@ Press `Space /` in the PR list or file list to activate keyword filtering. Type 
 
 ## Design Docs
 
-Two technical reference documents for the Repository Browser and its symbol
-engine live in [`docs/`](docs/):
+Technical reference documents for the Repository Browser and its code-intelligence
+engines live in [`docs/`](docs/):
 
 | Document | What it holds |
 |----------|---------------|
 | [docs/symbol-index.md](docs/symbol-index.md) | Technical reference for the tree-sitter tags symbol engine — language matrix, per-grammar quirks, how to add a language, measured cost |
+| [docs/module-graph.md](docs/module-graph.md) | Import extraction, JS/TS and Rust resolution, graph guarantees, path projection, and query behavior |
 | [docs/repo-browse-architecture.md](docs/repo-browse-architecture.md) | Architecture of the Repository Browser — state machine, module map, background tasks, extension points, known limitations |
 
 [`docs/README.md`](docs/README.md) indexes the same two documents from inside the directory.

@@ -1,18 +1,23 @@
 //! Key handling for the Repository Browser.
 //!
-//! Two focus states (tree / file) plus two overlays (outline / symbol search).
+//! Two focus states (tree / file) plus modal outline, search, and module overlays.
 //! Overlays are checked first so they behave as modal layers rather than as an
 //! extra set of conditionals sprinkled through the pane handlers.
 
 use anyhow::Result;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use ratatui::{backend::CrosstermBackend, Terminal};
+#[cfg(test)]
+use ratatui::{layout::Rect, TerminalOptions, Viewport};
 use std::io::Stdout;
 
 use crate::filter::ListFilter;
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
-use super::browse::{BrowseCommitDiffState, BrowseOverlay, IndexState, PrLookupState};
+use super::browse::{
+    BrowseCommitDiffState, BrowseOverlay, IndexState, ModuleGraphDirection, ModuleGraphState,
+    PrLookupState,
+};
 use super::browse_discussion::{DiscussionView, LineDiscussionState};
 use super::{App, AppState, PrOpenSource};
 
@@ -135,6 +140,10 @@ impl App {
 
         if self.matches_single_key(&key, &kb.symbol_outline) {
             self.open_browse_outline();
+            return Ok(());
+        }
+        if self.matches_single_key(&key, &kb.module_graph) {
+            self.open_browse_module_graph();
             return Ok(());
         }
 
@@ -393,6 +402,11 @@ impl App {
                 self.open_browse_line_discussion();
                 return Ok(true);
             }
+            if self.try_match_sequence(&kb.module_graph) == SequenceMatch::Full {
+                self.clear_pending_keys();
+                self.open_browse_module_graph();
+                return Ok(true);
+            }
             if self.try_match_sequence(&kb.go_to_definition) == SequenceMatch::Full {
                 self.clear_pending_keys();
                 self.browse_run_go_to_definition();
@@ -419,6 +433,8 @@ impl App {
             || self.key_could_match_sequence(key, &kb.open_blame_commit)
             || self.key_could_match_sequence(key, &kb.open_blame_pr)
             || self.key_could_match_sequence(key, &kb.open_line_discussion)
+            || (!kb.module_graph.is_single()
+                && self.key_could_match_sequence(key, &kb.module_graph))
             || self.key_could_match_sequence(key, &kb.go_to_definition)
             || self.key_could_match_sequence(key, &kb.go_to_file)
             || self.key_could_match_sequence(key, &kb.jump_to_first);
@@ -640,6 +656,10 @@ impl App {
                 self.handle_browse_symbol_search_input(key);
                 true
             }
+            BrowseOverlay::ModuleGraphLoading { .. } | BrowseOverlay::ModuleGraph(_) => {
+                self.handle_browse_module_graph_input(key);
+                true
+            }
         }
     }
 
@@ -743,6 +763,101 @@ impl App {
         }
 
         state.clamp_symbol_search_selection();
+    }
+
+    fn handle_browse_module_graph_input(&mut self, key: event::KeyEvent) {
+        let kb = self.config.keybindings.clone();
+        let close = key.code == KeyCode::Esc || self.matches_single_key(&key, &kb.quit);
+        let down = self.matches_single_key(&key, &kb.move_down);
+        let up = self.matches_single_key(&key, &kb.move_up);
+        let confirm = self.matches_single_key(&key, &kb.open_panel);
+        let show_dependencies =
+            key.code == KeyCode::Left || self.matches_single_key(&key, &kb.move_left);
+        let show_dependents =
+            key.code == KeyCode::Right || self.matches_single_key(&key, &kb.move_right);
+        let toggle = key.code == KeyCode::Tab;
+        let mut jump = None;
+
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        if matches!(state.overlay, BrowseOverlay::ModuleGraphLoading { .. }) {
+            if close {
+                state.cancel_module_graph_query();
+                state.overlay = BrowseOverlay::None;
+            }
+            return;
+        }
+        let BrowseOverlay::ModuleGraph(panel) = &mut state.overlay else {
+            return;
+        };
+        if close {
+            state.overlay = BrowseOverlay::None;
+            return;
+        }
+        if toggle {
+            panel.set_direction(match panel.direction {
+                ModuleGraphDirection::Dependencies => ModuleGraphDirection::Dependents,
+                ModuleGraphDirection::Dependents => ModuleGraphDirection::Dependencies,
+            });
+        } else if show_dependencies {
+            panel.set_direction(ModuleGraphDirection::Dependencies);
+        } else if show_dependents {
+            panel.set_direction(ModuleGraphDirection::Dependents);
+        } else if down {
+            panel.selected = (panel.selected + 1).min(panel.current_rows().len().saturating_sub(1));
+        } else if up {
+            panel.selected = panel.selected.saturating_sub(1);
+        } else if confirm {
+            if let Some(row) = panel.current_rows().get(panel.selected) {
+                jump = row.jump.clone();
+                state.overlay = BrowseOverlay::None;
+                if jump.is_none() {
+                    state.status =
+                        Some("This dependency target is not a listed repository file".into());
+                }
+            }
+        }
+
+        if let Some(jump) = jump {
+            self.browse_push_jump();
+            self.browse_open_path(&jump.path, jump.line);
+        }
+    }
+
+    pub(crate) fn open_browse_module_graph(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        if state.open_is_pending() {
+            state.status = Some("Still opening this file".to_string());
+            return;
+        }
+        let Some(path) = state.open.as_ref().map(|open| open.path.clone()) else {
+            state.status = Some("No file is open".to_string());
+            return;
+        };
+        let graph = match &state.module_graph {
+            ModuleGraphState::Idle | ModuleGraphState::Building => {
+                state.status = Some("Module graph is still building".to_string());
+                return;
+            }
+            ModuleGraphState::Failed => {
+                state.status = Some("Module graph is unavailable".to_string());
+                return;
+            }
+            ModuleGraphState::Ready(graph) => std::sync::Arc::clone(graph),
+        };
+        if !graph.is_analyzed(&path) {
+            state.status = Some(if crate::module_graph::supports_imports(&path) {
+                "Import analysis is unavailable for this file".to_string()
+            } else {
+                "Import analysis is not supported for this file".to_string()
+            });
+            return;
+        }
+        state.status = None;
+        state.start_module_graph_query(path, graph);
     }
 
     pub(crate) fn open_browse_outline(&mut self) {
@@ -925,6 +1040,25 @@ mod tests {
         state.refresh_open_file_symbols();
     }
 
+    fn attach_code_index(app: &mut App, root: &std::path::Path, paths: &[&str]) {
+        let paths: Vec<_> = paths.iter().map(|path| (*path).to_string()).collect();
+        let crate::code_index::CodeIndexBuild::Completed(code) =
+            crate::code_index::CodeIndex::build_cancellable(
+                root,
+                &paths,
+                crate::module_graph::SourceUniverse::Complete,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+        else {
+            panic!("code index fixture must build");
+        };
+        let crate::code_index::CodeIndex { symbols, modules } = *code;
+        let state = app.browse_state.as_mut().expect("browse state");
+        state.index = IndexState::Ready(Arc::new(symbols));
+        state.module_graph = ModuleGraphState::Ready(Arc::new(modules));
+        state.refresh_open_file_symbols();
+    }
+
     /// A browser rooted at a real directory holding `files`.
     ///
     /// Jumps that land in a *different* file go through `browse_open_path`,
@@ -977,6 +1111,20 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("browse load never settled");
+    }
+
+    async fn settle_module_graph(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if !matches!(
+                app.browse_state.as_ref().map(|state| &state.overlay),
+                Some(BrowseOverlay::ModuleGraphLoading { .. })
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("module graph query never settled");
     }
 
     async fn settle_blame(app: &mut App) {
@@ -2646,8 +2794,342 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_module_graph_overlay_loads_outgoing_and_switches_to_incoming() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source =
+            "import { helper } from './helper';\nexport function app() { return helper(); }\n";
+        let helper_source = "export function helper() { return 1; }\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().overlay,
+            BrowseOverlay::ModuleGraphLoading { .. }
+        ));
+        settle_module_graph(&mut app).await;
+        let state = app.browse_state.as_ref().unwrap();
+        let BrowseOverlay::ModuleGraph(panel) = &state.overlay else {
+            panic!("module graph overlay must open");
+        };
+        assert_eq!(panel.direction, ModuleGraphDirection::Dependencies);
+        assert_eq!(panel.current_rows().len(), 1);
+        assert!(panel.current_rows()[0].label.contains("./helper"));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Tab), &mut test_terminal())
+            .unwrap();
+        let state = app.browse_state.as_ref().unwrap();
+        let BrowseOverlay::ModuleGraph(panel) = &state.overlay else {
+            panic!("module graph overlay must stay open");
+        };
+        assert_eq!(panel.direction, ModuleGraphDirection::Dependents);
+        assert!(panel.current_rows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_default_and_custom_sequence_module_graph_keys_open_the_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import { helper } from './helper';\n";
+        let helper_source = "export const helper = 1;\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('i')), &mut test_terminal())
+            .unwrap();
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().overlay,
+            BrowseOverlay::ModuleGraphLoading { .. }
+        ));
+        settle_module_graph(&mut app).await;
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().overlay,
+            BrowseOverlay::ModuleGraph(_)
+        ));
+
+        app.handle_repo_browse_file_input(press(KeyCode::Esc), &mut test_terminal())
+            .unwrap();
+        app.config.keybindings.module_graph =
+            KeySequence::double(KeyBinding::char('m'), KeyBinding::char('i'));
+        app.handle_repo_browse_file_input(press(KeyCode::Char('m')), &mut test_terminal())
+            .unwrap();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('i')), &mut test_terminal())
+            .unwrap();
+        settle_module_graph(&mut app).await;
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().overlay,
+            BrowseOverlay::ModuleGraph(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_loading_module_graph_can_be_cancelled_without_installing_a_stale_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import './helper';\n";
+        let helper_source = "export const helper = 1;\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+        let cancel = app
+            .browse_state
+            .as_ref()
+            .unwrap()
+            .module_graph_query_token()
+            .expect("query token");
+        assert!(!cancel.is_cancelled());
+        app.handle_repo_browse_file_input(press(KeyCode::Esc), &mut test_terminal())
+            .unwrap();
+        assert!(cancel.is_cancelled());
+        app.poll_browse_updates();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(state.module_graph_query_receiver.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_loading_module_graph_is_abandoned_when_the_open_path_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import './helper';\n";
+        let helper_source = "export const helper = 1;\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+        let cancel = app
+            .browse_state
+            .as_ref()
+            .unwrap()
+            .module_graph_query_token()
+            .expect("query token");
+        attach_open_file(&mut app, "src/helper.ts", helper_source, Vec::new());
+        app.poll_browse_updates();
+
+        assert!(cancel.is_cancelled());
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(state.module_graph_query_receiver.is_none());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Dependency query abandoned because the open file changed")
+        );
+    }
+
+    #[test]
+    fn test_enter_on_an_empty_module_graph_direction_is_a_noop() {
+        let mut app = browsing_app(&["src/empty.ts"]);
+        attach_open_file(&mut app, "src/empty.ts", "export {};\n", Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().overlay =
+            BrowseOverlay::ModuleGraph(super::super::browse::ModuleGraphPanel {
+                direction: ModuleGraphDirection::Dependencies,
+                selected: 0,
+                dependencies: super::super::browse::ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+                dependents: super::super::browse::ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+            });
+
+        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
+            .unwrap();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::ModuleGraph(_)));
+        assert!(state.status.is_none());
+        assert!(state.jump_stack.is_empty());
+    }
+
+    #[test]
+    fn test_non_navigable_module_graph_row_reports_instead_of_jumping() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(
+            &mut app,
+            "src/app.ts",
+            "import react from 'react';\n",
+            Vec::new(),
+        );
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().overlay =
+            BrowseOverlay::ModuleGraph(super::super::browse::ModuleGraphPanel {
+                direction: ModuleGraphDirection::Dependencies,
+                selected: 0,
+                dependencies: super::super::browse::ModuleGraphRows {
+                    rows: vec![super::super::browse::ModuleGraphRow {
+                        label: "[import] react → package react  :1".to_string(),
+                        jump: None,
+                    }],
+                    total: 1,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+                dependents: super::super::browse::ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+            });
+
+        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
+            .unwrap();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert_eq!(
+            state.status.as_deref(),
+            Some("This dependency target is not a listed repository file")
+        );
+        assert!(state.jump_stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_module_graph_opens_a_listed_cjk_json_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import data from './データ.json';\nexport { data };\n";
+        let json_source = "{\"value\":1}\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/データ.json", json_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/データ.json"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+        settle_module_graph(&mut app).await;
+        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+
+        assert_eq!(open_path(&app), "src/データ.json");
+        assert!(app.browse_state.as_ref().unwrap().status.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_module_graph_overlay_jumps_to_local_dependency_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source =
+            "import { helper } from './helper';\nexport function app() { return helper(); }\n";
+        let helper_source = "export function helper() { return 1; }\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().cursor_line = 1;
+
+        app.open_browse_module_graph();
+        settle_module_graph(&mut app).await;
+        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+        assert_eq!(open_path(&app), "src/helper.ts");
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().overlay,
+            BrowseOverlay::None
+        ));
+
+        app.handle_repo_browse_file_input(ctrl('o'), &mut test_terminal())
+            .unwrap();
+        settle_browse(&mut app).await;
+        assert_eq!(open_path(&app), "src/app.ts");
+        assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 1);
+    }
+
+    #[test]
+    fn test_failed_module_graph_action_reports_unavailable() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(&mut app, "src/app.ts", "export {};\n", Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().module_graph = ModuleGraphState::Failed;
+
+        app.open_browse_module_graph();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert_eq!(state.status.as_deref(), Some("Module graph is unavailable"));
+    }
+
+    #[test]
+    fn test_module_graph_reports_unavailable_for_a_listed_unanalyzed_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import './oversized';\n";
+        let oversized = "x".repeat(crate::symbols::MAX_INDEXED_FILE_BYTES as usize + 1);
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[
+                ("src/app.ts", app_source),
+                ("src/oversized.ts", oversized.as_str()),
+            ],
+        );
+        attach_open_file(&mut app, "src/oversized.ts", "", Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/oversized.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Import analysis is unavailable for this file")
+        );
+    }
+
+    #[test]
+    fn test_module_graph_action_prioritizes_a_pending_file_load() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(&mut app, "src/app.ts", "import './helper';\n", Vec::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        app.browse_state.as_mut().unwrap().open_load = OpenLoad::Pending {
+            path: "src/app.ts".to_string(),
+            line: 0,
+            scroll: None,
+            cancel,
+        };
+
+        app.open_browse_module_graph();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert_eq!(state.status.as_deref(), Some("Still opening this file"));
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+    }
+
     /// A throwaway terminal for handlers that take one but do not draw.
     fn test_terminal() -> Terminal<CrosstermBackend<Stdout>> {
-        Terminal::new(CrosstermBackend::new(std::io::stdout())).expect("terminal")
+        Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .expect("terminal")
     }
 }
