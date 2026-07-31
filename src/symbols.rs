@@ -9,9 +9,10 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use hearth_graph::{
-    BuildOptions, FileSymbols as HearthFileSymbols, FsLoader, IndexBuild as HearthIndexBuild,
-    LanguageId, LanguageRegistry, LanguageSpec, Symbol as HearthSymbol,
-    SymbolIndex as HearthSymbolIndex, SymbolKind as HearthSymbolKind, SymbolRef as HearthSymbolRef,
+    BuildOptions, FileAnalysis as HearthFileAnalysis, FileSymbols as HearthFileSymbols, FsLoader,
+    IndexBuild as HearthIndexBuild, LanguageId, LanguageRegistry, LanguageSpec,
+    Symbol as HearthSymbol, SymbolIndex as HearthSymbolIndex, SymbolKind as HearthSymbolKind,
+    SymbolRef as HearthSymbolRef,
 };
 use rustc_hash::FxHashMap;
 
@@ -305,6 +306,30 @@ impl SymbolIndex {
         ))
     }
 
+    /// Consume the symbol half of Hearth's shared symbol/import analyses.
+    pub(crate) fn from_analyses_cancellable(
+        files: Vec<HearthFileAnalysis>,
+        cancel: &dyn CancelSignal,
+    ) -> Option<Self> {
+        let mut symbol_files = Vec::with_capacity(files.len());
+        for (index, analysis) in files.into_iter().enumerate() {
+            if index.is_multiple_of(1_024) && cancel.is_cancelled() {
+                return None;
+            }
+            symbol_files.push(HearthFileSymbols {
+                path: analysis.path,
+                content_hash: analysis.content_hash,
+                symbols: analysis.symbols,
+            });
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let inner =
+            HearthSymbolIndex::from_files(symbol_files, symbol_language_registry().generation());
+        Self::project_hearth(inner, Some(cancel))
+    }
+
     /// Build an index by reading and parsing repository-relative paths.
     ///
     /// Blocking and CPU-bound — call from `spawn_blocking`.
@@ -336,13 +361,22 @@ impl SymbolIndex {
     }
 
     fn from_hearth(inner: HearthSymbolIndex) -> Self {
+        Self::project_hearth(inner, None).expect("uncancellable symbol projection was cancelled")
+    }
+
+    fn project_hearth(inner: HearthSymbolIndex, cancel: Option<&dyn CancelSignal>) -> Option<Self> {
         let mut files = Vec::with_capacity(inner.file_count());
         let mut file_by_path = FxHashMap::default();
         file_by_path.reserve(inner.file_count());
         let mut symbol_projection = FxHashMap::default();
         symbol_projection.reserve(inner.symbol_count());
+        let mut projected_symbols = 0_usize;
 
-        for path in inner.paths() {
+        for (path_position, path) in inner.paths().enumerate() {
+            if path_position.is_multiple_of(1_024) && cancel.is_some_and(CancelSignal::is_cancelled)
+            {
+                return None;
+            }
             let hearth_symbols = inner
                 .file_symbols(path)
                 .expect("hearth-graph path iterator returned a missing file");
@@ -350,6 +384,12 @@ impl SymbolIndex {
             let mut symbols = Vec::with_capacity(hearth_symbols.len());
 
             for (symbol_position, symbol) in hearth_symbols.iter().enumerate() {
+                if projected_symbols.is_multiple_of(1_024)
+                    && cancel.is_some_and(CancelSignal::is_cancelled)
+                {
+                    return None;
+                }
+                projected_symbols += 1;
                 let key = std::ptr::from_ref(symbol) as usize;
                 let previous = symbol_projection.insert(key, (file_position, symbol_position));
                 assert!(
@@ -370,12 +410,15 @@ impl SymbolIndex {
             });
         }
 
-        Self {
+        if cancel.is_some_and(CancelSignal::is_cancelled) {
+            return None;
+        }
+        Some(Self {
             inner: Box::new(inner),
             files,
             file_by_path,
             symbol_projection,
-        }
+        })
     }
 
     /// Total number of indexed symbols.
@@ -463,6 +506,27 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             self.polls.fetch_add(1, Ordering::SeqCst) >= self.limit
         }
+    }
+
+    #[test]
+    fn test_combined_symbol_projection_observes_cancellation_between_files() {
+        let files = (0..2_048)
+            .map(|index| HearthFileAnalysis {
+                path: format!("src/file_{index:04}.ts").into(),
+                content_hash: index as u64,
+                language: Some("typescript".into()),
+                symbols: Vec::new(),
+                imports: Vec::new(),
+                has_opaque_imports: false,
+            })
+            .collect();
+        let cancel = PollCountCancel {
+            limit: 1,
+            polls: AtomicUsize::new(0),
+        };
+
+        assert!(SymbolIndex::from_analyses_cancellable(files, &cancel).is_none());
+        assert!(cancel.polls.load(Ordering::SeqCst) >= 2);
     }
 
     fn outline(source: &str, filename: &str) -> Vec<(String, SymbolKind, usize, usize)> {

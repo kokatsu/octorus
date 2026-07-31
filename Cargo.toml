@@ -17,13 +17,13 @@ name = "or"
 path = "src/main.rs"
 
 [dependencies]
-hearth-graph = { version = "=0.1.1", default-features = false, features = ["bundled-languages", "fs"] }
+hearth-graph = { version = "=0.1.1", default-features = false, features = ["bundled-languages", "fs", "resolve-js", "resolve-rust"] }
 ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28.1"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "rt", "macros", "sync", "process", "io-util", "time"] }
 tokio-util = "0.7.18"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.151"
 toml = "0.8.23"
 tempfile = "3.24.0"
 notify = "6.1.1"
@@ -103,6 +103,10 @@ harness = false
 
 [[bench]]
 name = "symbol_index"
+harness = false
+
+[[bench]]
+name = "module_graph"
 harness = false
 
 [[bench]]

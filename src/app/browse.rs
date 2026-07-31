@@ -19,13 +19,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::code_index::{CodeIndex, CodeIndexBuild};
 use crate::diff_store::{DiffScrollState, ScrollMode};
 use crate::filter::ListFilter;
 use crate::github::{
     blame_file, BlameError, BlameFile, BlameRef, CommitPrLookupError, CommitPrResolution,
     CommitPullRequest,
 };
-use crate::symbols::{CancelSignal, IndexBuild, Symbol, SymbolIndex, SymbolRef};
+use crate::module_graph::{
+    DependencyGuarantee, DependencyResult, DependencyTarget, ModuleGraph, SourceUniverse,
+};
+use crate::symbols::{CancelSignal, Symbol, SymbolIndex, SymbolRef};
 use crate::syntax::ParserPool;
 use crate::ui::common::truncate_with_width;
 
@@ -70,6 +74,14 @@ fn admit_commit_diff_for_cache(diff_text: String) -> Result<String, String> {
         Ok(diff_text)
     }
 }
+
+/// Maximum rows retained per direction in the module-graph overlay.
+///
+/// Hearth 0.1.1 materializes the full sorted query result, but bounding the
+/// octorus projection prevents unbounded labels and UI state for high fan-in.
+pub const MAX_MODULE_GRAPH_RESULTS: usize = 200;
+const MAX_MODULE_GRAPH_LABEL_WIDTH: usize = 240;
+const MAX_MODULE_GRAPH_COMPONENT_CHARS: usize = 512;
 
 /// Maximum rows shown in the symbol search overlay.
 pub const MAX_SYMBOL_SEARCH_RESULTS: usize = 200;
@@ -142,6 +154,26 @@ impl App {
         let mut completed_pr_lookup = None;
         let mut completed_line_discussion = None;
 
+        let module_graph_context_moved = match &state.overlay {
+            BrowseOverlay::ModuleGraphLoading { path, .. } => {
+                !browse_file_active
+                    || state
+                        .open
+                        .as_ref()
+                        .is_none_or(|open| open.path.as_str() != path)
+            }
+            BrowseOverlay::None
+            | BrowseOverlay::Outline { .. }
+            | BrowseOverlay::SymbolSearch { .. }
+            | BrowseOverlay::ModuleGraph(_) => false,
+        };
+        if module_graph_context_moved {
+            state.cancel_module_graph_query();
+            state.overlay = BrowseOverlay::None;
+            state.status =
+                Some("Dependency query abandoned because the open file changed".to_string());
+        }
+
         if let PrLookupState::Loading { .. } = &state.pr_lookup {
             if !browse_file_active || !state.pr_lookup_matches_current_context() {
                 state.cancel_pr_lookup_request();
@@ -170,6 +202,7 @@ impl App {
                     state.paths_receiver = None;
                     state.listing_status = repository_listing_status(&listing);
                     state.status = state.listing_status.clone();
+                    state.source_universe = listing.source_universe();
                     state.set_paths(listing.paths);
                     paths_ready = true;
                 }
@@ -193,14 +226,17 @@ impl App {
 
         if let Some(rx) = state.index_receiver.as_mut() {
             match rx.try_recv() {
-                Ok(IndexDelivery::Ready(index)) => {
+                Ok(IndexDelivery::Ready(code)) => {
                     state.index_receiver = None;
-                    state.index = IndexState::Ready(Arc::new(index));
+                    let CodeIndex { symbols, modules } = *code;
+                    state.index = IndexState::Ready(Arc::new(symbols));
+                    state.module_graph = ModuleGraphState::Ready(Arc::new(modules));
                     state.refresh_open_file_symbols();
                 }
                 Ok(IndexDelivery::Failed(message)) => {
                     state.index_receiver = None;
                     state.index = IndexState::Failed;
+                    state.module_graph = ModuleGraphState::Failed;
                     state.status = Some(message);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {}
@@ -208,7 +244,43 @@ impl App {
                     state.index_receiver = None;
                     if !state.cancel_token.is_cancelled() {
                         state.index = IndexState::Failed;
-                        state.status = Some("symbol indexing task ended".to_string());
+                        state.module_graph = ModuleGraphState::Failed;
+                        state.status = Some("code indexing task ended".to_string());
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = state.module_graph_query_receiver.as_mut() {
+            match rx.try_recv() {
+                Ok(delivery) => {
+                    state.module_graph_query_receiver = None;
+                    state.module_graph_query_cancel = None;
+                    let current = matches!(
+                        &state.overlay,
+                        BrowseOverlay::ModuleGraphLoading { request_id, path }
+                            if *request_id == delivery.request_id && path == &delivery.path
+                    ) && state
+                        .open
+                        .as_ref()
+                        .is_some_and(|open| open.path == delivery.path);
+                    if current {
+                        state.status = None;
+                        state.overlay = BrowseOverlay::ModuleGraph(delivery.panel);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    state.module_graph_query_receiver = None;
+                    let cancelled = state
+                        .module_graph_query_cancel
+                        .take()
+                        .is_some_and(|cancel| cancel.is_cancelled());
+                    if !cancelled
+                        && matches!(state.overlay, BrowseOverlay::ModuleGraphLoading { .. })
+                    {
+                        state.overlay = BrowseOverlay::None;
+                        state.status = Some("Dependency query task ended".to_string());
                     }
                 }
             }
@@ -501,7 +573,7 @@ impl App {
         }
     }
 
-    /// Kick off the repository-wide symbol index on a background thread.
+    /// Kick off one repository-wide symbol/import analysis on a background thread.
     fn start_symbol_index_build(&mut self) {
         let Some(state) = self.browse_state.as_mut() else {
             return;
@@ -514,24 +586,28 @@ impl App {
         // reuse installs no second receiver. A second build therefore cannot
         // start within one state today, and this guard keeps that invariant
         // safe if refresh support is added later.
-        if matches!(state.index, IndexState::Building) {
+        if matches!(state.index, IndexState::Building)
+            || matches!(state.module_graph, ModuleGraphState::Building)
+        {
             return;
         }
 
         let paths = paths.clone();
         let repo_root = state.repo_root.clone();
+        let universe = state.source_universe;
         let (tx, rx) = mpsc::channel(1);
         state.index = IndexState::Building;
+        state.module_graph = ModuleGraphState::Building;
         state.index_receiver = Some(rx);
         let cancel_token = state.cancel_token.clone();
 
         tokio::task::spawn_blocking(move || {
-            match SymbolIndex::build_cancellable(&repo_root, &paths, &cancel_token) {
-                IndexBuild::Completed(index) => {
-                    let _ = tx.blocking_send(IndexDelivery::Ready(index));
+            match CodeIndex::build_cancellable(&repo_root, &paths, universe, &cancel_token) {
+                CodeIndexBuild::Completed(code) => {
+                    let _ = tx.blocking_send(IndexDelivery::Ready(code));
                 }
-                IndexBuild::Cancelled { .. } => {}
-                IndexBuild::Failed { message } => {
+                CodeIndexBuild::Cancelled { .. } => {}
+                CodeIndexBuild::Failed { message } => {
                     let _ = tx.blocking_send(IndexDelivery::Failed(message));
                 }
             }
@@ -1658,6 +1734,25 @@ impl IndexState {
     }
 }
 
+/// Lifecycle of the repository module graph built in the symbol analysis pass.
+#[derive(Debug, Default)]
+pub enum ModuleGraphState {
+    #[default]
+    Idle,
+    Building,
+    Ready(Arc<ModuleGraph>),
+    Failed,
+}
+
+impl ModuleGraphState {
+    pub fn ready(&self) -> Option<&ModuleGraph> {
+        match self {
+            Self::Ready(graph) => Some(graph),
+            Self::Idle | Self::Building | Self::Failed => None,
+        }
+    }
+}
+
 /// Lifecycle of the blame annotation for the open browser file.
 #[derive(Debug, Default)]
 pub(crate) enum BlameState {
@@ -2019,6 +2114,61 @@ impl OpenFile {
     }
 }
 
+/// Direction shown by the module-graph overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleGraphDirection {
+    Dependencies,
+    Dependents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraphJump {
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraphRow {
+    pub label: String,
+    pub jump: Option<ModuleGraphJump>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraphRows {
+    pub rows: Vec<ModuleGraphRow>,
+    pub total: usize,
+    pub guarantee: DependencyGuarantee,
+}
+
+/// Precomputed dependency rows; drawing never walks the graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraphPanel {
+    pub direction: ModuleGraphDirection,
+    pub selected: usize,
+    pub dependencies: ModuleGraphRows,
+    pub dependents: ModuleGraphRows,
+}
+
+impl ModuleGraphPanel {
+    pub fn current(&self) -> &ModuleGraphRows {
+        match self.direction {
+            ModuleGraphDirection::Dependencies => &self.dependencies,
+            ModuleGraphDirection::Dependents => &self.dependents,
+        }
+    }
+
+    pub fn current_rows(&self) -> &[ModuleGraphRow] {
+        &self.current().rows
+    }
+
+    pub fn set_direction(&mut self, direction: ModuleGraphDirection) {
+        self.direction = direction;
+        self.selected = self
+            .selected
+            .min(self.current_rows().len().saturating_sub(1));
+    }
+}
+
 /// Which overlay is on top of the browser, if any.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub enum BrowseOverlay {
@@ -2028,6 +2178,10 @@ pub enum BrowseOverlay {
     Outline { selected: usize },
     /// Repository-wide fuzzy symbol search.
     SymbolSearch { query: String, selected: usize },
+    /// A request-scoped dependency panel build running off the UI thread.
+    ModuleGraphLoading { request_id: u64, path: String },
+    /// Direct imports and reverse dependencies of the open file.
+    ModuleGraph(ModuleGraphPanel),
 }
 
 /// Lifecycle of the file currently being opened.
@@ -2061,6 +2215,12 @@ pub(crate) struct CommitDiffLoadResult {
     request_id: u64,
     sha: String,
     result: Result<DiffCache, String>,
+}
+
+pub(crate) struct ModuleGraphPanelDelivery {
+    request_id: u64,
+    path: String,
+    panel: ModuleGraphPanel,
 }
 
 pub(crate) struct PrLookupLoadResult {
@@ -2208,7 +2368,7 @@ fn deliver_highlighted_cache<F>(
 /// `IndexBuild::Cancelled` is deliberately absent: a cancelled build sends
 /// nothing at all, so it cannot be observed here.
 pub(crate) enum IndexDelivery {
-    Ready(SymbolIndex),
+    Ready(Box<CodeIndex>),
     Failed(String),
 }
 
@@ -2232,6 +2392,10 @@ pub struct BrowseState {
     pub cursor_line: usize,
     pub scroll_offset: usize,
     pub index: IndexState,
+    pub module_graph: ModuleGraphState,
+    module_graph_query_generation: u64,
+    module_graph_query_cancel: Option<CancellationToken>,
+    pub source_universe: SourceUniverse,
     pub overlay: BrowseOverlay,
     pub jump_stack: Vec<BrowseJump>,
     /// Transient message shown in the footer (unreadable file, no definition, …).
@@ -2247,6 +2411,7 @@ pub struct BrowseState {
     pub return_state: AppState,
     pub(crate) paths_receiver: Option<mpsc::Receiver<Result<RepositoryFiles, String>>>,
     pub(crate) index_receiver: Option<mpsc::Receiver<IndexDelivery>>,
+    pub(crate) module_graph_query_receiver: Option<mpsc::Receiver<ModuleGraphPanelDelivery>>,
     pub(crate) file_receiver: Option<mpsc::Receiver<FileLoadResult>>,
     pub(crate) blame_receiver: Option<mpsc::Receiver<BlameLoadResult>>,
     pub(crate) commit_diff_receiver: Option<mpsc::Receiver<CommitDiffLoadResult>>,
@@ -2286,6 +2451,10 @@ impl BrowseState {
             cursor_line: 0,
             scroll_offset: 0,
             index: IndexState::Idle,
+            module_graph: ModuleGraphState::Idle,
+            module_graph_query_generation: 0,
+            module_graph_query_cancel: None,
+            source_universe: SourceUniverse::Partial,
             overlay: BrowseOverlay::None,
             jump_stack: Vec::new(),
             status: None,
@@ -2293,6 +2462,7 @@ impl BrowseState {
             return_state,
             paths_receiver: None,
             index_receiver: None,
+            module_graph_query_receiver: None,
             file_receiver: None,
             blame_receiver: None,
             commit_diff_receiver: None,
@@ -2300,6 +2470,44 @@ impl BrowseState {
             line_discussion_receiver: None,
             highlight_receiver: None,
         }
+    }
+
+    pub(crate) fn start_module_graph_query(&mut self, path: String, graph: Arc<ModuleGraph>) {
+        self.cancel_module_graph_query();
+        self.module_graph_query_generation = self.module_graph_query_generation.wrapping_add(1);
+        let request_id = self.module_graph_query_generation;
+        let cancel = self.cancel_token.child_token();
+        let task_cancel = cancel.clone();
+        let task_path = path.clone();
+        let (tx, rx) = mpsc::channel(1);
+        self.module_graph_query_cancel = Some(cancel);
+        self.module_graph_query_receiver = Some(rx);
+        self.overlay = BrowseOverlay::ModuleGraphLoading { request_id, path };
+
+        tokio::task::spawn_blocking(move || {
+            let Some(panel) = build_module_graph_panel(&graph, &task_path, &task_cancel) else {
+                return;
+            };
+            if !task_cancel.is_cancelled() {
+                let _ = tx.blocking_send(ModuleGraphPanelDelivery {
+                    request_id,
+                    path: task_path,
+                    panel,
+                });
+            }
+        });
+    }
+
+    pub(crate) fn cancel_module_graph_query(&mut self) {
+        if let Some(cancel) = self.module_graph_query_cancel.take() {
+            cancel.cancel();
+        }
+        self.module_graph_query_receiver = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn module_graph_query_token(&self) -> Option<CancellationToken> {
+        self.module_graph_query_cancel.clone()
     }
 
     fn cancel_blame_request(&mut self) {
@@ -2614,6 +2822,132 @@ impl BrowseState {
     }
 }
 
+fn build_module_graph_panel(
+    graph: &ModuleGraph,
+    path: &str,
+    cancel: &dyn CancelSignal,
+) -> Option<ModuleGraphPanel> {
+    let (dependencies, dependencies_total) =
+        graph.dependencies_bounded(path, MAX_MODULE_GRAPH_RESULTS)?;
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let dependencies = module_graph_rows(
+        graph,
+        dependencies,
+        dependencies_total,
+        ModuleGraphDirection::Dependencies,
+        cancel,
+    )?;
+    let (dependents, dependents_total) =
+        graph.dependents_bounded(path, MAX_MODULE_GRAPH_RESULTS)?;
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let dependents = module_graph_rows(
+        graph,
+        dependents,
+        dependents_total,
+        ModuleGraphDirection::Dependents,
+        cancel,
+    )?;
+    Some(ModuleGraphPanel {
+        direction: ModuleGraphDirection::Dependencies,
+        selected: 0,
+        dependencies,
+        dependents,
+    })
+}
+
+fn module_graph_rows(
+    graph: &ModuleGraph,
+    result: DependencyResult,
+    total: usize,
+    direction: ModuleGraphDirection,
+    cancel: &dyn CancelSignal,
+) -> Option<ModuleGraphRows> {
+    let guarantee = result.guarantee;
+    let mut rows = Vec::with_capacity(result.edges.len());
+    for (index, edge) in result.edges.into_iter().enumerate() {
+        if index.is_multiple_of(64) && cancel.is_cancelled() {
+            return None;
+        }
+        let row = match direction {
+            ModuleGraphDirection::Dependencies => {
+                let specifier = bounded_module_graph_text(&edge.specifier);
+                let (target, jump) = match edge.target {
+                    DependencyTarget::Path(path) => {
+                        let jump = graph.is_listed(&path).then(|| ModuleGraphJump {
+                            path: path.clone(),
+                            line: 0,
+                        });
+                        (bounded_module_graph_text(&path), jump)
+                    }
+                    DependencyTarget::External(package) => (
+                        format!("package {}", bounded_module_graph_text(&package)),
+                        None,
+                    ),
+                    DependencyTarget::Unresolved(reason) => (
+                        format!("unresolved ({})", bounded_module_graph_text(&reason)),
+                        None,
+                    ),
+                };
+                ModuleGraphRow {
+                    label: bounded_module_graph_text(&format!(
+                        "[{}] {} → {}  :{}",
+                        edge.kind.label(),
+                        specifier,
+                        target,
+                        edge.line
+                    )),
+                    jump,
+                }
+            }
+            ModuleGraphDirection::Dependents => {
+                let from = bounded_module_graph_text(&edge.from);
+                let specifier = bounded_module_graph_text(&edge.specifier);
+                ModuleGraphRow {
+                    label: bounded_module_graph_text(&format!(
+                        "[{}] {}:{}  {}",
+                        edge.kind.label(),
+                        from,
+                        edge.line,
+                        specifier
+                    )),
+                    jump: graph.is_listed(&edge.from).then(|| ModuleGraphJump {
+                        path: edge.from,
+                        line: edge.line.saturating_sub(1),
+                    }),
+                }
+            }
+        };
+        rows.push(row);
+    }
+    Some(ModuleGraphRows {
+        rows,
+        total,
+        guarantee,
+    })
+}
+
+pub(crate) fn bounded_module_graph_text(text: &str) -> String {
+    let end = text
+        .char_indices()
+        .nth(MAX_MODULE_GRAPH_COMPONENT_CHARS)
+        .map_or(text.len(), |(index, _)| index);
+    let character_truncated = end < text.len();
+    if character_truncated {
+        let mut marked = String::with_capacity(end + '…'.len_utf8());
+        marked.push_str(&text[..end]);
+        if !marked.ends_with('…') {
+            marked.push('…');
+        }
+        truncate_with_width(&marked, MAX_MODULE_GRAPH_LABEL_WIDTH).into_owned()
+    } else {
+        truncate_with_width(&text[..end], MAX_MODULE_GRAPH_LABEL_WIDTH).into_owned()
+    }
+}
+
 /// A bounded repository file listing plus its full de-duplicated size.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RepositoryFiles {
@@ -2622,6 +2956,16 @@ pub struct RepositoryFiles {
     pub total: usize,
     /// Invalid UTF-8 paths omitted because the browser stores openable paths as `String`.
     pub skipped_non_utf8: usize,
+}
+
+impl RepositoryFiles {
+    pub fn source_universe(&self) -> SourceUniverse {
+        if self.total == self.paths.len() && self.skipped_non_utf8 == 0 {
+            SourceUniverse::Complete
+        } else {
+            SourceUniverse::Partial
+        }
+    }
 }
 
 /// List the repository's files: tracked plus untracked-but-not-ignored.
@@ -3311,6 +3655,111 @@ mod tests {
 
         assert_eq!(state.tree.row_count(), 0);
         assert!(state.selected_path().is_none());
+    }
+
+    #[test]
+    fn test_module_graph_labels_are_bounded_by_unicode_display_width() {
+        let bounded = bounded_module_graph_text(&"依存先".repeat(1_000));
+
+        assert!(
+            unicode_width::UnicodeWidthStr::width(bounded.as_str()) <= MAX_MODULE_GRAPH_LABEL_WIDTH
+        );
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.chars().count() <= MAX_MODULE_GRAPH_COMPONENT_CHARS + 1);
+    }
+
+    #[test]
+    fn test_module_graph_label_reserves_width_for_a_character_cap_ellipsis() {
+        let text = format!("[import] {}{}tail", "a".repeat(231), "\u{301}".repeat(272));
+        let bounded = bounded_module_graph_text(&text);
+        let width = unicode_width::UnicodeWidthStr::width(bounded.as_str());
+
+        assert!(width <= MAX_MODULE_GRAPH_LABEL_WIDTH);
+        assert!(bounded.ends_with('…'));
+        insta::assert_snapshot!(format!("width={width} suffix={}", bounded.ends_with('…')), @"width=240 suffix=true");
+    }
+
+    struct CancelDuringPanelRows {
+        polls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CancelSignal for CancelDuringPanelRows {
+        fn is_cancelled(&self) -> bool {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        }
+    }
+
+    #[test]
+    fn test_high_fan_in_panel_retains_the_limit_and_preserves_the_total() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/center.ts"),
+            "export const center = 1;\n",
+        )
+        .unwrap();
+        let mut paths = vec!["src/center.ts".to_string()];
+        for index in 0..250 {
+            let path = format!("src/importer_{index:03}.ts");
+            std::fs::write(
+                dir.path().join(&path),
+                format!("import './center';\nexport const value{index} = {index};\n"),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let CodeIndexBuild::Completed(index) = CodeIndex::build_cancellable(
+            dir.path(),
+            &paths,
+            SourceUniverse::Complete,
+            &CancellationToken::new(),
+        ) else {
+            panic!("high fan-in fixture must build");
+        };
+
+        let cancel_during_rows = CancelDuringPanelRows {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            build_module_graph_panel(&index.modules, "src/center.ts", &cancel_during_rows)
+                .is_none(),
+            "row projection ignored cancellation"
+        );
+        assert_eq!(
+            cancel_during_rows
+                .polls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "cancellation must occur at the first dependent-row poll"
+        );
+
+        let mut panel =
+            build_module_graph_panel(&index.modules, "src/center.ts", &CancellationToken::new())
+                .expect("panel");
+
+        assert_eq!(panel.dependents.total, 250);
+        assert_eq!(panel.dependents.rows.len(), MAX_MODULE_GRAPH_RESULTS);
+        assert!(panel
+            .dependents
+            .rows
+            .iter()
+            .all(
+                |row| unicode_width::UnicodeWidthStr::width(row.label.as_str())
+                    <= MAX_MODULE_GRAPH_LABEL_WIDTH,
+            ));
+
+        panel.set_direction(ModuleGraphDirection::Dependents);
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
+        state.set_paths(paths);
+        state.overlay = BrowseOverlay::ModuleGraph(panel);
+        app.browse_state = Some(state);
+        app.state = AppState::RepoBrowseFile;
+        let rendered = render_at(&mut app, 80, 12);
+        assert!(
+            rendered.contains("Imported by (200/250 edges shown, exact)"),
+            "{rendered}"
+        );
     }
 
     // ===== cursor and scrolling =====
@@ -6390,16 +6839,39 @@ mod tests {
         let mut state = BrowseState::new(PathBuf::from("/repo"), AppState::FileList);
         let (tx, rx) = mpsc::channel(1);
         state.index = IndexState::Building;
+        state.module_graph = ModuleGraphState::Building;
         state.index_receiver = Some(rx);
         app.browse_state = Some(state);
         drop(tx);
 
         app.poll_browse_updates();
 
-        assert!(matches!(
-            app.browse_state.as_ref().unwrap().index,
-            IndexState::Failed
-        ));
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.index, IndexState::Failed));
+        assert!(matches!(state.module_graph, ModuleGraphState::Failed));
+    }
+
+    #[test]
+    fn test_poll_browse_updates_reports_a_disconnected_module_graph_query() {
+        let mut app = App::new_for_test();
+        let mut state = state_with_open_file(1);
+        let (tx, rx) = mpsc::channel::<ModuleGraphPanelDelivery>(1);
+        state.module_graph_query_receiver = Some(rx);
+        state.module_graph_query_cancel = Some(CancellationToken::new());
+        state.overlay = BrowseOverlay::ModuleGraphLoading {
+            request_id: 9,
+            path: "src/a.rs".to_string(),
+        };
+        app.browse_state = Some(state);
+        app.state = AppState::RepoBrowseFile;
+        drop(tx);
+
+        app.poll_browse_updates();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert_eq!(state.status.as_deref(), Some("Dependency query task ended"));
+        assert!(state.module_graph_query_receiver.is_none());
     }
 
     #[tokio::test]
@@ -6423,6 +6895,7 @@ mod tests {
 
         let state = app.browse_state.as_ref().unwrap();
         assert!(matches!(state.index, IndexState::Failed));
+        assert!(matches!(state.module_graph, ModuleGraphState::Failed));
         let message = state.status.as_deref().expect("failure reason in footer");
         assert!(message.contains("cannot build symbol index"), "{message}");
         assert!(message.contains("removed-worktree"), "{message}");
@@ -6457,6 +6930,80 @@ mod tests {
             panic!("completed build must become ready");
         };
         assert!(!index.search("searchable_alpha", 10).is_empty());
+    }
+
+    #[test]
+    fn test_repository_listing_completeness_controls_graph_universe() {
+        assert_eq!(
+            RepositoryFiles {
+                paths: vec!["src/app.ts".to_string()],
+                total: 1,
+                skipped_non_utf8: 0,
+            }
+            .source_universe(),
+            crate::module_graph::SourceUniverse::Complete
+        );
+        assert_eq!(
+            RepositoryFiles {
+                paths: vec!["src/app.ts".to_string()],
+                total: 2,
+                skipped_non_utf8: 0,
+            }
+            .source_universe(),
+            crate::module_graph::SourceUniverse::Partial
+        );
+        assert_eq!(
+            RepositoryFiles {
+                paths: vec!["src/app.ts".to_string()],
+                total: 1,
+                skipped_non_utf8: 1,
+            }
+            .source_universe(),
+            crate::module_graph::SourceUniverse::Partial
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_index_build_makes_symbols_and_module_graph_ready_together() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app.ts"),
+            "import { helper } from './helper';\nexport function app() { return helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/helper.ts"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        let mut app = App::new_for_test();
+        let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
+        let (tx, rx) = mpsc::channel(1);
+        state.paths_receiver = Some(rx);
+        app.browse_state = Some(state);
+        tx.send(Ok(RepositoryFiles {
+            paths: vec!["src/app.ts".to_string(), "src/helper.ts".to_string()],
+            total: 2,
+            skipped_non_utf8: 0,
+        }))
+        .await
+        .unwrap();
+
+        settle_index(&mut app).await;
+
+        let state = app.browse_state.as_ref().unwrap();
+        let IndexState::Ready(symbols) = &state.index else {
+            panic!("symbols must become ready");
+        };
+        assert!(!symbols.search("helper", 10).is_empty());
+        let ModuleGraphState::Ready(modules) = &state.module_graph else {
+            panic!("module graph must become ready with symbols");
+        };
+        assert_eq!(
+            modules.dependencies("src/app.ts").unwrap().edges[0].target,
+            crate::module_graph::DependencyTarget::Path("src/helper.ts".to_string())
+        );
     }
 
     #[tokio::test]
@@ -6517,8 +7064,14 @@ mod tests {
                 depth: 0,
             }],
         }]);
+        let injected_code = CodeIndex {
+            symbols: injected_index,
+            modules: ModuleGraph::default(),
+        };
         assert!(
-            tx.send(IndexDelivery::Ready(injected_index)).await.is_ok(),
+            tx.send(IndexDelivery::Ready(Box::new(injected_code)))
+                .await
+                .is_ok(),
             "starting a second build must not replace and disconnect the in-flight receiver"
         );
         app.poll_browse_updates();
