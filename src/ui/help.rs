@@ -1017,7 +1017,7 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             fmt_key(&kb.symbol_search.display(), key_width)
         )),
         Line::from(format!(
-            "{}  Show imports and importers",
+            "{}  Open / focus UML module graph pane",
             fmt_key(&kb.module_graph.display(), key_width)
         )),
         Line::from(format!(
@@ -1047,6 +1047,40 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
         Line::from(format!(
             "{}  Jump back",
             fmt_key(&kb.jump_back.display(), key_width)
+        )),
+        Line::from(vec![Span::styled(
+            "  Graph Focus:",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(format!(
+            "{}  Switch imports / imported by",
+            fmt_key(
+                &format!(
+                    "Tab / {} / {}",
+                    kb.move_left.display(),
+                    kb.move_right.display()
+                ),
+                key_width
+            )
+        )),
+        Line::from(format!(
+            "{}  Select a module node",
+            fmt_key(
+                &format!("{} / {}", kb.move_down.display(), kb.move_up.display()),
+                key_width
+            )
+        )),
+        Line::from(format!(
+            "{}  Open a listed local module",
+            fmt_key(&kb.open_panel.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Close graph pane",
+            fmt_key(&kb.module_graph.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Return focus to code",
+            fmt_key(&format!("Esc / {}", kb.quit.display_primary()), key_width)
         )),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -1515,6 +1549,32 @@ mod tests {
         assert!(joined.contains("Readline-style editing keys"));
         for key in ["Ctrl-A", "Ctrl-E", "Ctrl-W", "Ctrl-K", "Ctrl-U"] {
             assert!(joined.contains(key), "help missing binding: {key}");
+        }
+    }
+
+    #[test]
+    fn test_graph_focus_help_uses_configured_bindings() {
+        use crate::keybinding::{KeyBinding, KeySequence};
+
+        let kb = KeybindingsConfig {
+            move_left: KeySequence::single(KeyBinding::char('a')),
+            move_right: KeySequence::single(KeyBinding::char('d')),
+            move_down: KeySequence::single(KeyBinding::char('n')),
+            move_up: KeySequence::single(KeyBinding::char('p')),
+            open_panel: KeySequence::single(KeyBinding::char(' ')),
+            module_graph: KeySequence::double(KeyBinding::char('m'), KeyBinding::char('i')),
+            quit: KeySequence::single(KeyBinding::char('z')),
+            ..KeybindingsConfig::default()
+        };
+
+        let joined = build_help_lines(&kb)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for hint in ["Tab / a / d", "n / p", "Space", "mi", "Esc / z"] {
+            assert!(joined.contains(hint), "help missing {hint:?}: {joined}");
         }
     }
 

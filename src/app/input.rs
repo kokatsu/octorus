@@ -165,6 +165,7 @@ impl App {
                     AppState::RepoBrowseFile => {
                         self.handle_repo_browse_file_input(key, terminal)?
                     }
+                    AppState::RepoBrowseGraph => self.handle_repo_browse_graph_input(key),
                 }
             }
         }

@@ -173,6 +173,8 @@ pub enum AppState {
     RepoBrowseTree,
     /// Repository Browser, file content pane focused.
     RepoBrowseFile,
+    /// Repository Browser, module graph pane focused.
+    RepoBrowseGraph,
 }
 
 impl AppState {
@@ -193,12 +195,16 @@ impl AppState {
                 | Self::Cockpit
                 | Self::RepoBrowseTree
                 | Self::RepoBrowseFile
+                | Self::RepoBrowseGraph
         )
     }
 
     /// Whether this is a Repository Browser screen.
     pub fn is_repo_browse(self) -> bool {
-        matches!(self, Self::RepoBrowseTree | Self::RepoBrowseFile)
+        matches!(
+            self,
+            Self::RepoBrowseTree | Self::RepoBrowseFile | Self::RepoBrowseGraph
+        )
     }
 
     /// Whether this is an Issue-related screen.

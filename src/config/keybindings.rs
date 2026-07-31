@@ -264,6 +264,18 @@ impl KeybindingsConfig {
             ("confirm_no", &self.confirm_no),
         ];
 
+        let tab = KeyBinding::named(NamedKey::Tab);
+        if self
+            .module_graph
+            .all_sequences()
+            .any(|keys| keys.first() == Some(&tab))
+        {
+            errors.push(
+                "keybinding 'module_graph' cannot use the reserved Tab graph control or start with it"
+                    .to_string(),
+            );
+        }
+
         for (name, seq) in &bindings {
             if seq.keys.is_empty() {
                 errors.push(format!("keybinding '{}' is empty", name));
@@ -408,6 +420,7 @@ fn is_context_compatible(name1: &str, name2: &str) -> bool {
         "jump_back",
         "quit",
         "help",
+        "open_panel",
         "go_to_definition",
         "go_to_file",
         "toggle_zen_mode",

@@ -1344,6 +1344,7 @@ timeout_secs = 3600
             ("o", "symbol_outline"),
             ("s", "symbol_search"),
             ("g", "toggle_blame"),
+            ("Enter", "open_panel"),
         ] {
             let source = format!("[keybindings]\nmodule_graph = \"{binding}\"\n");
             let config: Config = toml::from_str(&source).unwrap();
@@ -1353,6 +1354,21 @@ timeout_secs = 3600
                     error.contains("module_graph") && error.contains(conflicting_name)
                 }),
                 "{binding:?} did not conflict with {conflicting_name}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_module_graph_rejects_tab_and_tab_prefixed_sequences() {
+        for binding in ["\"Tab\"", "[\"Tab\", \"i\"]"] {
+            let source = format!("[keybindings]\nmodule_graph = {binding}\n");
+            let config: Config = toml::from_str(&source).unwrap();
+            let errors = config.keybindings.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| {
+                    error.contains("module_graph") && error.contains("reserved Tab")
+                }),
+                "{binding} did not reject Tab: {errors:?}"
             );
         }
     }

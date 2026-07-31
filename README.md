@@ -134,7 +134,7 @@ There is a second message ahead of that one. `o` and `gd` answer questions about
 |---------|-----|-------------|
 | File outline | `o` | Symbols of the open file, indented by nesting depth, with the cursor's enclosing symbol pre-selected. Nesting follows the tags query: a Python method inside a class indents, a Rust method inside `impl` does not, because an `impl` block is not itself a tagged definition |
 | Symbol search | `s` | Fuzzy search across every symbol in the repository, best 200 matches listed; `Enter` opens the file at the definition |
-| Imports / imported by | `i` | Show direct imports and reverse dependencies of the open Rust, JavaScript, or TypeScript file. `Tab` or `h/l` switches direction; `Enter` opens a listed local file |
+| UML module graph | `i` | Open a right-side graph pane for the current Rust, JavaScript, or TypeScript file. The current module and its direct imports/importers are drawn as boxes and arrows; `Enter` opens a listed local module |
 | Go to definition | `gd` | Resolve the cursor **line** against the index — a CST match, not a grep for `fn <name>` |
 | Jump back | `Ctrl-o` | Return to the position before the last jump |
 
@@ -142,7 +142,7 @@ There is a second message ahead of that one. `o` and `gd` answer questions about
 
 Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Ruby, C, C++, Java, C#, Lua, PHP, Swift, Bash, Zig, Haskell, MoonBit, and Markdown (headings become the outline of a README).
 
-The same background parse pass also extracts imports for Rust, TypeScript, TSX, JavaScript, and JSX. JavaScript/TypeScript resolution handles relative paths, packages, and a root `tsconfig.json` or `jsconfig.json`; Rust module resolution is deliberately best-effort. Dependency queries run off the UI thread; each direction retains up to 200 rows and shows the full edge count when truncated. The overlay labels every answer `exact` or `approximate`. Rust answers are approximate, as are reverse dependencies when the repository listing was truncated, a non-UTF-8 path was omitted, or an import-supporting file could not be analyzed.
+The same background parse pass also extracts imports for Rust, TypeScript, TSX, JavaScript, and JSX. JavaScript/TypeScript resolution handles relative paths, packages, and a root `tsconfig.json` or `jsconfig.json`; Rust module resolution is deliberately best-effort. Dependency queries run off the UI thread; each direction retains up to 200 nodes and shows the full edge count when truncated. Pressing `i` adds a third pane to the right of the code view: the current module uses a double-line box, related modules use UML-like boxes and directional connectors, and every answer is labelled `exact` or `approximate`. The pane follows file navigation and refreshes asynchronously for the new current file. Rust answers are approximate, as are reverse dependencies when the repository listing was truncated, a non-UTF-8 path was omitted, or an import-supporting file could not be analyzed.
 
 #### Repository Browser Keybindings
 
@@ -171,13 +171,14 @@ The same background parse pass also extracts imports for Rust, TypeScript, TSX, 
 | `gg` / `G` | Jump to first / last line |
 | `o` | File outline |
 | `s` | Repository symbol search |
-| `i` | Show imports / imported by |
+| `i` | Open or focus the right-side UML module graph |
 | `gb` | Toggle blame gutter |
 | `gc` | Open the blamed line's commit diff inside the browser |
 | `gp` | Open the PR that introduced the blamed line's commit |
 | `gd` | Go to definition |
 | `gf` | Open file in your editor at the cursor line |
 | `Ctrl-o` | Jump back |
+| `l` / `→` | Focus the graph pane when it is visible |
 | `h` / `←` / `q` / `Esc` | Back to the tree |
 
 **Outline / Symbol search overlay:**
@@ -191,14 +192,15 @@ The same background parse pass also extracts imports for Rust, TypeScript, TSX, 
 | `Enter` | Jump to the symbol |
 | `Esc` | Close |
 
-**Imports / imported by overlay:**
+**Module Graph Focus:**
 
 | Key | Action |
 |-----|--------|
 | `Tab`, `h` / `l`, `←` / `→` | Switch between outgoing imports and incoming importers |
-| `j` / `k`, `↑` / `↓` | Move selection |
-| `Enter` | Open a listed local target/importer; external, unresolved, and unlisted targets stay visible but do not open |
-| `Esc` | Close |
+| `j` / `k`, `↑` / `↓` | Select a module node |
+| `Enter` | Open a listed local target/importer; external, unresolved, and unlisted nodes stay visible but do not open |
+| `i` | Close the graph pane and return to code |
+| `Esc` / `q` | Return focus to code while leaving the graph pane visible |
 
 ### Pull Requests
 
@@ -1035,7 +1037,7 @@ go_to_definition = ["g", "d"]
 | `repo_browse` | `b` | Open the Repository Browser |
 | `symbol_outline` | `o` | File outline (browser only) |
 | `symbol_search` | `s` | Repository symbol search (browser only) |
-| `module_graph` | `i` | Show direct imports and reverse dependencies (browser file pane only) |
+| `module_graph` | `i` | Open/focus the UML module graph pane (browser file/graph panes only) |
 | `toggle_blame` | `gb` | Toggle blame gutter (browser file pane only) |
 | `open_blame_commit` | `gc` | Open the blamed line's commit diff (browser file pane only) |
 | `open_blame_pr` | `gp` | Open the PR for the blamed line's commit (browser file pane only) |

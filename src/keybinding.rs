@@ -353,9 +353,14 @@ impl KeySequence {
         std::iter::once(self.keys.as_slice()).chain(self.alt.iter().map(|v| v.as_slice()))
     }
 
+    /// Display only the primary sequence for compact, context-specific hints.
+    pub fn display_primary(&self) -> String {
+        self.keys.iter().map(KeyBinding::display).collect()
+    }
+
     /// Display string for help screen (shows primary | alt)
     pub fn display(&self) -> String {
-        let primary: String = self.keys.iter().map(|k| k.display()).collect();
+        let primary = self.display_primary();
         if self.alt.is_empty() {
             primary
         } else {

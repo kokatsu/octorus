@@ -1,6 +1,6 @@
 //! Key handling for the Repository Browser.
 //!
-//! Two focus states (tree / file) plus modal outline, search, and module overlays.
+//! Three focus states (tree / file / graph) plus modal outline and search overlays.
 //! Overlays are checked first so they behave as modal layers rather than as an
 //! extra set of conditionals sprinkled through the pane handlers.
 
@@ -14,8 +14,10 @@ use std::io::Stdout;
 use crate::filter::ListFilter;
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
+#[cfg(test)]
+use super::browse::ModuleGraphState;
 use super::browse::{
-    BrowseCommitDiffState, BrowseOverlay, IndexState, ModuleGraphDirection, ModuleGraphState,
+    BrowseCommitDiffState, BrowseOverlay, IndexState, ModuleGraphDirection, ModuleGraphPaneState,
     PrLookupState,
 };
 use super::browse_discussion::{DiscussionView, LineDiscussionState};
@@ -144,6 +146,17 @@ impl App {
         }
         if self.matches_single_key(&key, &kb.module_graph) {
             self.open_browse_module_graph();
+            return Ok(());
+        }
+
+        let graph_visible = self
+            .browse_state
+            .as_ref()
+            .is_some_and(|state| state.module_graph_pane.is_visible());
+        if graph_visible
+            && (key.code == KeyCode::Right || self.matches_single_key(&key, &kb.move_right))
+        {
+            self.state = AppState::RepoBrowseGraph;
             return Ok(());
         }
 
@@ -656,10 +669,6 @@ impl App {
                 self.handle_browse_symbol_search_input(key);
                 true
             }
-            BrowseOverlay::ModuleGraphLoading { .. } | BrowseOverlay::ModuleGraph(_) => {
-                self.handle_browse_module_graph_input(key);
-                true
-            }
         }
     }
 
@@ -765,9 +774,36 @@ impl App {
         state.clamp_symbol_search_selection();
     }
 
-    fn handle_browse_module_graph_input(&mut self, key: event::KeyEvent) {
+    pub(crate) fn handle_repo_browse_graph_input(&mut self, key: event::KeyEvent) {
+        if self.handle_line_discussion_input(&key) {
+            return;
+        }
+        if self.handle_pr_lookup_selection_input(&key) {
+            return;
+        }
+        if self.handle_browse_overlay_input(key) {
+            return;
+        }
+        if self.handle_browse_shared_input(&key) {
+            return;
+        }
+        if self.handle_browse_graph_module_sequence(&key) {
+            return;
+        }
+
         let kb = self.config.keybindings.clone();
-        let close = key.code == KeyCode::Esc || self.matches_single_key(&key, &kb.quit);
+        if self.matches_single_key(&key, &kb.module_graph) {
+            if let Some(state) = self.browse_state.as_mut() {
+                state.close_module_graph_pane();
+            }
+            self.state = AppState::RepoBrowseFile;
+            return;
+        }
+        if key.code == KeyCode::Esc || self.matches_single_key(&key, &kb.quit) {
+            self.state = AppState::RepoBrowseFile;
+            return;
+        }
+
         let down = self.matches_single_key(&key, &kb.move_down);
         let up = self.matches_single_key(&key, &kb.move_up);
         let confirm = self.matches_single_key(&key, &kb.open_panel);
@@ -781,20 +817,12 @@ impl App {
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
-        if matches!(state.overlay, BrowseOverlay::ModuleGraphLoading { .. }) {
-            if close {
-                state.cancel_module_graph_query();
-                state.overlay = BrowseOverlay::None;
+        let ModuleGraphPaneState::Ready(panel) = &mut state.module_graph_pane else {
+            if matches!(state.module_graph_pane, ModuleGraphPaneState::Closed) {
+                self.state = AppState::RepoBrowseFile;
             }
             return;
-        }
-        let BrowseOverlay::ModuleGraph(panel) = &mut state.overlay else {
-            return;
         };
-        if close {
-            state.overlay = BrowseOverlay::None;
-            return;
-        }
         if toggle {
             panel.set_direction(match panel.direction {
                 ModuleGraphDirection::Dependencies => ModuleGraphDirection::Dependents,
@@ -811,7 +839,6 @@ impl App {
         } else if confirm {
             if let Some(row) = panel.current_rows().get(panel.selected) {
                 jump = row.jump.clone();
-                state.overlay = BrowseOverlay::None;
                 if jump.is_none() {
                     state.status =
                         Some("This dependency target is not a listed repository file".into());
@@ -825,10 +852,44 @@ impl App {
         }
     }
 
+    fn handle_browse_graph_module_sequence(&mut self, key: &event::KeyEvent) -> bool {
+        self.check_sequence_timeout();
+        let binding = self.config.keybindings.module_graph.clone();
+        if binding.is_single() {
+            return false;
+        }
+        let Some(keybinding) = event_to_keybinding(key) else {
+            return false;
+        };
+
+        if !self.pending_keys.is_empty() {
+            self.push_pending_key(keybinding);
+            let close = self.try_match_sequence(&binding) == SequenceMatch::Full;
+            self.clear_pending_keys();
+            if close {
+                if let Some(state) = self.browse_state.as_mut() {
+                    state.close_module_graph_pane();
+                }
+                self.state = AppState::RepoBrowseFile;
+            }
+            return close;
+        }
+
+        if self.key_could_match_sequence(key, &binding) {
+            self.push_pending_key(keybinding);
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn open_browse_module_graph(&mut self) {
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
+        if state.module_graph_pane.is_visible() {
+            self.state = AppState::RepoBrowseGraph;
+            return;
+        }
         if state.open_is_pending() {
             state.status = Some("Still opening this file".to_string());
             return;
@@ -837,27 +898,13 @@ impl App {
             state.status = Some("No file is open".to_string());
             return;
         };
-        let graph = match &state.module_graph {
-            ModuleGraphState::Idle | ModuleGraphState::Building => {
-                state.status = Some("Module graph is still building".to_string());
-                return;
+        match state.start_module_graph_query_for_path(path) {
+            Ok(()) => {
+                state.status = None;
+                self.state = AppState::RepoBrowseGraph;
             }
-            ModuleGraphState::Failed => {
-                state.status = Some("Module graph is unavailable".to_string());
-                return;
-            }
-            ModuleGraphState::Ready(graph) => std::sync::Arc::clone(graph),
-        };
-        if !graph.is_analyzed(&path) {
-            state.status = Some(if crate::module_graph::supports_imports(&path) {
-                "Import analysis is unavailable for this file".to_string()
-            } else {
-                "Import analysis is not supported for this file".to_string()
-            });
-            return;
+            Err(message) => state.status = Some(message.to_string()),
         }
-        state.status = None;
-        state.start_module_graph_query(path, graph);
     }
 
     pub(crate) fn open_browse_outline(&mut self) {
@@ -935,6 +982,7 @@ mod tests {
     use crate::app::browse::{
         build_file_patch, BlameGutter, BlameState, BrowseState, OpenFile, OpenLoad, PrLookupState,
     };
+    use crate::app::browse_discussion::{DiscussionIndex, DiscussionOutcome};
     use crate::app::{PrOpenSource, RepositoryAvailability};
     use crate::diff_store::{DiffScrollState, ScrollMode};
     use crate::github::{
@@ -1117,8 +1165,10 @@ mod tests {
         for _ in 0..2_000 {
             app.poll_browse_updates();
             if !matches!(
-                app.browse_state.as_ref().map(|state| &state.overlay),
-                Some(BrowseOverlay::ModuleGraphLoading { .. })
+                app.browse_state
+                    .as_ref()
+                    .map(|state| &state.module_graph_pane),
+                Some(ModuleGraphPaneState::Waiting { .. } | ModuleGraphPaneState::Loading { .. })
             ) {
                 return;
             }
@@ -2795,45 +2845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_module_graph_overlay_loads_outgoing_and_switches_to_incoming() {
-        let dir = tempfile::tempdir().unwrap();
-        let app_source =
-            "import { helper } from './helper';\nexport function app() { return helper(); }\n";
-        let helper_source = "export function helper() { return 1; }\n";
-        let mut app = browsing_app_on_disk(
-            dir.path(),
-            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
-        );
-        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
-        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
-        app.state = AppState::RepoBrowseFile;
-
-        app.open_browse_module_graph();
-        assert!(matches!(
-            app.browse_state.as_ref().unwrap().overlay,
-            BrowseOverlay::ModuleGraphLoading { .. }
-        ));
-        settle_module_graph(&mut app).await;
-        let state = app.browse_state.as_ref().unwrap();
-        let BrowseOverlay::ModuleGraph(panel) = &state.overlay else {
-            panic!("module graph overlay must open");
-        };
-        assert_eq!(panel.direction, ModuleGraphDirection::Dependencies);
-        assert_eq!(panel.current_rows().len(), 1);
-        assert!(panel.current_rows()[0].label.contains("./helper"));
-
-        app.handle_repo_browse_file_input(press(KeyCode::Tab), &mut test_terminal())
-            .unwrap();
-        let state = app.browse_state.as_ref().unwrap();
-        let BrowseOverlay::ModuleGraph(panel) = &state.overlay else {
-            panic!("module graph overlay must stay open");
-        };
-        assert_eq!(panel.direction, ModuleGraphDirection::Dependents);
-        assert!(panel.current_rows().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_default_and_custom_sequence_module_graph_keys_open_the_overlay() {
+    async fn test_module_graph_key_opens_and_focuses_a_right_side_pane() {
         let dir = tempfile::tempdir().unwrap();
         let app_source = "import { helper } from './helper';\n";
         let helper_source = "export const helper = 1;\n";
@@ -2847,18 +2859,284 @@ mod tests {
 
         app.handle_repo_browse_file_input(press(KeyCode::Char('i')), &mut test_terminal())
             .unwrap();
+
+        assert_eq!(app.state, AppState::RepoBrowseGraph);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            super::super::browse::ModuleGraphPaneState::Loading { .. }
+        ));
         assert!(matches!(
             app.browse_state.as_ref().unwrap().overlay,
-            BrowseOverlay::ModuleGraphLoading { .. }
+            BrowseOverlay::None
+        ));
+    }
+
+    #[test]
+    fn test_escape_returns_to_code_without_hiding_the_module_graph_pane() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(&mut app, "src/app.ts", "export {};\n", Vec::new());
+        app.state = AppState::RepoBrowseGraph;
+        app.browse_state.as_mut().unwrap().module_graph_pane =
+            super::super::browse::ModuleGraphPaneState::Loading {
+                request_id: 7,
+                path: "src/app.ts".to_string(),
+            };
+
+        app.handle_repo_browse_graph_input(press(KeyCode::Esc));
+
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            super::super::browse::ModuleGraphPaneState::Loading { .. }
+        ));
+    }
+
+    #[test]
+    fn test_discussion_modal_handles_escape_before_graph_focus_controls() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(&mut app, "src/app.ts", "export {};\n", Vec::new());
+        app.state = AppState::RepoBrowseGraph;
+        let state = app.browse_state.as_mut().unwrap();
+        state.module_graph_pane = ModuleGraphPaneState::Loading {
+            request_id: 7,
+            path: "src/app.ts".to_string(),
+        };
+        state.line_discussion = LineDiscussionState::Ready {
+            path: "src/app.ts".to_string(),
+            pr_numbers: vec![42],
+            index: DiscussionIndex {
+                comments: Vec::new(),
+                threads: Vec::new(),
+                line_threads: vec![Default::default()],
+                file_thread_count: 0,
+                comment_paths: Vec::new(),
+                outcome: DiscussionOutcome::Complete,
+            },
+            view: DiscussionView::ThreadList {
+                line: 0,
+                selected: 0,
+                scroll: 0,
+            },
+        };
+
+        app.handle_repo_browse_graph_input(press(KeyCode::Esc));
+
+        assert_eq!(app.state, AppState::RepoBrowseGraph);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().line_discussion,
+            LineDiscussionState::Ready {
+                view: DiscussionView::Closed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_right_from_code_refocuses_a_visible_module_graph_pane() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(&mut app, "src/app.ts", "export {};\n", Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().module_graph_pane = ModuleGraphPaneState::Loading {
+            request_id: 7,
+            path: "src/app.ts".to_string(),
+        };
+
+        app.handle_repo_browse_file_input(press(KeyCode::Right), &mut test_terminal())
+            .unwrap();
+
+        assert_eq!(app.state, AppState::RepoBrowseGraph);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Loading { .. }
+        ));
+    }
+
+    #[test]
+    fn test_graph_selection_and_direction_are_clamped_to_visible_nodes() {
+        let mut app = browsing_app(&["src/app.ts"]);
+        attach_open_file(&mut app, "src/app.ts", "export {};\n", Vec::new());
+        app.state = AppState::RepoBrowseGraph;
+        let row = |name: &str| super::super::browse::ModuleGraphRow {
+            node: name.to_string(),
+            edge: "[import] ./node  :1".to_string(),
+            jump: None,
+        };
+        app.browse_state.as_mut().unwrap().module_graph_pane =
+            ModuleGraphPaneState::Ready(super::super::browse::ModuleGraphPanel {
+                path: "src/app.ts".to_string(),
+                display_path: "src/app.ts".to_string(),
+                direction: ModuleGraphDirection::Dependencies,
+                selected: 0,
+                dependencies: super::super::browse::ModuleGraphRows {
+                    rows: vec![row("first"), row("second")],
+                    total: 2,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+                dependents: super::super::browse::ModuleGraphRows {
+                    rows: vec![row("importer")],
+                    total: 1,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+            });
+
+        app.config.keybindings.module_graph =
+            KeySequence::double(KeyBinding::char('m'), KeyBinding::char('i'));
+        app.handle_repo_browse_graph_input(press(KeyCode::Char('m')));
+        app.handle_repo_browse_graph_input(press(KeyCode::Down));
+        let ModuleGraphPaneState::Ready(panel) =
+            &app.browse_state.as_ref().unwrap().module_graph_pane
+        else {
+            panic!("graph pane must stay ready");
+        };
+        assert_eq!(panel.selected, 1);
+
+        app.handle_repo_browse_graph_input(press(KeyCode::Tab));
+        let ModuleGraphPaneState::Ready(panel) =
+            &app.browse_state.as_ref().unwrap().module_graph_pane
+        else {
+            panic!("graph pane must stay ready");
+        };
+        assert_eq!(panel.direction, ModuleGraphDirection::Dependents);
+        assert_eq!(panel.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn test_visible_module_graph_refreshes_when_the_open_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import './helper';\n";
+        let helper_source = "export const helper = 1;\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+        app.open_browse_module_graph();
+        settle_module_graph(&mut app).await;
+
+        app.browse_open_path("src/helper.ts", 0);
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            &state.module_graph_pane,
+            super::super::browse::ModuleGraphPaneState::Waiting { path }
+                if path == "src/helper.ts"
+        ));
+        assert!(state.module_graph_query_receiver.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_waiting_module_graph_closes_when_the_new_file_fails_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "export {};\n";
+        let mut app = browsing_app_on_disk(dir.path(), &[("src/app.ts", app_source)]);
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        app.state = AppState::RepoBrowseFile;
+        app.browse_state.as_mut().unwrap().module_graph_pane =
+            ModuleGraphPaneState::Ready(super::super::browse::ModuleGraphPanel {
+                path: "src/app.ts".to_string(),
+                display_path: "src/app.ts".to_string(),
+                direction: ModuleGraphDirection::Dependencies,
+                selected: 0,
+                dependencies: super::super::browse::ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+                dependents: super::super::browse::ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: crate::module_graph::DependencyGuarantee::Exact,
+                },
+            });
+
+        app.browse_open_path("src/missing.ts", 0);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Waiting { .. }
+        ));
+        app.state = AppState::RepoBrowseGraph;
+        settle_browse(&mut app).await;
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert_eq!(app.state, AppState::RepoBrowseFile);
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|message| message.contains("missing.ts")),
+            "file-load error must survive graph-pane cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_module_graph_pane_loads_outgoing_and_switches_to_incoming() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source =
+            "import { helper } from './helper';\nexport function app() { return helper(); }\n";
+        let helper_source = "export function helper() { return 1; }\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+        assert_eq!(app.state, AppState::RepoBrowseGraph);
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Loading { .. }
         ));
         settle_module_graph(&mut app).await;
+        let state = app.browse_state.as_ref().unwrap();
+        let ModuleGraphPaneState::Ready(panel) = &state.module_graph_pane else {
+            panic!("module graph pane must become ready");
+        };
+        assert_eq!(panel.direction, ModuleGraphDirection::Dependencies);
+        assert_eq!(panel.current_rows().len(), 1);
+        assert!(panel.current_rows()[0].edge.contains("./helper"));
+        assert_eq!(panel.current_rows()[0].node, "src/helper.ts");
+
+        app.handle_repo_browse_graph_input(press(KeyCode::Tab));
+        let state = app.browse_state.as_ref().unwrap();
+        let ModuleGraphPaneState::Ready(panel) = &state.module_graph_pane else {
+            panic!("module graph pane must stay open");
+        };
+        assert_eq!(panel.direction, ModuleGraphDirection::Dependents);
+        assert!(panel.current_rows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_default_and_custom_sequence_module_graph_keys_open_the_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import { helper } from './helper';\n";
+        let helper_source = "export const helper = 1;\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[("src/app.ts", app_source), ("src/helper.ts", helper_source)],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(&mut app, dir.path(), &["src/app.ts", "src/helper.ts"]);
+        app.state = AppState::RepoBrowseFile;
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('i')), &mut test_terminal())
+            .unwrap();
+        settle_module_graph(&mut app).await;
+        assert_eq!(app.state, AppState::RepoBrowseGraph);
         assert!(matches!(
-            app.browse_state.as_ref().unwrap().overlay,
-            BrowseOverlay::ModuleGraph(_)
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Ready(_)
         ));
 
-        app.handle_repo_browse_file_input(press(KeyCode::Esc), &mut test_terminal())
-            .unwrap();
+        app.handle_repo_browse_graph_input(press(KeyCode::Char('i')));
+        assert_eq!(app.state, AppState::RepoBrowseFile);
         app.config.keybindings.module_graph =
             KeySequence::double(KeyBinding::char('m'), KeyBinding::char('i'));
         app.handle_repo_browse_file_input(press(KeyCode::Char('m')), &mut test_terminal())
@@ -2866,9 +3144,10 @@ mod tests {
         app.handle_repo_browse_file_input(press(KeyCode::Char('i')), &mut test_terminal())
             .unwrap();
         settle_module_graph(&mut app).await;
+        assert_eq!(app.state, AppState::RepoBrowseGraph);
         assert!(matches!(
-            app.browse_state.as_ref().unwrap().overlay,
-            BrowseOverlay::ModuleGraph(_)
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Ready(_)
         ));
     }
 
@@ -2893,18 +3172,21 @@ mod tests {
             .module_graph_query_token()
             .expect("query token");
         assert!(!cancel.is_cancelled());
-        app.handle_repo_browse_file_input(press(KeyCode::Esc), &mut test_terminal())
-            .unwrap();
+        app.handle_repo_browse_graph_input(press(KeyCode::Char('i')));
         assert!(cancel.is_cancelled());
         app.poll_browse_updates();
 
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
         assert!(state.module_graph_query_receiver.is_none());
+        assert_eq!(app.state, AppState::RepoBrowseFile);
     }
 
     #[tokio::test]
-    async fn test_loading_module_graph_is_abandoned_when_the_open_path_changes() {
+    async fn test_loading_module_graph_restarts_when_the_open_path_changes() {
         let dir = tempfile::tempdir().unwrap();
         let app_source = "import './helper';\n";
         let helper_source = "export const helper = 1;\n";
@@ -2928,21 +3210,23 @@ mod tests {
 
         assert!(cancel.is_cancelled());
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::None));
-        assert!(state.module_graph_query_receiver.is_none());
-        assert_eq!(
-            state.status.as_deref(),
-            Some("Dependency query abandoned because the open file changed")
-        );
+        assert!(matches!(
+            &state.module_graph_pane,
+            ModuleGraphPaneState::Loading { path, .. } if path == "src/helper.ts"
+        ));
+        assert!(state.module_graph_query_receiver.is_some());
+        assert!(state.status.is_none());
     }
 
     #[test]
     fn test_enter_on_an_empty_module_graph_direction_is_a_noop() {
         let mut app = browsing_app(&["src/empty.ts"]);
         attach_open_file(&mut app, "src/empty.ts", "export {};\n", Vec::new());
-        app.state = AppState::RepoBrowseFile;
-        app.browse_state.as_mut().unwrap().overlay =
-            BrowseOverlay::ModuleGraph(super::super::browse::ModuleGraphPanel {
+        app.state = AppState::RepoBrowseGraph;
+        app.browse_state.as_mut().unwrap().module_graph_pane =
+            ModuleGraphPaneState::Ready(super::super::browse::ModuleGraphPanel {
+                path: "src/empty.ts".to_string(),
+                display_path: "src/empty.ts".to_string(),
                 direction: ModuleGraphDirection::Dependencies,
                 selected: 0,
                 dependencies: super::super::browse::ModuleGraphRows {
@@ -2957,11 +3241,13 @@ mod tests {
                 },
             });
 
-        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
-            .unwrap();
+        app.handle_repo_browse_graph_input(press(KeyCode::Enter));
 
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::ModuleGraph(_)));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Ready(_)
+        ));
         assert!(state.status.is_none());
         assert!(state.jump_stack.is_empty());
     }
@@ -2975,14 +3261,17 @@ mod tests {
             "import react from 'react';\n",
             Vec::new(),
         );
-        app.state = AppState::RepoBrowseFile;
-        app.browse_state.as_mut().unwrap().overlay =
-            BrowseOverlay::ModuleGraph(super::super::browse::ModuleGraphPanel {
+        app.state = AppState::RepoBrowseGraph;
+        app.browse_state.as_mut().unwrap().module_graph_pane =
+            ModuleGraphPaneState::Ready(super::super::browse::ModuleGraphPanel {
+                path: "src/app.ts".to_string(),
+                display_path: "src/app.ts".to_string(),
                 direction: ModuleGraphDirection::Dependencies,
                 selected: 0,
                 dependencies: super::super::browse::ModuleGraphRows {
                     rows: vec![super::super::browse::ModuleGraphRow {
-                        label: "[import] react → package react  :1".to_string(),
+                        node: "package react".to_string(),
+                        edge: "[import] react  :1".to_string(),
                         jump: None,
                     }],
                     total: 1,
@@ -2995,11 +3284,13 @@ mod tests {
                 },
             });
 
-        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
-            .unwrap();
+        app.handle_repo_browse_graph_input(press(KeyCode::Enter));
 
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Ready(_)
+        ));
         assert_eq!(
             state.status.as_deref(),
             Some("This dependency target is not a listed repository file")
@@ -3022,16 +3313,23 @@ mod tests {
 
         app.open_browse_module_graph();
         settle_module_graph(&mut app).await;
-        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
-            .unwrap();
+        app.handle_repo_browse_graph_input(press(KeyCode::Enter));
         settle_browse(&mut app).await;
 
+        assert_eq!(app.state, AppState::RepoBrowseFile);
         assert_eq!(open_path(&app), "src/データ.json");
-        assert!(app.browse_state.as_ref().unwrap().status.is_none());
+        assert_eq!(
+            app.browse_state.as_ref().unwrap().status.as_deref(),
+            Some("Import analysis is not supported for this file")
+        );
+        assert!(matches!(
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
     }
 
     #[tokio::test]
-    async fn test_module_graph_overlay_jumps_to_local_dependency_and_back() {
+    async fn test_module_graph_pane_jumps_to_local_dependency_and_back() {
         let dir = tempfile::tempdir().unwrap();
         let app_source =
             "import { helper } from './helper';\nexport function app() { return helper(); }\n";
@@ -3047,18 +3345,19 @@ mod tests {
 
         app.open_browse_module_graph();
         settle_module_graph(&mut app).await;
-        app.handle_repo_browse_file_input(press(KeyCode::Enter), &mut test_terminal())
-            .unwrap();
+        app.handle_repo_browse_graph_input(press(KeyCode::Enter));
         settle_browse(&mut app).await;
+        settle_module_graph(&mut app).await;
         assert_eq!(open_path(&app), "src/helper.ts");
         assert!(matches!(
-            app.browse_state.as_ref().unwrap().overlay,
-            BrowseOverlay::None
+            app.browse_state.as_ref().unwrap().module_graph_pane,
+            ModuleGraphPaneState::Ready(_)
         ));
 
         app.handle_repo_browse_file_input(ctrl('o'), &mut test_terminal())
             .unwrap();
         settle_browse(&mut app).await;
+        settle_module_graph(&mut app).await;
         assert_eq!(open_path(&app), "src/app.ts");
         assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 1);
     }
@@ -3073,7 +3372,10 @@ mod tests {
         app.open_browse_module_graph();
 
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
         assert_eq!(state.status.as_deref(), Some("Module graph is unavailable"));
     }
 
@@ -3096,7 +3398,10 @@ mod tests {
         app.open_browse_module_graph();
 
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
         assert_eq!(
             state.status.as_deref(),
             Some("Import analysis is unavailable for this file")
@@ -3119,7 +3424,10 @@ mod tests {
 
         let state = app.browse_state.as_ref().unwrap();
         assert_eq!(state.status.as_deref(), Some("Still opening this file"));
-        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
     }
 
     /// A throwaway terminal for handlers that take one but do not draw.

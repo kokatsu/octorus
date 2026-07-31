@@ -75,7 +75,7 @@ fn admit_commit_diff_for_cache(diff_text: String) -> Result<String, String> {
     }
 }
 
-/// Maximum rows retained per direction in the module-graph overlay.
+/// Maximum rows retained per direction in the module-graph pane.
 ///
 /// Hearth 0.1.1 materializes the full sorted query result, but bounding the
 /// octorus projection prevents unbounded labels and UI state for high fan-in.
@@ -143,7 +143,10 @@ impl App {
     /// Drain background browse channels: file list, symbol index, highlighting.
     pub(crate) fn poll_browse_updates(&mut self) {
         let tab_width = self.config.diff.tab_width;
-        let browse_file_active = self.state == AppState::RepoBrowseFile;
+        let browse_file_active = matches!(
+            self.state,
+            AppState::RepoBrowseFile | AppState::RepoBrowseGraph
+        );
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
@@ -154,24 +157,28 @@ impl App {
         let mut completed_pr_lookup = None;
         let mut completed_line_discussion = None;
 
-        let module_graph_context_moved = match &state.overlay {
-            BrowseOverlay::ModuleGraphLoading { path, .. } => {
-                !browse_file_active
-                    || state
-                        .open
-                        .as_ref()
-                        .is_none_or(|open| open.path.as_str() != path)
+        let module_graph_refresh_path = state
+            .module_graph_pane
+            .path()
+            .and_then(|pane_path| {
+                state
+                    .open
+                    .as_ref()
+                    .map(|open| open.path.as_str())
+                    .filter(|open_path| *open_path != pane_path)
+            })
+            .map(str::to_string);
+        if let Some(path) = module_graph_refresh_path {
+            if state.open_is_pending() {
+                state.cancel_module_graph_query();
+                state.module_graph_pane = ModuleGraphPaneState::Waiting { path };
+            } else if let Err(message) = state.start_module_graph_query_for_path(path) {
+                state.close_module_graph_pane();
+                state.status = Some(message.to_string());
+                if self.state == AppState::RepoBrowseGraph {
+                    self.state = AppState::RepoBrowseFile;
+                }
             }
-            BrowseOverlay::None
-            | BrowseOverlay::Outline { .. }
-            | BrowseOverlay::SymbolSearch { .. }
-            | BrowseOverlay::ModuleGraph(_) => false,
-        };
-        if module_graph_context_moved {
-            state.cancel_module_graph_query();
-            state.overlay = BrowseOverlay::None;
-            state.status =
-                Some("Dependency query abandoned because the open file changed".to_string());
         }
 
         if let PrLookupState::Loading { .. } = &state.pr_lookup {
@@ -257,16 +264,15 @@ impl App {
                     state.module_graph_query_receiver = None;
                     state.module_graph_query_cancel = None;
                     let current = matches!(
-                        &state.overlay,
-                        BrowseOverlay::ModuleGraphLoading { request_id, path }
+                        &state.module_graph_pane,
+                        ModuleGraphPaneState::Loading { request_id, path }
                             if *request_id == delivery.request_id && path == &delivery.path
                     ) && state
                         .open
                         .as_ref()
                         .is_some_and(|open| open.path == delivery.path);
                     if current {
-                        state.status = None;
-                        state.overlay = BrowseOverlay::ModuleGraph(delivery.panel);
+                        state.module_graph_pane = ModuleGraphPaneState::Ready(delivery.panel);
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {}
@@ -277,10 +283,16 @@ impl App {
                         .take()
                         .is_some_and(|cancel| cancel.is_cancelled());
                     if !cancelled
-                        && matches!(state.overlay, BrowseOverlay::ModuleGraphLoading { .. })
+                        && matches!(
+                            state.module_graph_pane,
+                            ModuleGraphPaneState::Loading { .. }
+                        )
                     {
-                        state.overlay = BrowseOverlay::None;
+                        state.module_graph_pane = ModuleGraphPaneState::Closed;
                         state.status = Some("Dependency query task ended".to_string());
+                        if self.state == AppState::RepoBrowseGraph {
+                            self.state = AppState::RepoBrowseFile;
+                        }
                     }
                 }
             }
@@ -328,6 +340,20 @@ impl App {
                         install_file_load_failure(state, path, message, tab_width);
                     }
                 }
+            }
+        }
+
+        let waiting_graph_file_failed = matches!(
+            (&state.module_graph_pane, &state.open_load),
+            (
+                ModuleGraphPaneState::Waiting { path: waiting },
+                OpenLoad::Failed { path: failed, .. }
+            ) if waiting == failed
+        );
+        if waiting_graph_file_failed {
+            state.close_module_graph_pane();
+            if self.state == AppState::RepoBrowseGraph {
+                self.state = AppState::RepoBrowseFile;
             }
         }
 
@@ -552,6 +578,24 @@ impl App {
             }
         }
 
+        if file_ready {
+            let waiting_path = match (&state.module_graph_pane, &state.open) {
+                (ModuleGraphPaneState::Waiting { path }, Some(open)) if path == &open.path => {
+                    Some(path.clone())
+                }
+                _ => None,
+            };
+            if let Some(path) = waiting_path {
+                if let Err(message) = state.start_module_graph_query_for_path(path) {
+                    state.close_module_graph_pane();
+                    state.status = Some(message.to_string());
+                    if self.state == AppState::RepoBrowseGraph {
+                        self.state = AppState::RepoBrowseFile;
+                    }
+                }
+            }
+        }
+
         if paths_ready {
             self.start_symbol_index_build();
         }
@@ -657,6 +701,7 @@ impl App {
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
+        let module_graph_visible = state.module_graph_pane.is_visible();
         state.cancel_commit_diff_request();
         state.commit_diff = BrowseCommitDiffState::Off;
 
@@ -734,6 +779,12 @@ impl App {
             deliver_file_load(load, delivery_path, &request, &tx);
         });
 
+        if module_graph_visible {
+            state.cancel_module_graph_query();
+            state.module_graph_pane = ModuleGraphPaneState::Waiting {
+                path: path.to_string(),
+            };
+        }
         self.state = AppState::RepoBrowseFile;
     }
 
@@ -2114,7 +2165,7 @@ impl OpenFile {
     }
 }
 
-/// Direction shown by the module-graph overlay.
+/// Direction selected in the module-graph pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleGraphDirection {
     Dependencies,
@@ -2127,9 +2178,11 @@ pub struct ModuleGraphJump {
     pub line: usize,
 }
 
+/// Precomputed UML node text for one direct relationship.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleGraphRow {
-    pub label: String,
+    pub node: String,
+    pub edge: String,
     pub jump: Option<ModuleGraphJump>,
 }
 
@@ -2140,9 +2193,13 @@ pub struct ModuleGraphRows {
     pub guarantee: DependencyGuarantee,
 }
 
-/// Precomputed dependency rows; drawing never walks the graph.
+/// Precomputed dependency nodes; drawing never walks the graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleGraphPanel {
+    /// Full repository-relative path used to validate request context.
+    pub path: String,
+    /// Bounded current-module label used by the renderer.
+    pub display_path: String,
     pub direction: ModuleGraphDirection,
     pub selected: usize,
     pub dependencies: ModuleGraphRows,
@@ -2169,7 +2226,37 @@ impl ModuleGraphPanel {
     }
 }
 
-/// Which overlay is on top of the browser, if any.
+/// Visibility and request lifecycle of the right-side module-graph pane.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum ModuleGraphPaneState {
+    #[default]
+    Closed,
+    /// A new file is still loading; query only the last successfully opened path.
+    Waiting {
+        path: String,
+    },
+    Loading {
+        request_id: u64,
+        path: String,
+    },
+    Ready(ModuleGraphPanel),
+}
+
+impl ModuleGraphPaneState {
+    pub fn is_visible(&self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Closed => None,
+            Self::Waiting { path } | Self::Loading { path, .. } => Some(path),
+            Self::Ready(panel) => Some(&panel.path),
+        }
+    }
+}
+
+/// Which modal overlay is on top of the browser, if any.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub enum BrowseOverlay {
     #[default]
@@ -2178,10 +2265,6 @@ pub enum BrowseOverlay {
     Outline { selected: usize },
     /// Repository-wide fuzzy symbol search.
     SymbolSearch { query: String, selected: usize },
-    /// A request-scoped dependency panel build running off the UI thread.
-    ModuleGraphLoading { request_id: u64, path: String },
-    /// Direct imports and reverse dependencies of the open file.
-    ModuleGraph(ModuleGraphPanel),
 }
 
 /// Lifecycle of the file currently being opened.
@@ -2393,6 +2476,7 @@ pub struct BrowseState {
     pub scroll_offset: usize,
     pub index: IndexState,
     pub module_graph: ModuleGraphState,
+    pub module_graph_pane: ModuleGraphPaneState,
     module_graph_query_generation: u64,
     module_graph_query_cancel: Option<CancellationToken>,
     pub source_universe: SourceUniverse,
@@ -2452,6 +2536,7 @@ impl BrowseState {
             scroll_offset: 0,
             index: IndexState::Idle,
             module_graph: ModuleGraphState::Idle,
+            module_graph_pane: ModuleGraphPaneState::Closed,
             module_graph_query_generation: 0,
             module_graph_query_cancel: None,
             source_universe: SourceUniverse::Partial,
@@ -2482,7 +2567,7 @@ impl BrowseState {
         let (tx, rx) = mpsc::channel(1);
         self.module_graph_query_cancel = Some(cancel);
         self.module_graph_query_receiver = Some(rx);
-        self.overlay = BrowseOverlay::ModuleGraphLoading { request_id, path };
+        self.module_graph_pane = ModuleGraphPaneState::Loading { request_id, path };
 
         tokio::task::spawn_blocking(move || {
             let Some(panel) = build_module_graph_panel(&graph, &task_path, &task_cancel) else {
@@ -2498,11 +2583,38 @@ impl BrowseState {
         });
     }
 
+    pub(crate) fn start_module_graph_query_for_path(
+        &mut self,
+        path: String,
+    ) -> Result<(), &'static str> {
+        let graph = match &self.module_graph {
+            ModuleGraphState::Idle | ModuleGraphState::Building => {
+                return Err("Module graph is still building");
+            }
+            ModuleGraphState::Failed => return Err("Module graph is unavailable"),
+            ModuleGraphState::Ready(graph) => Arc::clone(graph),
+        };
+        if !graph.is_analyzed(&path) {
+            return Err(if crate::module_graph::supports_imports(&path) {
+                "Import analysis is unavailable for this file"
+            } else {
+                "Import analysis is not supported for this file"
+            });
+        }
+        self.start_module_graph_query(path, graph);
+        Ok(())
+    }
+
     pub(crate) fn cancel_module_graph_query(&mut self) {
         if let Some(cancel) = self.module_graph_query_cancel.take() {
             cancel.cancel();
         }
         self.module_graph_query_receiver = None;
+    }
+
+    pub(crate) fn close_module_graph_pane(&mut self) {
+        self.cancel_module_graph_query();
+        self.module_graph_pane = ModuleGraphPaneState::Closed;
     }
 
     #[cfg(test)]
@@ -2852,6 +2964,8 @@ fn build_module_graph_panel(
         cancel,
     )?;
     Some(ModuleGraphPanel {
+        path: path.to_string(),
+        display_path: bounded_module_graph_text(path),
         direction: ModuleGraphDirection::Dependencies,
         selected: 0,
         dependencies,
@@ -2893,11 +3007,11 @@ fn module_graph_rows(
                     ),
                 };
                 ModuleGraphRow {
-                    label: bounded_module_graph_text(&format!(
-                        "[{}] {} → {}  :{}",
+                    node: bounded_module_graph_text(&target),
+                    edge: bounded_module_graph_text(&format!(
+                        "[{}] {}  :{}",
                         edge.kind.label(),
                         specifier,
-                        target,
                         edge.line
                     )),
                     jump,
@@ -2907,12 +3021,12 @@ fn module_graph_rows(
                 let from = bounded_module_graph_text(&edge.from);
                 let specifier = bounded_module_graph_text(&edge.specifier);
                 ModuleGraphRow {
-                    label: bounded_module_graph_text(&format!(
-                        "[{}] {}:{}  {}",
+                    node: bounded_module_graph_text(&from),
+                    edge: bounded_module_graph_text(&format!(
+                        "[{}] {}  :{}",
                         edge.kind.label(),
-                        from,
-                        edge.line,
-                        specifier
+                        specifier,
+                        edge.line
                     )),
                     jump: graph.is_listed(&edge.from).then(|| ModuleGraphJump {
                         path: edge.from,
@@ -3739,27 +3853,21 @@ mod tests {
 
         assert_eq!(panel.dependents.total, 250);
         assert_eq!(panel.dependents.rows.len(), MAX_MODULE_GRAPH_RESULTS);
-        assert!(panel
-            .dependents
-            .rows
-            .iter()
-            .all(
-                |row| unicode_width::UnicodeWidthStr::width(row.label.as_str())
-                    <= MAX_MODULE_GRAPH_LABEL_WIDTH,
-            ));
+        assert!(panel.dependents.rows.iter().all(|row| {
+            unicode_width::UnicodeWidthStr::width(row.node.as_str()) <= MAX_MODULE_GRAPH_LABEL_WIDTH
+                && unicode_width::UnicodeWidthStr::width(row.edge.as_str())
+                    <= MAX_MODULE_GRAPH_LABEL_WIDTH
+        }));
 
         panel.set_direction(ModuleGraphDirection::Dependents);
         let mut app = App::new_for_test();
         let mut state = BrowseState::new(dir.path().to_path_buf(), AppState::FileList);
         state.set_paths(paths);
-        state.overlay = BrowseOverlay::ModuleGraph(panel);
+        state.module_graph_pane = ModuleGraphPaneState::Ready(panel);
         app.browse_state = Some(state);
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
         let rendered = render_at(&mut app, 80, 12);
-        assert!(
-            rendered.contains("Imported by (200/250 edges shown, exact)"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Importers 200/250 exact"), "{rendered}");
     }
 
     // ===== cursor and scrolling =====
@@ -6852,25 +6960,74 @@ mod tests {
     }
 
     #[test]
+    fn test_module_graph_delivery_preserves_a_newer_status() {
+        let mut app = App::new_for_test();
+        let mut state = state_with_open_file(1);
+        let (tx, rx) = mpsc::channel(1);
+        state.module_graph_query_receiver = Some(rx);
+        state.module_graph_query_cancel = Some(CancellationToken::new());
+        state.module_graph_pane = ModuleGraphPaneState::Loading {
+            request_id: 9,
+            path: "src/a.rs".to_string(),
+        };
+        state.status = Some("No position to jump back to".to_string());
+        app.browse_state = Some(state);
+        tx.try_send(ModuleGraphPanelDelivery {
+            request_id: 9,
+            path: "src/a.rs".to_string(),
+            panel: ModuleGraphPanel {
+                path: "src/a.rs".to_string(),
+                display_path: "src/a.rs".to_string(),
+                direction: ModuleGraphDirection::Dependencies,
+                selected: 0,
+                dependencies: ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: DependencyGuarantee::Exact,
+                },
+                dependents: ModuleGraphRows {
+                    rows: Vec::new(),
+                    total: 0,
+                    guarantee: DependencyGuarantee::Exact,
+                },
+            },
+        })
+        .unwrap();
+
+        app.poll_browse_updates();
+
+        let state = app.browse_state.as_ref().unwrap();
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Ready(_)
+        ));
+        assert_eq!(state.status.as_deref(), Some("No position to jump back to"));
+    }
+
+    #[test]
     fn test_poll_browse_updates_reports_a_disconnected_module_graph_query() {
         let mut app = App::new_for_test();
         let mut state = state_with_open_file(1);
         let (tx, rx) = mpsc::channel::<ModuleGraphPanelDelivery>(1);
         state.module_graph_query_receiver = Some(rx);
         state.module_graph_query_cancel = Some(CancellationToken::new());
-        state.overlay = BrowseOverlay::ModuleGraphLoading {
+        state.module_graph_pane = ModuleGraphPaneState::Loading {
             request_id: 9,
             path: "src/a.rs".to_string(),
         };
         app.browse_state = Some(state);
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
         drop(tx);
 
         app.poll_browse_updates();
 
         let state = app.browse_state.as_ref().unwrap();
-        assert!(matches!(state.overlay, BrowseOverlay::None));
+        assert!(matches!(
+            state.module_graph_pane,
+            ModuleGraphPaneState::Closed
+        ));
         assert_eq!(state.status.as_deref(), Some("Dependency query task ended"));
+        assert_eq!(app.state, AppState::RepoBrowseFile);
         assert!(state.module_graph_query_receiver.is_none());
     }
 
