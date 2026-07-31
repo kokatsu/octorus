@@ -2,7 +2,7 @@
 
 The Repository Browser import engine is an octorus-owned compatibility facade
 over `hearth-graph = "=0.1.1"`. Read this document when changing import
-extraction, resolver setup, graph guarantees, or the `i` dependency overlay.
+extraction, resolver setup, graph guarantees, or the `i` dependency graph pane.
 Browser task/state/rendering architecture remains in
 [`repo-browse-architecture.md`](repo-browse-architecture.md); symbol-specific
 behavior remains in [`symbol-index.md`](symbol-index.md).
@@ -158,43 +158,75 @@ configuration changes.
 
 ## 6. Browser state and interaction
 
-The graph lifecycle is independent state, although the same worker transitions
-it together with symbols:
+The repository graph lifecycle is independent state, although the same worker
+transitions it together with symbols:
 
 ```text
 ModuleGraphState
     Idle → Building → Ready(Arc<ModuleGraph>) | Failed
 ```
 
-The `i` action checks conditions in this order:
+Visibility and request progress for the right-side pane are a second typed
+lifecycle. They are not modal overlays:
+
+```text
+ModuleGraphPaneState
+    Closed ── i ──→ Loading { request_id, path } → Ready(ModuleGraphPanel)
+       ▲                   ▲                            │
+       │                   └─ Waiting { path } ← path ─┘
+       └──────────── close/error from every visible state
+```
+
+`Waiting` coalesces rapid file navigation. It cancels the old graph request but
+does not start another until the latest background file load succeeds. The
+existing superseded-file cancellation therefore prevents intermediate paths
+from launching Hearth queries whose internal materialize/sort phase cannot be
+interrupted in 0.1.1.
+
+`AppState::RepoBrowseGraph` represents graph-pane focus. Tree and code remain
+visible while the pane is loading or ready. With a closed pane, the `i` action
+checks conditions in this order:
 
 1. open file still loading → `Still opening this file`;
 2. graph idle/building → `Module graph is still building`;
 3. graph failed → `Module graph is unavailable`;
 4. unsupported file → `Import analysis is not supported for this file`;
 5. supported but skipped file → `Import analysis is unavailable for this file`;
-6. otherwise enter `BrowseOverlay::ModuleGraphLoading` and start a request-scoped
-   `spawn_blocking` query;
-7. install `BrowseOverlay::ModuleGraph` only when request id, requested path,
-   current open path, and browser context still match.
+6. otherwise enter `ModuleGraphPaneState::Loading`, focus
+   `AppState::RepoBrowseGraph`, and start a request-scoped `spawn_blocking`
+   query;
+7. install `ModuleGraphPaneState::Ready` only when request id, requested path,
+   and current open path still match.
 
-`Esc`, a changed open path, or closing the browser cancels the request and drops
-its receiver. A late delivery therefore cannot replace the current overlay.
-Direct and reverse rows are materialized on the blocking worker, never on the
-input or draw thread. Octorus retains at most 200 rows per direction and keeps
-the pre-truncation total so the title reports, for example,
-`200/5000 edges shown`. Each component is capped at 512 Unicode scalars and each
-final label at 240 terminal cells before retention. Rendering borrows label
-spans from the visible slice; it neither clones labels nor queries/walks the
-graph per frame.
+Pressing `i` while the pane is already visible only focuses it; pressing `i`
+from graph focus closes it and cancels any request. `Esc`/`q` returns focus to
+code without hiding or cancelling the pane. Opening another file while the pane is visible cancels the old query and enters
+`Waiting`; only the final successfully loaded file starts a new query. A file
+load failure, unsupported path, or unavailable analysis closes the pane.
+Closing the browser cancels the browser session token, so a late delivery cannot
+be installed.
+
+Direct and reverse nodes are materialized on the blocking worker, never on the
+input or draw thread. Octorus retains at most 200 nodes per direction and keeps
+the pre-truncation total so the title can report `3/5000 exact`. Each source
+component is capped at 512 Unicode scalars. The precomputed node and edge labels
+are each capped at 240 terminal cells before retention.
+
+The pane visualizes one direction at a time. The current module uses a
+UML-style double-line box; each direct relationship uses a single-line module
+box and a directional connector (`├─▶` for imports, `▲─┤` for importers).
+Package, unresolved, and unlisted nodes remain in the diagram but are not
+navigable.
 
 | Key | Behavior |
 |---|---|
-| `i` | Open the graph overlay from browser file focus |
+| `i` from file | Open or focus the graph pane |
+| `l` / `→` from file | Focus an already-visible graph pane |
 | `Tab`, `h/l`, `←/→` | Switch Imports / Imported by |
-| `j/k`, `↑/↓` | Move selection |
+| `j/k`, `↑/↓` | Select a module node |
 | `Enter` | Open a listed local target/importer |
-| `Esc` | Close |
+| `Esc` / `q` | Return focus to code, keeping the pane visible |
+| `i` from graph | Close the pane and return to code |
 
 Outgoing jumps open the target at its first line. Incoming jumps open the
 importer at the extracted import line. Both push the existing browser jump
@@ -216,9 +248,10 @@ cargo bench --bench module_graph
 ```
 
 The renderer is protected structurally rather than by this graph benchmark:
-`ModuleGraphPanel` owns at most 200 precomputed, 240-cell rows per direction;
-`render_module_graph` applies `skip(offset).take(viewport_height)` and borrows
-the retained labels.
+`ModuleGraphPanel` owns at most 200 precomputed nodes per direction, with
+separately bounded 240-cell node and edge labels. `render_module_graph_ready_pane`
+applies `skip(offset).take(visible_nodes)` and allocates only the three UML text
+lines for each visible node; it never walks Hearth or formats hidden rows.
 
 Hearth 0.1.1 has no bounded direct/reverse query API. It clones and sorts the
 full edge result before octorus can truncate it. Running that work in
@@ -234,13 +267,13 @@ upstream boundary explicitly.
 | `src/module_graph.rs` | import kinds/spans, JS/TS aliases/packages, Rust resolution, direct/reverse guarantees, stub/listed non-source availability, high fan-in bounds, observable cancellation, import-vector release |
 | `src/code_index.rs` / `src/symbols.rs` | one completed result containing symbols and graph edges, empty files, cancellation through post-analysis projection |
 | `src/app/browse.rs` | listing completeness, combined/query failure lifecycles, actual 250-importer panel limits, Unicode label bounds |
-| `src/app/input_browse.rs` | loading/open/switch/jump/back/CJK JSON/non-navigable/empty/pending/cancel/stale scenarios, single and sequence bindings |
-| `src/ui/browse.rs` | loading/outgoing/truncated/incoming/long-CJK/approximate/empty/tiny-terminal inline snapshots |
+| `src/app/input_browse.rs` | waiting/loading/open/switch/jump/back/CJK JSON/non-navigable/empty/pending/cancel/stale/file-failure scenarios, single and sequence bindings |
+| `src/ui/browse.rs` | waiting/loading/outgoing/truncated/incoming/long-CJK/approximate/empty/tiny-terminal inline snapshots |
 | `src/config/mod.rs` | default, serialization, overlap validation, one-diagnostic ownership, and round-trip |
 
 ## 9. Known limitations
 
-- no visual node-link or transitive-neighborhood UI;
+- the UML pane shows only the current module and one direct direction at a time; there is no transitive neighborhood, pan, zoom, or automatic graph layout;
 - no import-aware symbol disambiguation for `gd`;
 - no alias or re-export chain mapped to an exact destination symbol;
 - no incremental upsert/removal from filesystem watcher events;

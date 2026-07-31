@@ -12,7 +12,7 @@ Read this before adding features.
 | `src/symbols.rs` | octorus compatibility facade over the Hearth symbol engine (see [symbol-index.md](symbol-index.md)) |
 | `src/module_graph.rs` | octorus compatibility facade over Hearth import resolution and graph queries (see [module-graph.md](module-graph.md)) |
 | `src/ui/browse.rs` | Rendering |
-| `src/app/input_browse.rs` | Key handling (2 panes + 3 browser overlays, plus PR/discussion modals) |
+| `src/app/input_browse.rs` | Key handling (3 focusable panes + 2 browser overlays, plus PR/discussion modals) |
 
 Do not put line counts in this table; they become stale whenever the browser or
 its compatibility facade changes. Count the current checkout when needed.
@@ -60,8 +60,9 @@ stateless `CancelSignal` and Hearth returns an `IndexBuild` outcome.
 
 ```
 AppState
- ├ RepoBrowseTree   focus on the tree pane
- └ RepoBrowseFile   focus on the file content pane
+ ├ RepoBrowseTree    focus on the tree pane
+ ├ RepoBrowseFile    focus on the file content pane
+ └ RepoBrowseGraph   focus on the right-side module graph pane
 ```
 
 Inside `BrowseState`:
@@ -75,6 +76,11 @@ index:     IndexState
 
 graph:     ModuleGraphState
            Idle → Building → Ready(Arc<ModuleGraph>) | Failed
+
+graph pane: ModuleGraphPaneState
+            Closed → Loading { request_id, path } → Ready(ModuleGraphPanel)
+                          ↑                           │
+                          └──── Waiting { path } ←────┘
 
 universe:  SourceUniverse
            Partial | Complete
@@ -98,8 +104,6 @@ PR lookup: PrLookupState
 
 overlay:   BrowseOverlay
            None | Outline { selected } | SymbolSearch { query, selected }
-                | ModuleGraphLoading { request_id, path }
-                | ModuleGraph(ModuleGraphPanel)
 
 filter:    Option<ListFilter>   ← reuses the existing list filter
 ```
@@ -110,9 +114,16 @@ an accelerator, not a precondition: while it is building, tree browsing, file
 viewing, and filtering all keep working. Symbol consumers `o` / `s` / `gd` and
 the graph consumer `i` put the reason into the footer instead of opening an
 overlay. A ready graph does not make a high-fan-in query synchronous:
-`i` transitions to `ModuleGraphLoading`, runs both directions in
-`spawn_blocking`, and installs `ModuleGraph` only when the request id and open
-path still match.
+`i` transitions the right-side pane to `ModuleGraphPaneState::Loading`, runs
+both directions in `spawn_blocking`, and installs `Ready(ModuleGraphPanel)` only
+when the request id and open path still match. The pane lifecycle is independent
+of focus: `Esc` can return to `RepoBrowseFile` while the request continues.
+Opening another file while the pane is visible cancels that request and enters
+`Waiting`. Only the final successfully loaded file starts a new graph query, so
+superseded file-load cancellation coalesces rapid navigation instead of
+launching uninterruptible Hearth sort work for every intermediate path. `i`
+from graph focus closes the pane and cancels; closing the browser cancels the
+parent session token.
 
 More than one message can come out. `o` and `gd` **check `open_is_pending()`
 first**, so while a file is loading, `Still opening this file` wins regardless
@@ -130,7 +141,7 @@ does not carry this check.
 | `o` | `Still opening this file` | `Symbol index is still building` | `No symbols in this file` if the target file has none, otherwise opens the outline |
 | `s` | (not checked) | `Symbol index is still building` | opens the search overlay |
 | `gd` | `Still opening this file` | `Symbol index is still building` | `No definition found` when it cannot resolve |
-| `i` | `Still opening this file` | `Module graph is still building` | enters a cancellable loading overlay, or reports unsupported/unavailable analysis |
+| `i` | `Still opening this file` | `Module graph is still building` | opens/focuses a cancellable right-side pane, or reports unsupported/unavailable analysis |
 
 `Symbol index is still building` is emitted on `index.ready().is_none()`.
 `IndexState::Failed` also satisfies that condition, so after a failed build the
@@ -365,16 +376,16 @@ panels. The draw loop never blocks.
 
 ## 4. Key-handling layers
 
-At the top of `handle_repo_browse_{tree,file}_input`, input is fed through the
-layers from the top down.
+At the top of `handle_repo_browse_{tree,file,graph}_input`, input is fed through
+the layers from the top down.
 
 ```
-1. Overlays (Outline / SymbolSearch / ModuleGraphLoading / ModuleGraph) ← modal; consume everything while open
-2. commit diff mode (file pane only)   ← blocks the source-file actions
-3. Filter input bar (tree pane only)   ← consumes all character input while open
-4. Shared by both panes (s / ? / Z / Ctrl-o)
-5. Sequences (tree: Space / and gg / file: gb, gc, gp, gr, gd, gf, gg)
-6. Single keys
+1. Overlays (Outline / SymbolSearch)   ← modal; consume everything while open
+2. commit diff mode (file pane only)  ← blocks the source-file actions
+3. Filter input bar (tree pane only)  ← consumes all character input while open
+4. Shared browse actions (s / ? / Z / Ctrl-o)
+5. Sequences (tree: Space / and gg / file: gb, gc, gp, gr, gd, gf, gg / graph: configured i)
+6. Focus-specific single keys
 ```
 
 **Why the sequence layer exists**: the default for `filter` is the two-key
@@ -387,11 +398,14 @@ list / diff view.
 `Ctrl-n` (clear the whole query with `Ctrl-u`). A search UI where you cannot
 type `j` is infuriating, so this is deliberate.
 
-**Input rules for the module graph overlay**: while loading, only `Esc` / the
-configured quit key cancels the request. Once ready it has no text input. `j/k`
-and arrows move, `Tab` or `h/l` switches Imports / Imported by, and `Enter`
-opens only a target represented in the original Git listing. Rows without a
-jump stay visible and report why they cannot be opened.
+**Input rules for the module graph pane**: `i` from file focus opens or focuses
+the pane; `l` / `→` also focuses an already-visible pane. While waiting/loading,
+graph navigation is ignored, but `Esc` / `q` can return to code without cancelling and
+`i` closes and cancels. Once ready, `j/k` and arrows move, `Tab` or `h/l`
+switches Imports / Imported by, and `Enter` opens only a target represented in
+the original Git listing. Nodes without a jump stay visible and report why they
+cannot be opened. Opening a node returns focus to code and refreshes the still
+visible pane for that new current file.
 
 ## 5. Keybinding registration caveats
 
@@ -437,10 +451,15 @@ before the sequence layer.
 ## 6. Rendering
 
 `src/ui/browse.rs`. In zen mode the header and footer are dropped and the whole
-frame becomes the two panes.
+frame becomes the active panes.
 
 - Tree pane: "loading spinner", "error", or "tree" according to `LoadState`
 - Content pane: nothing selected / the binary or oversized-file notice / the contents
+- Graph pane: absent when `Closed`; otherwise the remaining non-tree width is
+  split evenly between code and graph. `Waiting` shows the target module while
+  its file load settles; `Loading` shows an explicit dependency-resolving state.
+  `Ready` shows the double-line current module plus
+  three-line single-border relationship boxes and directional connectors
 - The content pane cursor scrolls with the diff view's margin behaviour:
   `clamp_scroll` calls the shared `margin_scroll_offset` (`src/diff_store.rs`),
   so the cursor rides the viewport centre and only walks to the edge at file
@@ -486,9 +505,11 @@ double-width glyph (CJK etc.), replaces that cell with a space. When a
 double-width glyph straddles the left border, ratatui's buffer diff skips the
 next cell and the border line never reaches the terminal. The right edge needs
 no such repair: overwriting the leading cell already leaves a space in the
-continuation cell. `render_outline` (60%×70%), `render_symbol_search`, and
-`render_module_graph` (both 80%×70%) all go through it. Any new overlay added to `src/ui/browse.rs` must
-also use `clear_overlay_area()` rather than a bare `Clear`. A continuation cell
+continuation cell. `render_outline` (60%×70%) and `render_symbol_search`
+(80%×70%) both go through it. The module graph is a real pane and deliberately
+does not clear or cover adjacent panes. Any new overlay added to
+`src/ui/browse.rs` must also use `clear_overlay_area()` rather than a bare
+`Clear`. A continuation cell
 is a space at the text level, so text snapshots alone cannot catch this mistake.
 Removing the repair fails
 `test_overlay_left_border_survives_a_wide_glyph_straddling_it`.
@@ -497,18 +518,19 @@ Removing the repair fails
 `test_overlay_rect_is_centred_and_bounded`. On 100×40, an 80%×50% rect becomes
 80×20 at (10, 10), and even on 10×4 it stays inside the terminal.
 `test_symbol_search_overlay_is_reviewably_clipped_in_a_tiny_terminal` and
-`test_empty_module_graph_overlay_clips_in_a_tiny_terminal` render their overlays
-at 20×5 and pin the clipped results as snapshots.
+`test_empty_module_graph_pane_clips_in_a_tiny_terminal` pin both overlay and pane
+clipping at 20×5.
 
-The module graph overlay never queries Hearth from the input or draw path.
+The module graph pane never queries Hearth from the input or draw path.
 `open_browse_module_graph()` starts a request-scoped blocking task; its delivery
 converts direct and reverse results into a `ModuleGraphPanel` only if the
-request/path context is still current. Each direction retains at most 200 rows
-plus the full edge count; components are capped at 512 Unicode scalars and final
-labels at 240 terminal cells. `render_module_graph()` borrows label spans from
-only `skip(offset).take(inner_height)`, preserving O(viewport) redraw cost even
-when the repository graph is large. Hearth 0.1.1 still materializes and sorts all
-matching edges inside the blocking task before octorus can truncate them; see
+request/path context is still current. Each direction retains at most 200 nodes
+plus the full edge count; components are capped at 512 Unicode scalars and both
+final node and edge labels at 240 terminal cells. `render_module_graph_ready_pane()`
+formats only `skip(offset).take(visible_nodes)`, three lines per visible UML
+node, preserving O(viewport) redraw cost even when the repository graph is
+large. Hearth 0.1.1 still materializes and sorts all matching edges inside the
+blocking task before octorus can truncate them; see
 [module-graph.md](module-graph.md).
 
 ## 7. Tests
@@ -526,8 +548,8 @@ is "where are the tests for what", so that table stays:
 | `src/symbols.rs` | Hearth-registry extraction snapshots, compatibility boundaries (including C macro merging, empty files, duplicate paths, CJK and checked conversion), projected index refs, search, and build cancellation |
 | `src/code_index.rs` | one-pass combined symbol/import result and cancellation |
 | `src/module_graph.rs` | JS/TS/Rust import extraction and resolution, listed non-source navigation, path projection, direct/reverse guarantees, cancellation |
-| `src/ui/browse.rs` | inline rendering snapshots, graph loading/outgoing/incoming/truncated/long-CJK/empty/tiny states, wide-glyph border repair |
-| `src/app/input_browse.rs` | **scenario tests** (tree navigation, outline/search, graph cancel/stale/CJK JSON/empty/switch/jump/back, blame/history) |
+| `src/ui/browse.rs` | inline rendering snapshots, graph-pane loading/outgoing/incoming/truncated/long-CJK/empty/tiny states, focus borders, wide-glyph overlay repair |
+| `src/app/input_browse.rs` | **scenario tests** (tree navigation, outline/search, graph focus/close/cancel/restart/CJK JSON/empty/switch/jump/back, blame/history) |
 | `src/main.rs` | the flag set allowed to start without a repository (including `--browse`) |
 | `tests/cli.rs` | e2e launching the binary via `assert_cmd` (non-git directory, git repo without a GitHub remote) |
 

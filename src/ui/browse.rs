@@ -17,8 +17,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::browse::{
     BlameCoverage, BlameGutter, BlameGutterWidth, BlameState, BrowseCommitDiffState, BrowseOverlay,
-    BrowseState, ModuleGraphDirection, ModuleGraphPanel, PrLookupState, BLAME_AUTHOR_WIDTH,
-    BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
+    BrowseState, ModuleGraphDirection, ModuleGraphPaneState, ModuleGraphPanel, ModuleGraphRow,
+    PrLookupState, BLAME_AUTHOR_WIDTH, BLAME_FULL_WIDTH, BLAME_IDENTITY_WIDTH,
 };
 use crate::app::browse_discussion::{
     DiscussionIndex, DiscussionView, LineDiscussionFailure, LineDiscussionState,
@@ -27,6 +27,7 @@ use crate::app::{App, AppState, CachedDiffLine, DiffCache, LoadState, TreeRow};
 use crate::diff::LineType;
 use crate::github::{CommitPullRequest, CommitPullRequestState};
 use crate::symbols::Symbol;
+use crate::ui::common::truncate_with_width;
 
 /// Narrowest the line-number gutter ever gets.
 ///
@@ -59,6 +60,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     let tree_focused = app.state == AppState::RepoBrowseTree;
+    let graph_focused = app.state == AppState::RepoBrowseGraph;
+    let graph_visible = app
+        .browse_state
+        .as_ref()
+        .is_some_and(|state| state.module_graph_pane.is_visible());
     let left_width = app.config.layout.left_panel_width;
     let panes = Layout::default()
         .direction(Direction::Horizontal)
@@ -69,7 +75,40 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(body);
 
     render_tree(frame, app, panes[0], tree_focused);
-    render_content(frame, app, panes[1], !tree_focused);
+    if graph_visible {
+        let right_panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(panes[1]);
+        render_content(
+            frame,
+            app,
+            right_panes[0],
+            app.state == AppState::RepoBrowseFile,
+        );
+        if let Some(state) = app.browse_state.as_ref() {
+            let kb = &app.config.keybindings;
+            let graph_help = if graph_focused {
+                format!(
+                    " Tab/{}/{} dir | {}/{} node | {} open | {} close | Esc/{} code ",
+                    kb.move_left.display_primary(),
+                    kb.move_right.display_primary(),
+                    kb.move_down.display_primary(),
+                    kb.move_up.display_primary(),
+                    kb.open_panel.display_primary(),
+                    kb.module_graph.display_primary(),
+                    kb.quit.display_primary(),
+                )
+            } else if app.state == AppState::RepoBrowseFile {
+                format!(" {}/→ focus ", kb.module_graph.display_primary())
+            } else {
+                String::new()
+            };
+            render_module_graph_pane(frame, state, right_panes[1], graph_focused, &graph_help);
+        }
+    } else {
+        render_content(frame, app, panes[1], !tree_focused);
+    }
 
     if !zen {
         render_footer(frame, app, chunks[2]);
@@ -695,6 +734,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             kb.symbol_search.display(),
             kb.quit.display(),
         )),
+        None if app.state == AppState::RepoBrowseGraph => std::borrow::Cow::Owned(format!(
+            " Tab/{}/{} direction | {}/{} node | {} open | {} close graph | Esc/{} code",
+            kb.move_left.display_primary(),
+            kb.move_right.display_primary(),
+            kb.move_down.display_primary(),
+            kb.move_up.display_primary(),
+            kb.open_panel.display_primary(),
+            kb.module_graph.display_primary(),
+            kb.quit.display_primary(),
+        )),
         None => match coverage {
             Some(
                 BlameCoverage::ShorterThanBuffer {
@@ -709,7 +758,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " blame covers {blame_lines} lines, this file shows {buffer_lines} — reopen the file to refresh"
             )),
             Some(BlameCoverage::Exact) | None => std::borrow::Cow::Owned(format!(
-                " {} outline | {} search | {} imports | {} blame | {} diff | {} PR | {} discuss | {} def | {} edit | {} back",
+                " {} outline | {} search | {} graph | {} blame | {} diff | {} PR | {} discuss | {} def | {} edit | {} back",
                 kb.symbol_outline.display(),
                 kb.symbol_search.display(),
                 kb.module_graph.display(),
@@ -765,8 +814,6 @@ fn render_overlay(frame: &mut Frame, app: &mut App) {
             ref query,
             selected,
         } => render_symbol_search(frame, state, query, selected),
-        BrowseOverlay::ModuleGraphLoading { .. } => render_module_graph_loading(frame),
-        BrowseOverlay::ModuleGraph(ref panel) => render_module_graph(frame, panel),
     }
 }
 
@@ -942,88 +989,248 @@ fn render_outline(frame: &mut Frame, state: &BrowseState, selected: usize) {
     frame.render_widget(list, area);
 }
 
-fn render_module_graph_loading(frame: &mut Frame) {
-    let area = overlay_rect(frame.area(), 80, 70);
-    clear_overlay_area(frame, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title("Imports (loading…)")
-        .title_bottom(Line::from(Span::styled(
-            " Esc cancel ",
-            Style::default().fg(Color::DarkGray),
-        )));
-    frame.render_widget(
-        Paragraph::new(" Resolving direct and reverse dependencies…").block(block),
-        area,
-    );
+fn render_module_graph_pane(
+    frame: &mut Frame,
+    state: &BrowseState,
+    area: Rect,
+    focused: bool,
+    graph_help: &str,
+) {
+    match &state.module_graph_pane {
+        ModuleGraphPaneState::Closed => {}
+        ModuleGraphPaneState::Waiting { path } => {
+            render_module_graph_loading_pane(
+                frame,
+                area,
+                path,
+                "Graph (opening…)",
+                " Waiting for the current file…",
+                focused,
+                graph_help,
+            );
+        }
+        ModuleGraphPaneState::Loading { path, .. } => {
+            render_module_graph_loading_pane(
+                frame,
+                area,
+                path,
+                "Graph (loading…)",
+                " Resolving imports and importers…",
+                focused,
+                graph_help,
+            );
+        }
+        ModuleGraphPaneState::Ready(panel) => {
+            render_module_graph_ready_pane(frame, area, panel, focused, graph_help);
+        }
+    }
 }
 
-fn render_module_graph(frame: &mut Frame, panel: &ModuleGraphPanel) {
-    let area = overlay_rect(frame.area(), 80, 70);
-    clear_overlay_area(frame, area);
-
-    let current = panel.current();
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let offset = scroll_offset(panel.selected, current.rows.len(), inner_height);
-    let items: Vec<ListItem> = if current.rows.is_empty() {
-        let empty = match panel.direction {
-            ModuleGraphDirection::Dependencies => " No imports.",
-            ModuleGraphDirection::Dependents => " No importers.",
-        };
-        vec![ListItem::new(Line::from(Span::styled(
-            empty,
-            Style::default().fg(Color::DarkGray),
-        )))]
+fn render_module_graph_loading_pane(
+    frame: &mut Frame,
+    area: Rect,
+    path: &str,
+    title: &str,
+    message: &str,
+    focused: bool,
+    graph_help: &str,
+) {
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
     } else {
-        current
-            .rows
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(inner_height)
-            .map(|(index, row)| {
-                let style = if index == panel.selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(" ", style),
-                    Span::styled(row.label.as_str(), style),
-                ]))
-            })
-            .collect()
+        Style::default()
     };
+    let block = module_graph_block(title, border_style, graph_help);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let mut lines = module_graph_box_lines("current module", path, inner_width, true)
+        .into_iter()
+        .map(|text| {
+            Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(Span::styled(
+        message,
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
 
+fn render_module_graph_ready_pane(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &ModuleGraphPanel,
+    focused: bool,
+    graph_help: &str,
+) {
+    let current = panel.current();
     let direction = match panel.direction {
-        ModuleGraphDirection::Dependencies => "Imports",
-        ModuleGraphDirection::Dependents => "Imported by",
+        ModuleGraphDirection::Dependencies => "Imports →",
+        ModuleGraphDirection::Dependents => "Importers",
     };
     let guarantee = match current.guarantee {
         crate::module_graph::DependencyGuarantee::Exact => "exact",
         crate::module_graph::DependencyGuarantee::Approximate => "approximate",
     };
-    let edge_noun = if current.total == 1 { "edge" } else { "edges" };
     let count = if current.rows.len() < current.total {
-        format!("{}/{} {edge_noun} shown", current.rows.len(), current.total)
+        format!("{}/{}", current.rows.len(), current.total)
     } else {
-        format!("{} {edge_noun}", current.total)
+        current.total.to_string()
     };
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("{direction} ({count}, {guarantee})"))
-            .title_bottom(Line::from(Span::styled(
-                " Tab/h/l switch | j/k move | Enter open | Esc close ",
-                Style::default().fg(Color::DarkGray),
-            ))),
+    let title = format!("{direction} {count} {guarantee}");
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let block = module_graph_block(title, border_style, graph_help);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let current_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut lines =
+        module_graph_box_lines("current module", &panel.display_path, inner_width, true)
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, current_style)))
+            .collect::<Vec<_>>();
+
+    if current.rows.is_empty() {
+        let empty = match panel.direction {
+            ModuleGraphDirection::Dependencies => " No imports.",
+            ModuleGraphDirection::Dependents => " No importers.",
+        };
+        lines.push(Line::from(Span::styled(
+            empty,
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let visible_nodes = inner_height.saturating_sub(3) / 3;
+        let offset = scroll_offset(panel.selected, current.rows.len(), visible_nodes);
+        for (index, row) in current
+            .rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible_nodes)
+        {
+            let style = if index == panel.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if row.jump.is_none() {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            let last = index + 1 == current.rows.len();
+            for text in module_graph_relationship_lines(row, panel.direction, inner_width, last) {
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn module_graph_block<'a>(
+    title: impl Into<Line<'a>>,
+    border_style: Style,
+    graph_help: &str,
+) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title)
+        .title_bottom(Line::from(Span::styled(
+            graph_help.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )))
+}
+
+fn module_graph_relationship_lines(
+    row: &ModuleGraphRow,
+    direction: ModuleGraphDirection,
+    width: usize,
+    last: bool,
+) -> [String; 3] {
+    let prefix_width = usize::from(width >= 7) * 3;
+    let box_width = width.saturating_sub(prefix_width);
+    let [top, middle, bottom] = module_graph_box_lines(&row.node, &row.edge, box_width, false);
+    if prefix_width == 0 {
+        return [top, middle, bottom];
+    }
+    let connector = match (direction, last) {
+        (ModuleGraphDirection::Dependencies, false) => "├─▶",
+        (ModuleGraphDirection::Dependencies, true) => "└─▶",
+        (ModuleGraphDirection::Dependents, false) => "▲─┤",
+        (ModuleGraphDirection::Dependents, true) => "▲─┘",
+    };
+    let tail = if last { "   " } else { "│  " };
+    [
+        format!("│  {top}"),
+        format!("{connector}{middle}"),
+        format!("{tail}{bottom}"),
+    ]
+}
+
+fn module_graph_box_lines(
+    title: &str,
+    detail: &str,
+    width: usize,
+    emphasized: bool,
+) -> [String; 3] {
+    if width < 4 {
+        return [
+            fit_module_graph_text(title, width),
+            fit_module_graph_text(detail, width),
+            fit_module_graph_text("─", width),
+        ];
+    }
+
+    let (top_left, horizontal, top_right, vertical, bottom_left, bottom_right) = if emphasized {
+        ('╔', '═', '╗', '║', '╚', '╝')
+    } else {
+        ('┌', '─', '┐', '│', '└', '┘')
+    };
+    let inner = width - 2;
+    let top = if inner <= 3 {
+        format!(
+            "{top_left}{}{top_right}",
+            horizontal.to_string().repeat(inner)
+        )
+    } else {
+        let title = truncate_with_width(title, inner - 3);
+        let title_width = title.width();
+        let fill = inner.saturating_sub(title_width + 3);
+        format!(
+            "{top_left}{horizontal} {title} {}{top_right}",
+            horizontal.to_string().repeat(fill)
+        )
+    };
+    let middle = format!(
+        "{vertical}{}{vertical}",
+        fit_module_graph_text(detail, inner)
     );
-    frame.render_widget(list, area);
+    let bottom = format!(
+        "{bottom_left}{}{bottom_right}",
+        horizontal.to_string().repeat(inner)
+    );
+    [top, middle, bottom]
+}
+
+fn fit_module_graph_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let text = truncate_with_width(text, width);
+    let padding = width.saturating_sub(text.width());
+    format!("{text}{}", " ".repeat(padding))
 }
 
 fn outline_row(symbol: &Symbol, selected: bool) -> Line<'static> {
@@ -1365,7 +1572,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
         "#);
     }
 
@@ -1680,8 +1887,8 @@ mod tests {
                 footer_at(&mut app, 60)
             ),
             @"
-        80:  o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
-        60:  o outline | s search | i imports | gb blame | gc diff | gp
+        80:  o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
+        60:  o outline | s search | i graph | gb blame | gc diff | gp PR
         "
         );
     }
@@ -1706,7 +1913,7 @@ mod tests {
         │                          ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
         ");
     }
 
@@ -1748,7 +1955,7 @@ mod tests {
         │  main.rs                               ││aaaaaaa Alice Example 2h ago        1 fn main() {}                          │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc back
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc back
         --- no time (90) ---
         ┌────────────────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                                                 │
@@ -1757,7 +1964,7 @@ mod tests {
         │  main.rs                     ││aaaaaaa Alice Example      1 fn main() {}               │
         │                              ││                                                        │
         └──────────────────────────────┘└────────────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd def | gf
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd def | gf ed
         --- identity (70) ---
         ┌────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -                             │
@@ -1766,7 +1973,7 @@ mod tests {
         │  main.rs              ││aaaaaaa         1 fn main() {}             │
         │                       ││                                           │
         └───────────────────────┘└───────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr di
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr disc
         --- hidden (50) ---
         ┌────────────────────────────────────────────────┐
         │Repo Browse - demo  1 files  symbols: -         │
@@ -1775,7 +1982,7 @@ mod tests {
         │  main.rs       ││    1 fn main() {}            │
         │                ││                              │
         └────────────────┘└──────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc
+         o outline | s search | i graph | gb blame | gc di
         ");
     }
 
@@ -1908,7 +2115,7 @@ mod tests {
         │                                        ││Uncommitted                         3 third                                 │
         │                                        ││                                                                            │
         └────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc back
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/Esc back
         ");
     }
 
@@ -2000,7 +2207,7 @@ mod tests {
         │  empty.rs                ││                                                  │
         │                          ││                                                  │
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
         ");
     }
 
@@ -2025,7 +2232,7 @@ mod tests {
         │                          ││   29 line 29                                     ║
         │                          ││   30 line 30                                     █
         └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
         ");
     }
 
@@ -2325,48 +2532,141 @@ mod tests {
     }
 
     #[test]
-    fn test_render_module_graph_loading_overlay() {
+    fn test_module_graph_loading_renders_as_a_right_side_pane() {
         let mut app = app_with_browse(&["src/app.ts"]);
         let state = app.browse_state.as_mut().unwrap();
         open_file(state, "src/app.ts", "import './helper';\n");
-        state.overlay = BrowseOverlay::ModuleGraphLoading {
+        state.module_graph_pane = ModuleGraphPaneState::Loading {
             request_id: 7,
             path: "src/app.ts".to_string(),
         };
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
 
-        assert_snapshot!(render_at(&mut app, 60, 8), @"
-        ┌──────────────────────────────────────────────────────────┐
-        │Repo ┌Imports (loading…)────────────────────────────┐     │
-        └─────│ Resolving direct and reverse dependencies…   │─────┘
-        ┌Files│                                              │─────┐
-        │▼ src│                                              │     │
-        │    a└ Esc cancel ──────────────────────────────────┘     │
-        └───────────────────┘└─────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp
+        assert_snapshot!(render_at(&mut app, 100, 12), @"
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌src/app.ts (1/1)───────────────┐┌Graph (loading…)──────────────┐
+        │▼ src/                           ││    1 import './helper';       ││╔═ current module ═══════════╗│
+        │    app.ts                       ││                               ││║src/app.ts                  ║│
+        │                                 ││                               ││╚════════════════════════════╝│
+        │                                 ││                               ││ Resolving imports and importe│
+        │                                 ││                               ││                              │
+        │                                 ││                               ││                              │
+        └─────────────────────────────────┘└───────────────────────────────┘└ Tab/h/l dir | j/k node | Ente┘
+         Tab/h/l direction | j/k node | Enter open | i close graph | Esc/q code
         ");
     }
 
     #[test]
-    fn test_render_module_graph_outgoing_overlay() {
+    fn test_module_graph_waiting_keeps_the_right_side_pane_visible() {
+        let mut app = app_with_browse(&["src/helper.ts"]);
+        let state = app.browse_state.as_mut().unwrap();
+        open_file(state, "src/helper.ts", "export {};\n");
+        state.module_graph_pane = ModuleGraphPaneState::Waiting {
+            path: "src/helper.ts".to_string(),
+        };
+        app.state = AppState::RepoBrowseFile;
+
+        assert_snapshot!(render_at(&mut app, 80, 10), @"
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                       │
+        └──────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────────────────┐┌src/helper.ts (1/1)─────┐┌Graph (opening…)────────┐
+        │▼ src/                    ││    1 export {};        ││╔═ current module ═════╗│
+        │    helper.ts             ││                        ││║src/helper.ts         ║│
+        │                          ││                        ││╚══════════════════════╝│
+        │                          ││                        ││ Waiting for the current│
+        └──────────────────────────┘└────────────────────────┘└ i/→ focus ─────────────┘
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
+        ");
+    }
+
+    #[test]
+    fn test_tree_focus_does_not_advertise_a_graph_focus_shortcut() {
+        let mut app = app_with_browse(&["src/app.ts"]);
+        let state = app.browse_state.as_mut().unwrap();
+        open_file(state, "src/app.ts", "export {};\n");
+        state.module_graph_pane = ModuleGraphPaneState::Waiting {
+            path: "src/app.ts".to_string(),
+        };
+        app.state = AppState::RepoBrowseTree;
+
+        let rendered = render_at(&mut app, 100, 10);
+        assert!(!rendered.contains("i/→ focus"), "{rendered}");
+    }
+
+    #[test]
+    fn test_module_graph_pane_hint_uses_the_configured_binding() {
+        let mut app = app_with_browse(&["src/app.ts"]);
+        let state = app.browse_state.as_mut().unwrap();
+        open_file(state, "src/app.ts", "export {};\n");
+        state.module_graph_pane = ModuleGraphPaneState::Waiting {
+            path: "src/app.ts".to_string(),
+        };
+        app.config.keybindings.module_graph =
+            KeySequence::double(KeyBinding::char('m'), KeyBinding::char('i'));
+        app.state = AppState::RepoBrowseFile;
+
+        let rendered = render_at(&mut app, 120, 12);
+        assert!(rendered.contains("mi/→ focus"), "{rendered}");
+    }
+
+    #[test]
+    fn test_module_graph_focused_hints_use_configured_controls() {
+        let mut app = app_with_browse(&["src/app.ts"]);
+        let state = app.browse_state.as_mut().unwrap();
+        open_file(state, "src/app.ts", "export {};\n");
+        state.module_graph_pane = ModuleGraphPaneState::Waiting {
+            path: "src/app.ts".to_string(),
+        };
+        app.config.keybindings.move_left = KeySequence::single(KeyBinding::char('a'));
+        app.config.keybindings.move_right = KeySequence::single(KeyBinding::char('d'));
+        app.config.keybindings.move_down = KeySequence::single(KeyBinding::char('n'));
+        app.config.keybindings.move_up = KeySequence::single(KeyBinding::char('p'));
+        app.config.keybindings.open_panel = KeySequence::single(KeyBinding::char(' '));
+        app.config.keybindings.module_graph =
+            KeySequence::double(KeyBinding::char('m'), KeyBinding::char('i'));
+        app.config.keybindings.quit = KeySequence::single(KeyBinding::char('z'));
+        app.state = AppState::RepoBrowseGraph;
+
+        let rendered = render_at(&mut app, 160, 12);
+        assert!(
+            rendered.contains(
+                "Tab/a/d direction | n/p node | Space open | mi close graph | Esc/z code"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_module_graph_outgoing_pane_as_uml_nodes() {
         let mut app = app_with_browse(&["src/app.ts", "src/helper.ts"]);
         let state = app.browse_state.as_mut().unwrap();
         open_file(state, "src/app.ts", "import './helper';\n");
-        state.overlay = BrowseOverlay::ModuleGraph(ModuleGraphPanel {
+        state.module_graph_pane = ModuleGraphPaneState::Ready(ModuleGraphPanel {
+            path: "src/app.ts".to_string(),
+            display_path: "src/app.ts".to_string(),
             direction: ModuleGraphDirection::Dependencies,
             selected: 0,
             dependencies: ModuleGraphRows {
                 rows: vec![
                     ModuleGraphRow {
-                        label: "[import] ./helper → src/helper.ts  :1".to_string(),
+                        node: "src/helper.ts".to_string(),
+                        edge: "[import] ./helper  :1".to_string(),
+                        jump: Some(crate::app::browse::ModuleGraphJump {
+                            path: "src/helper.ts".to_string(),
+                            line: 0,
+                        }),
+                    },
+                    ModuleGraphRow {
+                        node: "package react".to_string(),
+                        edge: "[import] react  :2".to_string(),
                         jump: None,
                     },
                     ModuleGraphRow {
-                        label: "[import] react → package react  :2".to_string(),
-                        jump: None,
-                    },
-                    ModuleGraphRow {
-                        label: "[dynamic] ./missing → unresolved (not found)  :3".to_string(),
+                        node: "unresolved (not found)".to_string(),
+                        edge: "[dynamic] ./missing  :3".to_string(),
                         jump: None,
                     },
                 ],
@@ -2379,39 +2679,58 @@ mod tests {
                 guarantee: DependencyGuarantee::Exact,
             },
         });
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
 
-        assert_snapshot!(render_at(&mut app, 100, 16), @"
+        assert_snapshot!(render_at(&mut app, 100, 18), @"
         ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
         │Repo Browse - demo  2 files  symbols: -                                                           │
-        └─────────┌Imports (3/300 edges shown, exact)────────────────────────────────────────────┐─────────┘
-        ┌Files────│ [import] ./helper → src/helper.ts  :1                                        │─────────┐
-        │▼ src/   │ [import] react → package react  :2                                           │         │
-        │    app.t│ [dynamic] ./missing → unresolved (not found)  :3                             │         │
-        │    helpe│                                                                              │         │
-        │         │                                                                              │         │
-        │         │                                                                              │         │
-        │         │                                                                              │         │
-        │         │                                                                              │         │
-        │         │                                                                              │         │
-        │         └ Tab/h/l switch | j/k move | Enter open | Esc close ──────────────────────────┘         │
-        │                                 ││                                                               │
-        └─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd def | gf edit | q/E
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌src/app.ts (1/1)───────────────┐┌Imports → 3/300 exact─────────┐
+        │▼ src/                           ││    1 import './helper';       ││╔═ current module ═══════════╗│
+        │    app.ts                       ││                               ││║src/app.ts                  ║│
+        │    helper.ts                    ││                               ││╚════════════════════════════╝│
+        │                                 ││                               │││  ┌─ src/helper.ts ─────────┐│
+        │                                 ││                               ││├─▶│[import] ./helper  :1    ││
+        │                                 ││                               │││  └─────────────────────────┘│
+        │                                 ││                               │││  ┌─ package react ─────────┐│
+        │                                 ││                               ││├─▶│[import] react  :2       ││
+        │                                 ││                               │││  └─────────────────────────┘│
+        │                                 ││                               │││  ┌─ unresolved (not found) ┐│
+        │                                 ││                               ││└─▶│[dynamic] ./missing  :3  ││
+        │                                 ││                               ││   └─────────────────────────┘│
+        └─────────────────────────────────┘└───────────────────────────────┘└ Tab/h/l dir | j/k node | Ente┘
+         Tab/h/l direction | j/k node | Enter open | i close graph | Esc/q code
         ");
     }
 
     #[test]
-    fn test_render_module_graph_bounded_long_cjk_label() {
+    fn test_five_column_module_graph_box_stays_within_its_width() {
+        let lines = module_graph_box_lines("node", "edge", 5, false);
+
+        assert_eq!(lines[0], "┌───┐");
+        assert!(lines
+            .iter()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) == 5));
+    }
+
+    #[test]
+    fn test_render_module_graph_bounded_long_cjk_node() {
         let mut app = app_with_browse(&["src/app.ts"]);
-        let label = crate::app::browse::bounded_module_graph_text(&"依存先".repeat(1_000));
-        assert!(unicode_width::UnicodeWidthStr::width(label.as_str()) <= 240);
+        let node = crate::app::browse::bounded_module_graph_text(&"依存先".repeat(1_000));
+        assert!(unicode_width::UnicodeWidthStr::width(node.as_str()) <= 240);
         let state = app.browse_state.as_mut().unwrap();
-        state.overlay = BrowseOverlay::ModuleGraph(ModuleGraphPanel {
+        open_file(state, "src/app.ts", "import './依存先';\n");
+        state.module_graph_pane = ModuleGraphPaneState::Ready(ModuleGraphPanel {
+            path: "src/app.ts".to_string(),
+            display_path: "src/app.ts".to_string(),
             direction: ModuleGraphDirection::Dependencies,
             selected: 0,
             dependencies: ModuleGraphRows {
-                rows: vec![ModuleGraphRow { label, jump: None }],
+                rows: vec![ModuleGraphRow {
+                    node,
+                    edge: "[import] ./依存先  :1".to_string(),
+                    jump: None,
+                }],
                 total: 1,
                 guarantee: DependencyGuarantee::Exact,
             },
@@ -2421,26 +2740,32 @@ mod tests {
                 guarantee: DependencyGuarantee::Exact,
             },
         });
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
 
-        assert_snapshot!(render_at(&mut app, 80, 8), @"
+        assert_snapshot!(render_at(&mut app, 80, 12), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
-        │Repo Br┌Imports (1 edge, exact)───────────────────────────────────────┐       │
-        └───────│ 依 存 先 依 存 先 依 存 先 依 存 先 依 存 先 依 存 先 依 存 先 依 存 先 依 存 先 依 存 先  │───────┘
-        ┌Files──│                                                              │───────┐
-        │▼ src/ │                                                              │       │
-        │    app└ Tab/h/l switch | j/k move | Enter open | Esc close ──────────┘       │
-        └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
+        │Repo Browse - demo  1 files  symbols: -                                       │
+        └──────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────────────────┐┌src/app.ts (1/1)────────┐┌Imports → 1 exact───────┐
+        │▼ src/                    ││    1 import './依 存 先 ';││╔═ current module ═════╗│
+        │    app.ts                ││                        ││║src/app.ts            ║│
+        │                          ││                        ││╚══════════════════════╝│
+        │                          ││                        │││  ┌─ 依 存 先 依 存 先 依 … ─┐│
+        │                          ││                        ││└─▶│[import] ./依 存 先  …││
+        │                          ││                        ││   └───────────────────┘│
+        └──────────────────────────┘└────────────────────────┘└ Tab/h/l dir | j/k node ┘
+         Tab/h/l direction | j/k node | Enter open | i close graph | Esc/q code
         ");
     }
 
     #[test]
-    fn test_render_module_graph_incoming_approximate_overlay() {
+    fn test_render_module_graph_incoming_approximate_pane() {
         let mut app = app_with_browse(&["src/app.ts", "src/helper.ts"]);
         let state = app.browse_state.as_mut().unwrap();
         open_file(state, "src/helper.ts", "export const helper = 1;\n");
-        state.overlay = BrowseOverlay::ModuleGraph(ModuleGraphPanel {
+        state.module_graph_pane = ModuleGraphPaneState::Ready(ModuleGraphPanel {
+            path: "src/helper.ts".to_string(),
+            display_path: "src/helper.ts".to_string(),
             direction: ModuleGraphDirection::Dependents,
             selected: 0,
             dependencies: ModuleGraphRows {
@@ -2450,39 +2775,42 @@ mod tests {
             },
             dependents: ModuleGraphRows {
                 rows: vec![ModuleGraphRow {
-                    label: "[use] src/app.rs:4  crate::helper".to_string(),
+                    node: "src/app.rs".to_string(),
+                    edge: "[use] crate::helper  :4".to_string(),
                     jump: None,
                 }],
                 total: 1,
                 guarantee: DependencyGuarantee::Approximate,
             },
         });
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
 
-        assert_snapshot!(render_at(&mut app, 80, 14), @"
-        ┌──────────────────────────────────────────────────────────────────────────────┐
-        │Repo Browse - demo  2 files  symbols: -                                       │
-        └───────┌Imported by (1 edge, approximate)─────────────────────────────┐───────┘
-        ┌Files──│ [use] src/app.rs:4  crate::helper                            │───────┐
-        │▼ src/ │                                                              │       │
-        │    app│                                                              │       │
-        │    hel│                                                              │       │
-        │       │                                                              │       │
-        │       │                                                              │       │
-        │       │                                                              │       │
-        │       └ Tab/h/l switch | j/k move | Enter open | Esc close ──────────┘       │
-        │                          ││                                                  │
-        └──────────────────────────┘└──────────────────────────────────────────────────┘
-         o outline | s search | i imports | gb blame | gc diff | gp PR | gr discuss | gd
+        assert_snapshot!(render_at(&mut app, 100, 14), @"
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  2 files  symbols: -                                                           │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+        ┌Files────────────────────────────┐┌src/helper.ts (1/1)────────────┐┌Importers 1 approximate───────┐
+        │▼ src/                           ││    1 export const helper = 1; ││╔═ current module ═══════════╗│
+        │    app.ts                       ││                               ││║src/helper.ts               ║│
+        │    helper.ts                    ││                               ││╚════════════════════════════╝│
+        │                                 ││                               │││  ┌─ src/app.rs ────────────┐│
+        │                                 ││                               ││▲─┘│[use] crate::helper  :4  ││
+        │                                 ││                               ││   └─────────────────────────┘│
+        │                                 ││                               ││                              │
+        │                                 ││                               ││                              │
+        └─────────────────────────────────┘└───────────────────────────────┘└ Tab/h/l dir | j/k node | Ente┘
+         Tab/h/l direction | j/k node | Enter open | i close graph | Esc/q code
         ");
     }
 
     #[test]
-    fn test_empty_module_graph_overlay_clips_in_a_tiny_terminal() {
+    fn test_empty_module_graph_pane_clips_in_a_tiny_terminal() {
         let mut app = app_with_browse(&["src/empty.ts"]);
         let state = app.browse_state.as_mut().unwrap();
         open_file(state, "src/empty.ts", "export {};\n");
-        state.overlay = BrowseOverlay::ModuleGraph(ModuleGraphPanel {
+        state.module_graph_pane = ModuleGraphPaneState::Ready(ModuleGraphPanel {
+            path: "src/empty.ts".to_string(),
+            display_path: "src/empty.ts".to_string(),
             direction: ModuleGraphDirection::Dependencies,
             selected: 0,
             dependencies: ModuleGraphRows {
@@ -2496,14 +2824,14 @@ mod tests {
                 guarantee: DependencyGuarantee::Exact,
             },
         });
-        app.state = AppState::RepoBrowseFile;
+        app.state = AppState::RepoBrowseGraph;
 
         assert_snapshot!(render_at(&mut app, 20, 5), @"
-        ┌Imports (0 edges, ┐
-        │ No imports.      │
-        │                  │
-        │                  │
-        └ Tab/h/l switch | ┘
+        ┌──────────────────┐
+        │Repo Browse - demo│
+        └──────────────────┘
+        ┌Files┐┌src/e┐┌ Tab┐
+         Tab/h/l direction |
         ");
     }
 
@@ -2981,43 +3309,6 @@ mod tests {
                 matches!(border, "│" | "┌" | "└"),
                 "row {y}: the overlay's left border is {border:?}"
             );
-        }
-    }
-
-    #[test]
-    fn test_module_graph_left_border_survives_a_wide_glyph_straddling_it() {
-        let paths: Vec<String> = (0..8).map(|i| format!("{i:0>4}日本語")).collect();
-        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        let mut app = app_with_browse(&refs);
-        let area = overlay_rect(Rect::new(0, 0, 80, 14), 80, 70);
-        let bare = render_buffer(&mut app, 80, 14);
-        let straddling_rows: Vec<u16> = (area.top()..area.bottom())
-            .filter(|&y| bare[(7, y)].symbol() == "日")
-            .collect();
-        assert!(straddling_rows.len() >= 5);
-
-        if let Some(state) = app.browse_state.as_mut() {
-            state.overlay = BrowseOverlay::ModuleGraph(ModuleGraphPanel {
-                direction: ModuleGraphDirection::Dependencies,
-                selected: 0,
-                dependencies: ModuleGraphRows {
-                    rows: Vec::new(),
-                    total: 0,
-                    guarantee: DependencyGuarantee::Exact,
-                },
-                dependents: ModuleGraphRows {
-                    rows: Vec::new(),
-                    total: 0,
-                    guarantee: DependencyGuarantee::Exact,
-                },
-            });
-        }
-        let overlaid = render_buffer(&mut app, 80, 14);
-        for y in area.top()..area.bottom() {
-            assert!(overlaid[(area.x - 1, y)].symbol().width() <= 1);
-        }
-        for y in straddling_rows {
-            assert!(matches!(overlaid[(area.x, y)].symbol(), "│" | "┌" | "└"));
         }
     }
 
