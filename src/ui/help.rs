@@ -1045,6 +1045,10 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
             fmt_key(&kb.go_to_file.display(), key_width)
         )),
         Line::from(format!(
+            "{}  Toggle markdown rich display",
+            fmt_key(&kb.toggle_markdown_rich.display(), key_width)
+        )),
+        Line::from(format!(
             "{}  Jump back",
             fmt_key(&kb.jump_back.display(), key_width)
         )),

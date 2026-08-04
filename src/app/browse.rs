@@ -1613,6 +1613,30 @@ impl App {
         });
     }
 
+    /// Toggle markdown rich display and rebuild the open markdown file's
+    /// highlight so the change shows without reopening the file.
+    pub(crate) fn toggle_browse_markdown_rich(&mut self) {
+        self.toggle_markdown_rich();
+        let Some(state) = self.browse_state.as_ref() else {
+            return;
+        };
+        // A pending `open` is a placeholder; highlighting it would race the
+        // landing file's cache with an empty one. The landing load starts its
+        // own highlight and reads the new flag then.
+        if state.open_is_pending() {
+            return;
+        }
+        // The flag only changes markdown output, so rebuilding any other
+        // language would be wasted work.
+        let is_markdown = state
+            .open
+            .as_ref()
+            .is_some_and(|open| crate::language::is_markdown_ext_from_filename(&open.path));
+        if is_markdown {
+            self.start_browse_highlight();
+        }
+    }
+
     /// Jump to the definition of the identifier under the cursor.
     ///
     /// Returns `false` when there is no index yet, no identifier under the

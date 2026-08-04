@@ -329,6 +329,15 @@ string interning and takes no `ParserPool`. This is why a file can be displayed
 without waiting for highlighting; the replacement produced by
 `build_diff_cache()` arrives afterwards.
 
+`start_browse_highlight()` passes `App::is_markdown_rich()` through to
+`build_diff_cache()`, so the browser shares the diff view's markdown rich
+display. `M` (`toggle_markdown_rich`) in the file pane flips the flag via
+`toggle_browse_markdown_rich()` and re-runs `start_browse_highlight()` — but
+only for an open markdown file (the flag changes no other language's output),
+and never while `open_is_pending()`: a pending `open` is a placeholder, and
+highlighting it would race the landing file's cache with an empty one. The
+landing load starts its own highlight and reads the new flag then.
+
 Two verdicts come from a single `std::fs::metadata` call. Anything that is not a
 regular file (directories included) makes `file_metadata()` return
 `not a regular file` and the load becomes `FileLoad::Failed`; files over
@@ -434,6 +443,11 @@ of:
 4. `SCREEN_SPECIFIC_KEYS` (only when the single key really is valid on one screen only)
 5. `serialize_entry` in the `Serialize` impl
 
+`toggle_markdown_rich` (`M`) is a pre-existing global binding that the file
+pane merely dispatches; nothing new is registered, and because the same key is
+valid in the diff view and issue detail too, it must not be added to
+`SCREEN_SPECIFIC_KEYS`.
+
 The blame gutter registers into the file pane's existing sequence layer as
 `toggle_blame = ["g", "b"]`. It shares the prefix with `gg` / `gd` / `gf` but
 differs in the second key. Because `validate()` puts only the first key of a
@@ -498,6 +512,16 @@ frame becomes the active panes.
   work scales with the viewport width. **Line N of the file is line N+1 of the
   cache**
 - One context-marker space is stripped from the leading span of every line
+- A file line wider than the pane wraps onto continuation rows
+  (`push_wrapped_line()`), each carrying a blank prefix as wide as the whole
+  gutter — blame and discussion columns included — so the line-number column
+  stays straight. Rows break on character boundaries: CJK prose has no spaces,
+  and ratatui's word wrapper would push such a paragraph onto its own rows
+  below a lonely line number, which is why the pane does not use
+  `Paragraph::wrap`. Sub-spans borrow slices of the interned text, and
+  `content_lines()` stops emitting at the viewport height (`max_rows`), so
+  rendering stays O(viewport) even when every visible line wraps. The
+  cursor-line background extends across a wrapped line's continuation rows
 
 Overlays are drawn centred, after going through `clear_overlay_area()`. The
 function `Clear`s the target area and, if the column just left of it holds a
@@ -616,8 +640,7 @@ source — but that is not the default procedure.
 | The index is built once, when `BrowseState` is created | Re-entering the same root does not rebuild, so the index stays stale after external changes. No double start while building. Closing and reopening rebuilds everything from zero rather than incrementally | There is no refresh key today. Rebuild on `R`, or piggyback on the existing file watcher |
 | The file listing is also produced once, at `BrowseState` creation | Re-entering the same root does not re-enumerate, so new files do not appear in the tree. Closing and reopening re-enumerates everything | Same as above |
 | Search results are cut off at 200 | Only `MAX_SYMBOL_SEARCH_RESULTS` entries are returned and the rest are lost. The returned order equals sorting all matches, so ranking is not lost | `matches` is the post-truncation `hits.len()`, so it saturates at `200 matches` and truncation cannot be told apart. Paging is unimplemented |
-| No horizontal scrolling | Long lines are cut off | Add horizontal scroll to ratatui's `Paragraph` |
-| No intra-line wrapping | Same as above | Wrapping makes cursor-line arithmetic visual-line-based (the same problem as `pr_description`) |
+| Cursor/scroll arithmetic is logical-line-based under wrapping | Long lines wrap instead of being cut off, but `clamp_scroll` still counts logical lines, so when several wrapped lines share the viewport the cursor line can sit below the last visible row (the diff view accepts the same imperfection) | Make margin scrolling visual-row-based, the way `pr_description` counts wrapped rows with `Paragraph::line_count` |
 | `gd` jumps to the first identifier that resolves | Columns are ignored; identifiers are scanned from the start of the line, minus duplicates and common keywords. For `foo.bar()`, if `foo` has a definition it jumps there, otherwise it tries `bar` | Show the existing `SymbolPopupState` when there are several candidates |
 | symbol references unimplemented | The `@reference.*` captures present in the tags queries are still dropped; the module graph models file imports, not arbitrary symbol references | Keep import navigation file-level, or add a separate reference index with explicit per-language coverage |
 | Module graph is built once | Imports and resolver configuration become stale after external edits; no watcher-driven upsert or re-resolution exists | Re-analyze changed files and use Hearth incremental graph APIs; clear resolver caches when config dependencies change |
