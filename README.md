@@ -113,6 +113,7 @@ octorus is not only a review tool — `or --browse` (or `b` from the file list, 
 - **Same highlighting as the diff view** — tree-sitter for 24 languages, your configured theme, injections for Vue/Svelte/Markdown. File content is rendered through the exact same cache the diff view uses, so there is no second rendering path to drift.
 - **Loading never blocks the UI.** Listing the repository, reading a file, and highlighting it are all background work: the pane shows `Loading…` until the content arrives, and selecting another file cancels the read still in flight. Highlighting is a second pass over the file that is already on screen, so a large file is readable before it is coloured.
 - **Blame links back to history and review.** Toggle the blame gutter with `gb`, place the cursor on a blamed line, and press `gc` to show that commit's diff in the browser content pane, or `gp` to open the pull request that introduced it. GitHub's commit-to-pulls API is authoritative; when it returns no PR, a strict trailing `(#123)` commit-subject reference is used as an explicitly labelled, unconfirmed fallback. The full commit SHA comes from the cursor line even when a repeated gutter row is visually blank. `q`, `Esc`, `h`, or `Ctrl-o` returns to the exact source line with blame still enabled. Uncommitted lines and unavailable/loading blame explain why no history target can be opened in the footer.
+- **Review discussions anchor to the lines they argued about.** With the blame gutter on, `gr` marks every line of the open file that a pull request review discussed and opens the thread under the cursor. Line numbers are never compared directly: a comment carries the commit and range it was written against, that range is blamed at that revision, and a thread is placed only where those origins match the working file's — a range must survive whole and contiguous, and an origin that maps to several current lines is declined rather than guessed. The mapping is deliberately conservative rather than exact: blame is whitespace-insensitive, so a re-indented line can keep a comment whose meaning changed, and an edited or purely moved line loses its thread. The footer counts the threads that could not be placed confidently instead of pretending they never existed.
 - **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your editor (`editor` config → `$VISUAL` → `$EDITOR` → `vi`) at the cursor line when you actually want to change something.
 - **Files it will not render say why.** Over 8 MiB, over 100,000 lines, or a single line over 10,000 bytes each get a notice quoting the file's own figure against the limit that stopped it; binary content says `Binary file — no text preview.` — no wall of garbage either way. An empty file says `Empty file.`, and a path Git listed that is not on disk — a sparse checkout leaves index entries like that behind — shows the read error in place of the content.
 - **Empty and failed states are screens too.** A repository with no files says so. If `git ls-files` fails at all — including in a directory that is not a git repository — the browser still opens and shows what Git said, wrapped, in the preview pane.
@@ -175,6 +176,7 @@ The same background parse pass also extracts imports for Rust, TypeScript, TSX, 
 | `gb` | Toggle blame gutter |
 | `gc` | Open the blamed line's commit diff inside the browser |
 | `gp` | Open the PR that introduced the blamed line's commit |
+| `gr` | Mark reviewed lines and open the review discussion for the cursor line (blame gutter must be on) |
 | `gd` | Go to definition |
 | `gf` | Open file in your editor at the cursor line |
 | `Ctrl-o` | Jump back |
@@ -1041,6 +1043,7 @@ go_to_definition = ["g", "d"]
 | `toggle_blame` | `gb` | Toggle blame gutter (browser file pane only) |
 | `open_blame_commit` | `gc` | Open the blamed line's commit diff (browser file pane only) |
 | `open_blame_pr` | `gp` | Open the PR for the blamed line's commit (browser file pane only) |
+| `open_line_discussion` | `gr` | Anchor review threads to lines and open the cursor line's discussion (browser file pane only) |
 | `toggle_zen_mode` | `Z` | Toggle zen mode (fullscreen diff) |
 | **Git Ops** |||
 | `git_ops_stage` | `Space` | Stage/unstage file or directory |
