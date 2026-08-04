@@ -148,6 +148,10 @@ impl App {
             self.open_browse_module_graph();
             return Ok(());
         }
+        if self.matches_single_key(&key, &kb.toggle_markdown_rich) {
+            self.toggle_browse_markdown_rich();
+            return Ok(());
+        }
 
         let graph_visible = self
             .browse_state
@@ -1191,6 +1195,23 @@ mod tests {
         panic!("blame load never settled");
     }
 
+    /// Drive the browse channels until the pending highlight upgrade lands.
+    async fn settle_highlight(app: &mut App) {
+        for _ in 0..2_000 {
+            app.poll_browse_updates();
+            if matches!(
+                app.browse_state
+                    .as_ref()
+                    .map(|state| &state.highlight_receiver),
+                None | Some(None)
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("highlight never settled");
+    }
+
     async fn settle_commit_diff(app: &mut App) {
         for _ in 0..2_000 {
             app.poll_browse_updates();
@@ -1367,6 +1388,117 @@ mod tests {
         let state = app.browse_state.as_ref().unwrap();
         assert!(matches!(state.blame, BlameState::Off));
         assert!(state.blame_receiver.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scenario_markdown_toggle_rebuilds_highlight_for_the_open_markdown_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app =
+            browsing_app_on_disk(dir.path(), &[("README.md", "# Title\n\nSome prose.\n")]);
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+        settle_highlight(&mut app).await;
+
+        let cache_rich = |app: &App| {
+            app.browse_state
+                .as_ref()
+                .and_then(|state| state.open.as_ref())
+                .expect("open file")
+                .cache
+                .markdown_rich
+        };
+        assert!(!app.is_markdown_rich());
+        assert!(!cache_rich(&app));
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('M')), &mut terminal)
+            .unwrap();
+        assert!(app.is_markdown_rich());
+        assert!(
+            app.browse_state
+                .as_ref()
+                .unwrap()
+                .highlight_receiver
+                .is_some(),
+            "toggling markdown rich must restart the open markdown file's highlight"
+        );
+
+        settle_highlight(&mut app).await;
+        assert!(
+            cache_rich(&app),
+            "the rebuilt cache must carry the rich transforms"
+        );
+
+        app.handle_repo_browse_file_input(press(KeyCode::Char('M')), &mut terminal)
+            .unwrap();
+        assert!(!app.is_markdown_rich());
+        settle_highlight(&mut app).await;
+        assert!(
+            !cache_rich(&app),
+            "toggling back must restore the base cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scenario_markdown_toggle_skips_rehighlight_for_non_markdown_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = browsing_app_on_disk(dir.path(), &[("main.rs", "fn main() {}\n")]);
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        settle_browse(&mut app).await;
+        settle_highlight(&mut app).await;
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('M')), &mut terminal)
+            .unwrap();
+        assert!(app.is_markdown_rich(), "the flag itself still toggles");
+        assert!(
+            app.browse_state
+                .as_ref()
+                .unwrap()
+                .highlight_receiver
+                .is_none(),
+            "a non-markdown file's highlight is unaffected by the flag, so \
+             rebuilding it would be wasted work"
+        );
+    }
+
+    /// While a load is pending, `open` is a placeholder with no content.
+    /// Highlighting it would race the landing file's cache with an empty one,
+    /// so the toggle only flips the flag and lets the landing load pick it up.
+    #[tokio::test]
+    async fn test_scenario_markdown_toggle_during_a_pending_load_lands_rich() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = browsing_app_on_disk(dir.path(), &[("README.md", "# Title\n")]);
+        app.handle_repo_browse_tree_input(press(KeyCode::Enter))
+            .unwrap();
+        assert!(app.browse_state.as_ref().unwrap().open_is_pending());
+
+        let mut terminal = test_terminal();
+        app.handle_repo_browse_file_input(press(KeyCode::Char('M')), &mut terminal)
+            .unwrap();
+        assert!(app.is_markdown_rich());
+        assert!(
+            app.browse_state
+                .as_ref()
+                .unwrap()
+                .highlight_receiver
+                .is_none(),
+            "a pending placeholder must not be highlighted"
+        );
+
+        settle_browse(&mut app).await;
+        settle_highlight(&mut app).await;
+        assert!(
+            app.browse_state
+                .as_ref()
+                .and_then(|state| state.open.as_ref())
+                .expect("open file")
+                .cache
+                .markdown_rich,
+            "the landing load's highlight must read the toggled flag"
+        );
     }
 
     #[test]

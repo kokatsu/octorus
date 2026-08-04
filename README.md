@@ -111,6 +111,8 @@ octorus is not only a review tool — `or --browse` (or `b` from the file list, 
 
 - Browse every file, not just the ones a PR touched — tracked and untracked files included, ignored files excluded, uncommitted files visible immediately
 - Same tree-sitter syntax highlighting as the diff view (24 languages, your configured theme, Vue/Svelte/Markdown injections)
+- Long lines wrap at the pane edge onto gutter-aligned continuation rows, breaking on character boundaries so CJK prose wraps cleanly
+- Markdown rich display (`M`) — the same rich rendering as the diff view, applied to the open markdown file
 - Background loading — listing the repository, reading a file, and highlighting never block the UI
 - Blame gutter (`gb`) with jump to the blamed commit's diff (`gc`) or the PR that introduced it (`gp`)
 - Review discussion anchoring (`gr`) — marks the lines a PR review discussed and opens the thread at the cursor line; threads are placed by blame origin, so lines edited or moved since the review may not be matched
@@ -774,6 +776,7 @@ This view can be opened with `b` from the file list, **Repo Browse** in the Cock
 | `gr` | Mark reviewed lines and open the review discussion for the cursor line (blame gutter must be on) |
 | `gd` | Go to definition |
 | `gf` | Open file in your editor at the cursor line |
+| `M` | Toggle Markdown rich display |
 | `Ctrl-o` | Jump back |
 | `l` / `→` | Focus the graph pane when it is visible |
 | `h` / `←` / `q` / `Esc` | Back to the tree |

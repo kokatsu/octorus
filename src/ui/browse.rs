@@ -36,6 +36,7 @@ use crate::ui::common::truncate_with_width;
 const LINE_NUMBER_WIDTH: usize = 5;
 const MIN_CODE_WIDTH_WITH_BLAME: usize = 24;
 const DISCUSSION_GUTTER_WIDTH: usize = 2;
+const CURSOR_LINE_BG: Color = Color::Rgb(48, 48, 64);
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let zen = app.zen_mode;
@@ -347,6 +348,7 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         blame,
         discussion,
         content_width,
+        inner_height,
     );
 
     let building = matches!(state.index, crate::app::browse::IndexState::Building);
@@ -559,6 +561,10 @@ fn gutter_width(total: usize) -> usize {
 /// every string, and copying them would allocate once per span on every keystroke.
 /// A copy renders the identical frame, so `test_content_lines_borrow_their_text`
 /// asserts the `Cow` variant rather than the output.
+///
+/// A file line wider than the pane continues on extra visual rows instead of
+/// being cut off; `max_rows` caps the emitted rows at the viewport height so
+/// the work stays O(viewport) even when every visible line wraps.
 fn content_lines<'a>(
     window: &ContentWindow<'a>,
     cursor_line: usize,
@@ -566,46 +572,53 @@ fn content_lines<'a>(
     blame: Option<&'a BlameGutter>,
     discussion: Option<&DiscussionIndex>,
     content_width: usize,
+    max_rows: usize,
 ) -> Vec<Line<'a>> {
     let width = gutter_width(window.total);
     let discussion_width = discussion.map_or(0, |_| DISCUSSION_GUTTER_WIDTH);
     let blame_width =
         blame_gutter_width(content_width.saturating_sub(discussion_width), window.total);
-    window
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(offset, cached)| {
-            let line_index = window.first_line + offset;
-            let is_cursor = line_index == cursor_line;
 
-            let mut spans = Vec::with_capacity(cached.spans.len() + 2);
-            if let (Some(gutter), Some(blame_width)) = (blame, blame_width) {
-                spans.push(Span::styled(
-                    gutter.text(line_index, blame_width),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            if let Some(index) = discussion {
-                spans.push(Span::styled(
-                    if index.thread_indices_at(line_index).is_empty() {
-                        "  "
-                    } else {
-                        "● "
-                    },
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
-            spans.push(Span::styled(
-                format!("{:>width$} ", line_index + 1),
-                Style::default().fg(if is_cursor {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                }),
+    let mut rows: Vec<Line<'a>> = Vec::new();
+    for (offset, cached) in window.lines.iter().enumerate() {
+        if rows.len() >= max_rows {
+            break;
+        }
+        let line_index = window.first_line + offset;
+        let is_cursor = line_index == cursor_line;
+
+        let mut prefix = Vec::with_capacity(3);
+        if let (Some(gutter), Some(blame_width)) = (blame, blame_width) {
+            prefix.push(Span::styled(
+                gutter.text(line_index, blame_width),
+                Style::default().fg(Color::DarkGray),
             ));
+        }
+        if let Some(index) = discussion {
+            prefix.push(Span::styled(
+                if index.thread_indices_at(line_index).is_empty() {
+                    "  "
+                } else {
+                    "● "
+                },
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        prefix.push(Span::styled(
+            format!("{:>width$} ", line_index + 1),
+            Style::default().fg(if is_cursor {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+        ));
+        let prefix_width: usize = prefix.iter().map(|span| span.content.width()).sum();
 
-            for (index, span) in cached.spans.iter().enumerate() {
+        let content: Vec<(&'a str, Style)> = cached
+            .spans
+            .iter()
+            .enumerate()
+            .map(|(index, span)| {
                 let text = window.cache.resolve(span.content);
                 // Strip the pseudo-patch's leading context marker.
                 let text = if index == 0 {
@@ -615,13 +628,103 @@ fn content_lines<'a>(
                 };
                 let mut style = span.style;
                 if is_cursor && bg_color {
-                    style = style.bg(Color::Rgb(48, 48, 64));
+                    style = style.bg(CURSOR_LINE_BG);
                 }
-                spans.push(Span::styled(text, style));
+                (text, style)
+            })
+            .collect();
+
+        push_wrapped_line(
+            &mut rows,
+            prefix,
+            prefix_width,
+            &content,
+            content_width,
+            max_rows,
+            is_cursor && bg_color,
+        );
+    }
+    rows
+}
+
+/// Append one file line as visual rows no wider than `content_width` cells.
+///
+/// Rows break on character boundaries: CJK prose has no spaces, so ratatui's
+/// word wrapper would push a whole paragraph onto its own row below a lonely
+/// line number. Continuation rows carry a blank prefix as wide as the gutter,
+/// keeping the line-number column straight. Sub-spans borrow slices of the
+/// same interned text as the unwrapped path, and emission stops at `max_rows`.
+fn push_wrapped_line<'a>(
+    rows: &mut Vec<Line<'a>>,
+    prefix: Vec<Span<'a>>,
+    prefix_width: usize,
+    content: &[(&'a str, Style)],
+    content_width: usize,
+    max_rows: usize,
+    cursor_bg: bool,
+) {
+    let text_width = content_width.saturating_sub(prefix_width);
+    // Degenerate pane: no room for text next to the gutter. Emit the single
+    // row the unwrapped path produced and let the renderer clip it.
+    if text_width == 0 {
+        let mut spans = prefix;
+        spans.extend(
+            content
+                .iter()
+                .map(|&(text, style)| Span::styled(text, style)),
+        );
+        rows.push(Line::from(spans));
+        return;
+    }
+
+    let pad = || {
+        Span::styled(
+            " ".repeat(prefix_width),
+            if cursor_bg {
+                Style::default().bg(CURSOR_LINE_BG)
+            } else {
+                Style::default()
+            },
+        )
+    };
+
+    let mut current = prefix;
+    let mut used = 0usize;
+    for &(text, style) in content {
+        // Fast path: the whole span fits on this row as one borrowed piece.
+        let span_width = text.width();
+        if used + span_width <= text_width {
+            if !text.is_empty() {
+                current.push(Span::styled(text, style));
             }
-            Line::from(spans)
-        })
-        .collect()
+            used += span_width;
+            continue;
+        }
+
+        let mut start = 0usize;
+        for (byte, ch) in text.char_indices() {
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            // A glyph wider than the whole text column still gets placed
+            // (`used > 0` fails), so every iteration makes progress.
+            if used + ch_width > text_width && used > 0 {
+                if byte > start {
+                    current.push(Span::styled(&text[start..byte], style));
+                }
+                rows.push(Line::from(std::mem::take(&mut current)));
+                if rows.len() >= max_rows {
+                    return;
+                }
+                current.push(pad());
+                start = byte;
+                used = 0;
+            }
+            used += ch_width;
+        }
+        if start < text.len() {
+            current.push(Span::styled(&text[start..], style));
+        }
+    }
+    rows.push(Line::from(current));
 }
 
 fn blame_gutter_width(content_width: usize, total: usize) -> Option<BlameGutterWidth> {
@@ -2004,16 +2107,23 @@ mod tests {
         );
         let index = discussion_index(2, 1);
 
-        let rendered: Vec<String> =
-            content_lines(&window, 0, false, Some(&blame), Some(&index), 20)
+        let rendered: Vec<String> = content_lines(
+            &window,
+            0,
+            false,
+            Some(&blame),
+            Some(&index),
+            20,
+            usize::MAX,
+        )
+        .iter()
+        .map(|line| {
+            line.spans
                 .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect()
-                })
-                .collect();
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+        .collect();
 
         assert!(!rendered.join("\n").contains("aaaaaaa"));
         assert!(rendered[0].starts_with("      1"), "{rendered:?}");
@@ -2285,7 +2395,7 @@ mod tests {
         assert_eq!(window.total, 30);
         assert_eq!(window.lines.len(), 30);
 
-        let lines = content_lines(&window, 0, false, None, None, usize::MAX);
+        let lines = content_lines(&window, 0, false, None, None, usize::MAX, usize::MAX);
         let content_of = |line: &Line| -> String {
             line.spans[1..]
                 .iter()
@@ -2320,7 +2430,7 @@ mod tests {
         let cache = cache_of("fn main() {\n    println!(\"hi\");\n}\n");
         let window = content_window(&cache, 0, 3);
 
-        let lines = content_lines(&window, 0, true, None, None, usize::MAX);
+        let lines = content_lines(&window, 0, true, None, None, usize::MAX, usize::MAX);
 
         assert_eq!(lines.len(), 3);
         for line in &lines {
@@ -2363,7 +2473,7 @@ mod tests {
             ),
             3,
         );
-        let lines = content_lines(&window, 0, true, Some(&blame), None, 120);
+        let lines = content_lines(&window, 0, true, Some(&blame), None, 120, usize::MAX);
         for line in &lines {
             assert!(
                 matches!(line.spans[0].content, Cow::Borrowed(_)),
@@ -2380,6 +2490,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Wrapping must not make a frame O(file): when every visible line wraps
+    /// many times, row emission stops at the viewport height instead of
+    /// materialising every continuation row of every window line.
+    #[test]
+    fn test_wrapped_rows_stop_at_the_viewport_row_cap() {
+        let long = "x".repeat(1_000);
+        let cache = cache_of(&format!("{long}\n{long}\n{long}\n"));
+        let window = content_window(&cache, 0, 3);
+
+        let rows = content_lines(&window, 0, false, None, None, 40, 5);
+
+        // content width 40 minus the 6-cell gutter leaves 34 text cells, so
+        // each 1,000-cell line alone would produce ~30 rows.
+        assert_eq!(rows.len(), 5);
+    }
+
+    /// The cursor-line background must extend across wrapped continuation rows
+    /// — pad and text alike — otherwise the highlight visually ends at the
+    /// first row of a wrapped line.
+    #[test]
+    fn test_cursor_line_background_covers_wrapped_continuation_rows() {
+        let cache = cache_of(&format!("{}\n", "y".repeat(80)));
+        let window = content_window(&cache, 0, 4);
+
+        let rows = content_lines(&window, 0, true, None, None, 46, usize::MAX);
+
+        // 46 cells minus the 6-cell gutter wraps 80 glyphs into exactly two rows.
+        assert_eq!(rows.len(), 2);
+        let text_of = |row: &Line| -> String {
+            row.spans[1..]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text_of(&rows[0]), "y".repeat(40));
+        assert_eq!(text_of(&rows[1]), "y".repeat(40));
+
+        let pad = &rows[1].spans[0];
+        assert!(
+            pad.content.chars().all(|c| c == ' '),
+            "the continuation prefix must be blank, not a repeated gutter"
+        );
+        assert_eq!(pad.content.as_ref().len(), 6);
+        assert_eq!(pad.style.bg, Some(CURSOR_LINE_BG));
+        assert_eq!(rows[1].spans[1].style.bg, Some(CURSOR_LINE_BG));
     }
 
     /// The gutter is the one part of a browse row the renderer writes itself, so
@@ -2409,10 +2566,18 @@ mod tests {
             let cache = cache_of(&numbered_source(total));
             let window = content_window(&cache, total - 3, 3);
             assert_eq!(window.total, total);
-            content_lines(&window, total - 1, false, None, None, usize::MAX)
-                .iter()
-                .map(|line| line.spans[0].content.chars().count())
-                .collect()
+            content_lines(
+                &window,
+                total - 1,
+                false,
+                None,
+                None,
+                usize::MAX,
+                usize::MAX,
+            )
+            .iter()
+            .map(|line| line.spans[0].content.chars().count())
+            .collect()
         };
 
         // 99,999 lines: five-column gutter, and it must not widen early.
@@ -3156,13 +3321,13 @@ mod tests {
         assert_eq!(ascii_right_border_x, cjk_right_border_x);
     }
 
-    /// A CJK line wider than the pane has to be cut somewhere. The cut must land
-    /// on a character boundary: half a double-width glyph would either bleed over
+    /// A CJK line wider than the pane wraps, and every visual row must break on
+    /// a character boundary: half a double-width glyph would either bleed over
     /// the pane border or leave the border painted inside the glyph's cell.
     /// Both alignments matter — with an odd-width prefix the glyph that no longer
     /// fits straddles the border, which is the case that goes wrong.
     #[test]
-    fn test_cjk_line_wider_than_the_pane_is_cut_on_a_character_boundary() {
+    fn test_cjk_line_wider_than_the_pane_wraps_on_a_character_boundary() {
         let wide_only = "あ".repeat(40);
         let odd_offset = format!("x{}", "あ".repeat(40));
 
@@ -3202,7 +3367,52 @@ mod tests {
                     "the cell after the glyph at x={x} is not its continuation"
                 );
             }
+
+            // The overflow is not discarded: the glyphs that no longer fit
+            // continue on the next visual row.
+            let continuation_glyphs = (0..border_x)
+                .filter(|&x| buf[(x, content_y + 1)].symbol() == "あ")
+                .count();
+            assert!(
+                continuation_glyphs > 0,
+                "the overflowing tail must wrap onto the next row: {source}"
+            );
         }
+    }
+
+    /// The diff view wraps long lines onto continuation rows instead of cutting
+    /// them off at the pane edge; the browse content pane matches so markdown
+    /// prose and long code lines stay readable.
+    #[test]
+    fn test_long_line_wraps_onto_continuation_rows() {
+        let mut app = app_with_browse(&["notes.md"]);
+        if let Some(state) = app.browse_state.as_mut() {
+            open_file(
+                state,
+                "notes.md",
+                &format!("{}tail-sentinel\nshort line\n", "word ".repeat(18)),
+            );
+        }
+        app.state = AppState::RepoBrowseFile;
+        let out = render_at(&mut app, 80, 12);
+        assert!(
+            out.contains("tail-sentinel"),
+            "the overflowing tail must land on a wrapped continuation row:\n{out}"
+        );
+        assert_snapshot!(out, @"
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │Repo Browse - demo  1 files  symbols: -                                       │
+        └──────────────────────────────────────────────────────────────────────────────┘
+        ┌Files─────────────────────┐┌notes.md (1/2)────────────────────────────────────┐
+        │  notes.md                ││    1 word word word word word word word word word│
+        │                          ││       word word word word word word word word wor│
+        │                          ││      d tail-sentinel                             │
+        │                          ││    2 short line                                  │
+        │                          ││                                                  │
+        │                          ││                                                  │
+        └──────────────────────────┘└──────────────────────────────────────────────────┘
+         o outline | s search | i graph | gb blame | gc diff | gp PR | gr discuss | gd d
+        ");
     }
 
     /// A CJK glyph in the tree can start in the column immediately left of the
