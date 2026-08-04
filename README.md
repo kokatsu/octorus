@@ -109,15 +109,15 @@ Running `or` with no flags opens the Cockpit — a dashboard that serves as the 
 
 octorus is not only a review tool — `or --browse` (or `b` from the file list, or **Repo Browse** in the Cockpit) opens the whole repository read-only.
 
-- **Browse every file**, not just the ones a PR touched. The tree comes from `git ls-files -z --cached --others --exclude-standard`: ignored files stay out, a submodule is the single entry Git reports rather than its whole working tree, and a file an AI agent wrote thirty seconds ago is there before it is ever committed. The NUL-delimited form keeps paths containing spaces or newlines intact; a path whose bytes are not valid UTF-8 is left out and counted in the status line, since a lossily decoded name would no longer open the file Git named.
-- **Same highlighting as the diff view** — tree-sitter for 24 languages, your configured theme, injections for Vue/Svelte/Markdown. File content is rendered through the exact same cache the diff view uses, so there is no second rendering path to drift.
-- **Loading never blocks the UI.** Listing the repository, reading a file, and highlighting it are all background work: the pane shows `Loading…` until the content arrives, and selecting another file cancels the read still in flight. Highlighting is a second pass over the file that is already on screen, so a large file is readable before it is coloured.
-- **Blame links back to history and review.** Toggle the blame gutter with `gb`, place the cursor on a blamed line, and press `gc` to show that commit's diff in the browser content pane, or `gp` to open the pull request that introduced it. GitHub's commit-to-pulls API is authoritative; when it returns no PR, a strict trailing `(#123)` commit-subject reference is used as an explicitly labelled, unconfirmed fallback. The full commit SHA comes from the cursor line even when a repeated gutter row is visually blank. `q`, `Esc`, `h`, or `Ctrl-o` returns to the exact source line with blame still enabled. Uncommitted lines and unavailable/loading blame explain why no history target can be opened in the footer.
-- **Review discussions anchor to the lines they argued about.** With the blame gutter on, `gr` marks every line of the open file that a pull request review discussed and opens the thread under the cursor. Line numbers are never compared directly: a comment carries the commit and range it was written against, that range is blamed at that revision, and a thread is placed only where those origins match the working file's — a range must survive whole and contiguous, and an origin that maps to several current lines is declined rather than guessed. The mapping is deliberately conservative rather than exact: blame is whitespace-insensitive, so a re-indented line can keep a comment whose meaning changed, and an edited or purely moved line loses its thread. The footer counts the threads that could not be placed confidently instead of pretending they never existed.
-- **Read-only by design.** There is no insert mode and no accidental edit. `gf` hands the file to your editor (`editor` config → `$VISUAL` → `$EDITOR` → `vi`) at the cursor line when you actually want to change something.
-- **Files it will not render say why.** Over 8 MiB, over 100,000 lines, or a single line over 10,000 bytes each get a notice quoting the file's own figure against the limit that stopped it; binary content says `Binary file — no text preview.` — no wall of garbage either way. An empty file says `Empty file.`, and a path Git listed that is not on disk — a sparse checkout leaves index entries like that behind — shows the read error in place of the content.
-- **Empty and failed states are screens too.** A repository with no files says so. If `git ls-files` fails at all — including in a directory that is not a git repository — the browser still opens and shows what Git said, wrapped, in the preview pane.
-- **No GitHub repository required.** Without `--repo`, start-up asks `gh` which repository this is — but for `--browse` a failed answer is tolerated rather than fatal, so a repository with no GitHub remote opens the browser just the same. Only the PR- and issue-backed screens need that answer.
+- Browse every file, not just the ones a PR touched — tracked and untracked files included, ignored files excluded, uncommitted files visible immediately
+- Same tree-sitter syntax highlighting as the diff view (24 languages, your configured theme, Vue/Svelte/Markdown injections)
+- Background loading — listing the repository, reading a file, and highlighting never block the UI
+- Blame gutter (`gb`) with jump to the blamed commit's diff (`gc`) or the PR that introduced it (`gp`)
+- Review discussion anchoring (`gr`) — marks the lines a PR review discussed and opens the thread at the cursor line; threads are placed by blame origin, so lines edited or moved since the review may not be matched
+- Read-only — `gf` opens the file in your editor (`editor` config → `$VISUAL` → `$EDITOR` → `vi`) at the cursor line
+- Keyword filter for the file tree (`Space /`)
+- Render limits with explicit notices: over 8 MiB, over 100,000 lines, or a single line over 10,000 bytes; binary and empty files are labelled instead of rendered
+- Works without a GitHub remote — only the PR- and issue-backed screens need one
 
 ```bash
 or --browse
@@ -125,84 +125,19 @@ or --browse
 
 #### Symbol Intelligence
 
-As soon as the file list arrives, octorus indexes exactly those files in the background using tree-sitter `tags.scm` queries — the same queries GitHub uses for its own code navigation. There is **no language server to install and nothing to configure**; the grammars are compiled into the binary.
-
-The header shows `symbols: indexing` while it builds, `symbols: ready` when it is done, and `symbols: unavailable` if it failed. Reading the repository never waits for it: the tree, the file pane, the keyword filter, `gf` and `Ctrl-o` all work throughout. The three features that do consult the index — `o`, `s` and `gd` — say `Symbol index is still building` in the footer until it is complete, rather than replying from a half-built one.
-
-There is a second message ahead of that one. `o` and `gd` answer questions about *the open file*, so they check the file first: while its content is still being read they say `Still opening this file`, whatever the index is doing. Otherwise a file that has not been read yet would be reported as having no symbols and no definitions. `s` searches the whole repository and does not depend on the open file, so it never shows that message. If indexing fails outright, the header turns red with `symbols: unavailable` but the footer still says `Symbol index is still building` — a known rough edge.
+octorus indexes the repository in the background using tree-sitter `tags.scm` queries — **no language server to install and nothing to configure**; the grammars are compiled into the binary. The header shows the index state (`symbols: indexing` / `ready` / `unavailable`), and browsing never waits for it.
 
 | Feature | Key | Description |
 |---------|-----|-------------|
-| File outline | `o` | Symbols of the open file, indented by nesting depth, with the cursor's enclosing symbol pre-selected. Nesting follows the tags query: a Python method inside a class indents, a Rust method inside `impl` does not, because an `impl` block is not itself a tagged definition |
+| File outline | `o` | Symbols of the open file, indented by nesting depth, with the cursor's enclosing symbol pre-selected |
 | Symbol search | `s` | Fuzzy search across every symbol in the repository, best 200 matches listed; `Enter` opens the file at the definition |
-| UML module graph | `i` | Open a right-side graph pane for the current Rust, JavaScript, or TypeScript file. The current module and its direct imports/importers are drawn as boxes and arrows; `Enter` opens a listed local module |
-| Go to definition | `gd` | Resolve the cursor **line** against the index — a CST match, not a grep for `fn <name>` |
+| UML module graph | `i` | Right-side graph pane showing the current module and its direct imports/importers; `Enter` opens a listed local module |
+| Go to definition | `gd` | Jump to the definition of the first indexed identifier on the cursor line |
 | Jump back | `Ctrl-o` | Return to the position before the last jump |
-
-`gd` in the browser works at line granularity: the browser has a line cursor and no column cursor, so it reads the identifiers on the cursor line left to right and jumps to the first one the index knows. On `Config::helper()` that is `Config`. To land on `helper` instead, use `s` and search for it by name — and either way `Ctrl-o` puts you back, so a jump you did not mean costs one keystroke. (The diff view's `gd` does have a column-free candidate popup; the browser deliberately does not, because `s` already covers "not that one, the other one" across the whole repository rather than one line.)
 
 Symbol extraction covers Rust, TypeScript, TSX, JavaScript, JSX, Go, Python, Ruby, C, C++, Java, C#, Lua, PHP, Swift, Bash, Zig, Haskell, MoonBit, and Markdown (headings become the outline of a README).
 
-The same background parse pass also extracts imports for Rust, TypeScript, TSX, JavaScript, and JSX. JavaScript/TypeScript resolution handles relative paths, packages, and a root `tsconfig.json` or `jsconfig.json`; Rust module resolution is deliberately best-effort. Dependency queries run off the UI thread; each direction retains up to 200 nodes and shows the full edge count when truncated. Pressing `i` adds a third pane to the right of the code view: the current module uses a double-line box, related modules use UML-like boxes and directional connectors, and every answer is labelled `exact` or `approximate`. The pane follows file navigation and refreshes asynchronously for the new current file. Rust answers are approximate, as are reverse dependencies when the repository listing was truncated, a non-UTF-8 path was omitted, or an import-supporting file could not be analyzed.
-
-#### Repository Browser Keybindings
-
-**Tree Focus:**
-
-| Key | Action |
-|-----|--------|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `Ctrl-d` / `Ctrl-u` | Page down / up |
-| `gg` / `G` | Jump to first / last row |
-| `Enter` / `l` / `→` | Open file, or expand/collapse directory |
-| `Space /` | Filter paths by keyword |
-| `s` | Repository symbol search |
-| `Z` | Toggle zen mode |
-| `?` | Toggle help |
-| `q` / `Esc` | Back to the previous screen |
-
-**File Focus:**
-
-| Key | Action |
-|-----|--------|
-| `j` / `↓` | Move cursor down |
-| `k` / `↑` | Move cursor up |
-| `Ctrl-d` / `Ctrl-u`, `PageDown` / `PageUp` | Page down / up |
-| `gg` / `G` | Jump to first / last line |
-| `o` | File outline |
-| `s` | Repository symbol search |
-| `i` | Open or focus the right-side UML module graph |
-| `gb` | Toggle blame gutter |
-| `gc` | Open the blamed line's commit diff inside the browser |
-| `gp` | Open the PR that introduced the blamed line's commit |
-| `gr` | Mark reviewed lines and open the review discussion for the cursor line (blame gutter must be on) |
-| `gd` | Go to definition |
-| `gf` | Open file in your editor at the cursor line |
-| `Ctrl-o` | Jump back |
-| `l` / `→` | Focus the graph pane when it is visible |
-| `h` / `←` / `q` / `Esc` | Back to the tree |
-
-**Outline / Symbol search overlay:**
-
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Move selection (outline only — in symbol search, letters type into the query) |
-| `↑` / `↓`, `Ctrl-p` / `Ctrl-n` | Move selection (symbol search) |
-| `Backspace` | Delete the last character of the query (symbol search) |
-| `Ctrl-u` | Clear the query |
-| `Enter` | Jump to the symbol |
-| `Esc` | Close |
-
-**Module Graph Focus:**
-
-| Key | Action |
-|-----|--------|
-| `Tab`, `h` / `l`, `←` / `→` | Switch between outgoing imports and incoming importers |
-| `j` / `k`, `↑` / `↓` | Select a module node |
-| `Enter` | Open a listed local target/importer; external, unresolved, and unlisted nodes stay visible but do not open |
-| `i` | Close the graph pane and return to code |
-| `Esc` / `q` | Return focus to code while leaving the graph pane visible |
+The module graph supports Rust, TypeScript, TSX, JavaScript, and JSX. JavaScript/TypeScript imports resolve relative paths, packages, and a root `tsconfig.json` or `jsconfig.json`; Rust resolution is best-effort. Each direction shows up to 200 nodes, every answer is labelled `exact` or `approximate`, and the pane follows file navigation.
 
 ### Pull Requests
 
@@ -800,6 +735,69 @@ When adding a comment, suggestion, or reply, you enter the built-in text input m
 | `Esc` | Cancel |
 
 Multi-line input is supported. Press `Enter` to insert a newline.
+
+### Repository Browser View
+
+The repository browser shows the file tree (left) and file content (right), with an optional UML module graph pane on the far right; the file outline and symbol search open as overlays. Keys depend on which pane has focus. The focused pane is highlighted with a yellow border.
+
+This view can be opened with `b` from the file list, **Repo Browse** in the Cockpit, or directly from the CLI with the `--browse` flag.
+
+**Tree Focus:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `Ctrl-d` / `Ctrl-u` | Page down / up |
+| `gg` / `G` | Jump to first / last row |
+| `Enter` / `l` / `→` | Open file, or expand/collapse directory |
+| `Space /` | Filter paths by keyword |
+| `s` | Repository symbol search |
+| `Z` | Toggle zen mode |
+| `?` | Toggle help |
+| `q` / `Esc` | Back to the previous screen |
+
+**File Focus:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
+| `Ctrl-d` / `Ctrl-u`, `PageDown` / `PageUp` | Page down / up |
+| `gg` / `G` | Jump to first / last line |
+| `o` | File outline |
+| `s` | Repository symbol search |
+| `i` | Open or focus the right-side UML module graph |
+| `gb` | Toggle blame gutter |
+| `gc` | Open the blamed line's commit diff inside the browser |
+| `gp` | Open the PR that introduced the blamed line's commit |
+| `gr` | Mark reviewed lines and open the review discussion for the cursor line (blame gutter must be on) |
+| `gd` | Go to definition |
+| `gf` | Open file in your editor at the cursor line |
+| `Ctrl-o` | Jump back |
+| `l` / `→` | Focus the graph pane when it is visible |
+| `h` / `←` / `q` / `Esc` | Back to the tree |
+
+**Outline / Symbol Search Overlay:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move selection (outline only — in symbol search, letters type into the query) |
+| `↑` / `↓`, `Ctrl-p` / `Ctrl-n` | Move selection (symbol search) |
+| `Backspace` | Delete the last character of the query (symbol search) |
+| `Ctrl-u` | Clear the query |
+| `Enter` | Jump to the symbol |
+| `Esc` | Close |
+
+**Module Graph Focus:**
+
+| Key | Action |
+|-----|--------|
+| `Tab`, `h` / `l`, `←` / `→` | Switch between outgoing imports and incoming importers |
+| `j` / `k`, `↑` / `↓` | Select a module node |
+| `Enter` | Open a listed local target/importer; external, unresolved, and unlisted nodes stay visible but do not open |
+| `i` | Close the graph pane and return to code |
+| `Esc` / `q` | Return focus to code while leaving the graph pane visible |
 
 ### Git Ops View
 
