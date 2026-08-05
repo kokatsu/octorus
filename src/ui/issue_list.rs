@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use super::common::truncate_with_width;
 use crate::app::App;
 use crate::github::IssueSummary;
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let Some(ref state) = app.issue_state else {
@@ -52,7 +53,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .block(Block::default().borders(Borders::ALL).title("Issues"));
             frame.render_widget(empty, chunks[1]);
         } else {
-            let (display_issues, display_selected, total_display) =
+            let (display_issues, display_selected, total_display, display_indices) =
                 if let Some(ref filter) = state.issue_list_filter {
                     if filter.matched_indices.is_empty() {
                         let empty_msg = format!("No matches for '{}'", filter.query);
@@ -77,12 +78,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                         filter.matched_indices.iter().map(|&i| &issues[i]).collect();
                     let sel = filter.selected.unwrap_or(0);
                     let total = filtered.len();
-                    (filtered, sel, total)
+                    (filtered, sel, total, filter.matched_indices.clone())
                 } else {
                     let all: Vec<&IssueSummary> = issues.iter().collect();
                     let sel = state.selected_issue;
                     let total = all.len();
-                    (all, sel, total)
+                    (all, sel, total, (0..issues.len()).collect())
                 };
 
             let total_issues = issues.len();
@@ -103,13 +104,44 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .with_offset(state.issue_list_scroll_offset)
                 .with_selected(Some(display_selected));
 
+            let block = Block::default().borders(Borders::ALL).title(title);
+            let inner_area = block.inner(chunks[1]);
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(title))
+                .block(block)
                 .highlight_style(Style::default().bg(Color::DarkGray));
             frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
+            let final_offset = list_state.offset();
             if let Some(ref mut state) = app.issue_state {
-                state.issue_list_scroll_offset = list_state.offset();
+                state.issue_list_scroll_offset = final_offset;
+            }
+
+            app.hit_map.push(
+                inner_area,
+                HitTarget::Pane {
+                    pane: PaneKind::List(ListKind::IssueList),
+                },
+            );
+            let visible_end = final_offset
+                .saturating_add(inner_area.height as usize)
+                .min(total_display);
+            for row in final_offset..visible_end {
+                let Some(&index) = display_indices.get(row) else {
+                    break;
+                };
+                app.hit_map.push(
+                    Rect {
+                        x: inner_area.x,
+                        y: inner_area.y + (row - final_offset) as u16,
+                        width: inner_area.width,
+                        height: 1,
+                    },
+                    HitTarget::ListRow {
+                        list: ListKind::IssueList,
+                        row,
+                        index,
+                    },
+                );
             }
 
             if total_display > 1 {

@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use super::common::{render_update_bar, truncate_with_width};
 use crate::app::App;
 use crate::github::{CiStatus, PullRequestSummary};
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let has_filter_bar = app
@@ -120,12 +121,44 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .with_offset(app.prs.pr_list_scroll_offset)
                 .with_selected(Some(display_selected));
 
+            let block = Block::default().borders(Borders::ALL).title(title);
+            let inner_area = block.inner(chunks[1]);
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(title))
+                .block(block)
                 .highlight_style(Style::default().bg(Color::DarkGray));
             frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
             app.prs.pr_list_scroll_offset = list_state.offset();
+            app.hit_map.push(
+                inner_area,
+                HitTarget::Pane {
+                    pane: PaneKind::List(ListKind::PrList),
+                },
+            );
+            for i in 0..inner_area.height as usize {
+                let row = list_state.offset() + i;
+                if row >= total_display {
+                    break;
+                }
+                let index = app
+                    .prs
+                    .pr_list_filter
+                    .as_ref()
+                    .map_or(row, |filter| filter.matched_indices[row]);
+                app.hit_map.push(
+                    Rect {
+                        x: inner_area.x,
+                        y: inner_area.y.saturating_add(i as u16),
+                        width: inner_area.width,
+                        height: 1,
+                    },
+                    HitTarget::ListRow {
+                        list: ListKind::PrList,
+                        row,
+                        index,
+                    },
+                );
+            }
 
             if total_display > 1 {
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)

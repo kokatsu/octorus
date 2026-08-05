@@ -69,6 +69,7 @@ pub struct KeybindingsConfig {
 
     pub tree_toggle: KeySequence,
     pub shell_command: KeySequence,
+    pub toggle_mouse: KeySequence,
 
     pub repo_browse: KeySequence,
     pub symbol_outline: KeySequence,
@@ -155,6 +156,7 @@ impl Default for KeybindingsConfig {
             mark_viewed_dir: KeySequence::single(KeyBinding::char('V')),
             tree_toggle: KeySequence::single(KeyBinding::char('t')),
             shell_command: KeySequence::single(KeyBinding::char('!')),
+            toggle_mouse: KeySequence::single(KeyBinding::named(NamedKey::F(2))),
 
             repo_browse: KeySequence::single(KeyBinding::char('b')),
             symbol_outline: KeySequence::single(KeyBinding::char('o')),
@@ -252,6 +254,7 @@ impl KeybindingsConfig {
             ("open_blame_pr", &self.open_blame_pr),
             ("open_line_discussion", &self.open_line_discussion),
             ("shell_command", &self.shell_command),
+            ("toggle_mouse", &self.toggle_mouse),
             ("filter_open", &self.filter_open),
             ("filter_closed", &self.filter_closed),
             ("filter_all", &self.filter_all),
@@ -534,6 +537,7 @@ impl Serialize for KeybindingsConfig {
         map.serialize_entry("mark_viewed", &seq_to_value(&self.mark_viewed))?;
         map.serialize_entry("mark_viewed_dir", &seq_to_value(&self.mark_viewed_dir))?;
         map.serialize_entry("tree_toggle", &seq_to_value(&self.tree_toggle))?;
+        map.serialize_entry("toggle_mouse", &seq_to_value(&self.toggle_mouse))?;
         map.serialize_entry("repo_browse", &seq_to_value(&self.repo_browse))?;
         map.serialize_entry("symbol_outline", &seq_to_value(&self.symbol_outline))?;
         map.serialize_entry("symbol_search", &seq_to_value(&self.symbol_search))?;

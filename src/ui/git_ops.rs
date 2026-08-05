@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -15,6 +15,7 @@ use super::common::render_rally_status_bar;
 use super::diff_view;
 use crate::app::{App, AppState, CommitLogState, FileStatus, GitOpsState, LeftPaneFocus, TreeRow};
 use crate::github::{format_relative_time, PrCommit};
+use crate::ui::hit::{HitMap, HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let has_rally = app.has_background_rally();
@@ -62,7 +63,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_tree_pane(frame, app, left_chunks[0], is_tree_focused);
     render_commits_pane(frame, app, left_chunks[1], is_commits_focused);
-    render_diff_pane(frame, &*app, h_chunks[1], is_diff_focused);
+    render_diff_pane(frame, app, h_chunks[1], is_diff_focused);
+    super::split_view::register_split_divider(app, h_chunks[0], outer_chunks[0]);
 
     if has_rally {
         render_rally_status_bar(frame, outer_chunks[1], app);
@@ -135,13 +137,13 @@ fn render_tree_pane(
             .map(|(i, row)| build_tree_row_item(ops, row, i == selected))
             .collect();
 
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(format!("Files ({})", ops.entries.len()));
+        let inner_area = block.inner(chunks[1]);
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color))
-                    .title(format!("Files ({})", ops.entries.len())),
-            )
+            .block(block)
             .highlight_style(Style::default().bg(Color::DarkGray));
 
         let mut list_state = ListState::default()
@@ -152,6 +154,42 @@ fn render_tree_pane(
 
         if let Some(ref mut ops) = app.git_ops_state {
             ops.tree.scroll_offset = list_state.offset();
+        }
+
+        app.hit_map.push(
+            inner_area,
+            HitTarget::Pane {
+                pane: PaneKind::List(ListKind::GitOpsTree),
+            },
+        );
+        let offset = list_state.offset();
+        if let Some(ref ops) = app.git_ops_state {
+            for (row, tree_row) in ops
+                .tree
+                .visible_rows
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(inner_area.height as usize)
+            {
+                let index = match tree_row {
+                    TreeRow::File { index, .. } => *index,
+                    TreeRow::Dir { .. } => row,
+                };
+                app.hit_map.push(
+                    Rect {
+                        x: inner_area.x,
+                        y: inner_area.y + (row - offset) as u16,
+                        width: inner_area.width,
+                        height: 1,
+                    },
+                    HitTarget::ListRow {
+                        list: ListKind::GitOpsTree,
+                        row,
+                        index,
+                    },
+                );
+            }
         }
 
         if total > 1 {
@@ -233,7 +271,12 @@ fn render_tree_pane(
     }
 }
 
-fn render_diff_pane(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, is_focused: bool) {
+fn render_diff_pane(
+    frame: &mut Frame,
+    app: &mut App,
+    area: ratatui::layout::Rect,
+    is_focused: bool,
+) {
     let border_color = if is_focused {
         Color::Yellow
     } else {
@@ -278,9 +321,23 @@ fn render_diff_pane(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, i
     frame.render_widget(header, chunks[0]);
 
     if is_commit_diff {
-        render_commit_diff_body(frame, &ops.commit_log, chunks[1], border_color, bg_color);
+        render_commit_diff_body(
+            frame,
+            &ops.commit_log,
+            chunks[1],
+            border_color,
+            bg_color,
+            &mut app.hit_map,
+        );
     } else {
-        render_diff_body(frame, ops, chunks[1], border_color, bg_color);
+        render_diff_body(
+            frame,
+            ops,
+            chunks[1],
+            border_color,
+            bg_color,
+            &mut app.hit_map,
+        );
     }
 
     let footer_text_owned;
@@ -305,33 +362,41 @@ fn render_diff_body(
     area: ratatui::layout::Rect,
     border_color: Color,
     bg_color: bool,
+    hit_map: &mut HitMap,
 ) {
-    let lines: Vec<Line> = if let Some(ref cache) = ops.diff_store.current {
-        let visible_height = area.height.saturating_sub(2) as usize;
-        let line_count = cache.lines.len();
-        let visible_start = ops
-            .diff_scroll
-            .scroll_offset
-            .saturating_sub(2)
-            .min(line_count);
-        let visible_end = (ops.diff_scroll.scroll_offset + visible_height + 5).min(line_count);
+    let (lines, first_logical_line): (Vec<Line>, Option<usize>) =
+        if let Some(ref cache) = ops.diff_store.current {
+            let visible_height = area.height.saturating_sub(2) as usize;
+            let line_count = cache.lines.len();
+            let visible_start = ops
+                .diff_scroll
+                .scroll_offset
+                .saturating_sub(2)
+                .min(line_count);
+            let visible_end = (ops.diff_scroll.scroll_offset + visible_height + 5).min(line_count);
 
-        let empty_comments = HashSet::new();
-        diff_view::render_cached_lines(
-            cache,
-            visible_start..visible_end,
-            ops.diff_scroll.selected_line,
-            &empty_comments,
-            bg_color,
-            None,
-            area.width.saturating_sub(2),
-        )
-    } else {
-        vec![Line::from(Span::styled(
-            "Select a file to preview diff",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    };
+            let empty_comments = HashSet::new();
+            (
+                diff_view::render_cached_lines(
+                    cache,
+                    visible_start..visible_end,
+                    ops.diff_scroll.selected_line,
+                    &empty_comments,
+                    bg_color,
+                    None,
+                    area.width.saturating_sub(2),
+                ),
+                Some(visible_start),
+            )
+        } else {
+            (
+                vec![Line::from(Span::styled(
+                    "Select a file to preview diff",
+                    Style::default().fg(Color::DarkGray),
+                ))],
+                None,
+            )
+        };
 
     let adjusted_scroll = if ops.diff_store.current.is_some() {
         let visible_start = ops.diff_scroll.scroll_offset.saturating_sub(2);
@@ -340,12 +405,20 @@ fn render_diff_body(
         ops.diff_scroll.scroll_offset as u16
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner_area = block.inner(area);
+    register_diff_body_hits(
+        hit_map,
+        inner_area,
+        &lines,
+        first_logical_line,
+        adjusted_scroll as usize,
+    );
+
     let diff_block = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
+        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((adjusted_scroll, 0));
     frame.render_widget(diff_block, area);
@@ -380,17 +453,24 @@ fn render_commit_diff_body(
     area: ratatui::layout::Rect,
     border_color: Color,
     bg_color: bool,
+    hit_map: &mut HitMap,
 ) {
-    let lines: Vec<Line> = if cl.diff_loading {
-        vec![Line::from(Span::styled(
-            "Loading diff...",
-            Style::default().fg(Color::Yellow),
-        ))]
+    let (lines, first_logical_line): (Vec<Line>, Option<usize>) = if cl.diff_loading {
+        (
+            vec![Line::from(Span::styled(
+                "Loading diff...",
+                Style::default().fg(Color::Yellow),
+            ))],
+            None,
+        )
     } else if let Some(ref error) = cl.diff_error {
-        vec![Line::from(Span::styled(
-            format!("Error: {}", error),
-            Style::default().fg(Color::Red),
-        ))]
+        (
+            vec![Line::from(Span::styled(
+                format!("Error: {}", error),
+                Style::default().fg(Color::Red),
+            ))],
+            None,
+        )
     } else if let Some(ref cache) = cl.diff_store.current {
         let visible_height = area.height.saturating_sub(2) as usize;
         let line_count = cache.lines.len();
@@ -402,20 +482,26 @@ fn render_commit_diff_body(
         let visible_end = (cl.diff_scroll.scroll_offset + visible_height + 5).min(line_count);
 
         let empty_comments = HashSet::new();
-        diff_view::render_cached_lines(
-            cache,
-            visible_start..visible_end,
-            cl.diff_scroll.selected_line,
-            &empty_comments,
-            bg_color,
-            None,
-            area.width.saturating_sub(2),
+        (
+            diff_view::render_cached_lines(
+                cache,
+                visible_start..visible_end,
+                cl.diff_scroll.selected_line,
+                &empty_comments,
+                bg_color,
+                None,
+                area.width.saturating_sub(2),
+            ),
+            Some(visible_start),
         )
     } else {
-        vec![Line::from(Span::styled(
-            "Select a commit to preview diff",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        (
+            vec![Line::from(Span::styled(
+                "Select a commit to preview diff",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            None,
+        )
     };
 
     let adjusted_scroll = if cl.diff_store.current.is_some() {
@@ -425,12 +511,20 @@ fn render_commit_diff_body(
         cl.diff_scroll.scroll_offset as u16
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner_area = block.inner(area);
+    register_diff_body_hits(
+        hit_map,
+        inner_area,
+        &lines,
+        first_logical_line,
+        adjusted_scroll as usize,
+    );
+
     let diff_block = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
+        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((adjusted_scroll, 0));
     frame.render_widget(diff_block, area);
@@ -455,6 +549,57 @@ fn render_commit_diff_body(
                 }),
                 &mut scrollbar_state,
             );
+        }
+    }
+}
+
+fn register_diff_body_hits(
+    hit_map: &mut HitMap,
+    area: Rect,
+    lines: &[Line<'_>],
+    first_logical_line: Option<usize>,
+    visual_scroll: usize,
+) {
+    hit_map.push(
+        area,
+        HitTarget::Pane {
+            pane: PaneKind::GitOpsDiff,
+        },
+    );
+
+    let Some(first_logical_line) = first_logical_line else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let visible_end = visual_scroll.saturating_add(area.height as usize);
+    let mut rendered_row = 0usize;
+    for (line_offset, line) in lines.iter().enumerate() {
+        let line_height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(area.width);
+        let line_end = rendered_row.saturating_add(line_height);
+
+        for row in rendered_row.max(visual_scroll)..line_end.min(visible_end) {
+            hit_map.push(
+                Rect {
+                    x: area.x,
+                    y: area.y.saturating_add((row - visual_scroll) as u16),
+                    width: area.width,
+                    height: 1,
+                },
+                HitTarget::ContentLine {
+                    pane: PaneKind::GitOpsDiff,
+                    line: first_logical_line + line_offset,
+                },
+            );
+        }
+
+        rendered_row = line_end;
+        if rendered_row >= visible_end {
+            break;
         }
     }
 }
@@ -548,13 +693,13 @@ fn render_commits_pane(
         format!("Commits ({})", count_str)
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title);
+    let inner_area = block.inner(area);
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(title),
-        )
+        .block(block)
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     let mut list_state = ListState::default()
@@ -563,6 +708,29 @@ fn render_commits_pane(
 
     frame.render_stateful_widget(list, area, &mut list_state);
     cl.scroll_offset = list_state.offset();
+
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::GitOpsCommits),
+        },
+    );
+    let offset = list_state.offset();
+    for row in offset..total.min(offset.saturating_add(inner_area.height as usize)) {
+        app.hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y + (row - offset) as u16,
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::GitOpsCommits,
+                row,
+                index: row,
+            },
+        );
+    }
 
     if total > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -1018,7 +1186,7 @@ mod tests {
     }
 
     /// render_diff_pane を描画し、diff body 部分のテキストを返す
-    fn render_diff_pane_body(app: &App) -> String {
+    fn render_diff_pane_body(app: &mut App) -> String {
         let backend = TestBackend::new(80, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect::new(0, 0, 80, 15);
@@ -1055,7 +1223,7 @@ mod tests {
         ops.left_return_focus = LeftPaneFocus::Commits;
         app.git_ops_state = Some(ops);
 
-        assert_snapshot!(render_diff_pane_body(&app), @"
+        assert_snapshot!(render_diff_pane_body(&mut app), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
         │Loading diff...                                                               │
         │                                                                              │
@@ -1080,7 +1248,7 @@ mod tests {
         ops.left_return_focus = LeftPaneFocus::Commits;
         app.git_ops_state = Some(ops);
 
-        assert_snapshot!(render_diff_pane_body(&app), @"
+        assert_snapshot!(render_diff_pane_body(&mut app), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
         │Error: gh: Not Found (HTTP 404)                                               │
         │                                                                              │
@@ -1100,7 +1268,7 @@ mod tests {
         ops.left_return_focus = LeftPaneFocus::Commits;
         app.git_ops_state = Some(ops);
 
-        assert_snapshot!(render_diff_pane_body(&app), @"
+        assert_snapshot!(render_diff_pane_body(&mut app), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
         │Select a commit to preview diff                                               │
         │                                                                              │
@@ -1140,7 +1308,7 @@ mod tests {
         assert!(cl.diff_loading);
         assert!(cl.diff_receiver.is_some());
 
-        assert_snapshot!(render_diff_pane_body(&app), @"
+        assert_snapshot!(render_diff_pane_body(&mut app), @"
         ┌──────────────────────────────────────────────────────────────────────────────┐
         │Loading diff...                                                               │
         │                                                                              │

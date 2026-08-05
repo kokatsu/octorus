@@ -47,6 +47,7 @@ mod git_ops;
 mod input;
 mod input_browse;
 mod input_diff;
+mod input_mouse;
 mod input_text;
 mod issue_detail;
 mod issue_list;
@@ -203,11 +204,20 @@ pub struct App {
     pub home_state: Option<AppState>,
     /// Repository Browser state (None = browser inactive).
     pub browse_state: Option<browse::BrowseState>,
+    /// マウスキャプチャの現在状態(F2 トグルで切替、mouse.enabled=false なら常に false)
+    pub mouse_capture_active: bool,
+    /// ドレイン中に読んでしまった未処理イベントの保留キュー(次イテレーションで消費)
+    pub(crate) pending_events: std::collections::VecDeque<crossterm::event::Event>,
+    /// 直近フレームのヒット領域(描画時に登録、入力時に参照)
+    pub hit_map: crate::ui::hit::HitMap,
+    /// マウスドラッグの状態機械
+    pub(crate) drag_state: input_mouse::DragState,
 }
 
 impl App {
     fn base_app(repo: String, config: Config) -> Self {
         let submit_key = config.keybindings.submit.clone();
+        let mouse_capture_active = config.mouse.enabled;
         Self {
             repo,
             repository_availability: RepositoryAvailability::Unavailable,
@@ -283,7 +293,23 @@ impl App {
             cockpit_state: None,
             home_state: None,
             browse_state: None,
+            mouse_capture_active,
+            pending_events: std::collections::VecDeque::new(),
+            hit_map: crate::ui::hit::HitMap::default(),
+            drag_state: input_mouse::DragState::default(),
         }
+    }
+
+    /// F2 トグルで移行すべきキャプチャ状態。mouse.enabled=false なら None(トグル無効)。
+    pub(crate) fn mouse_capture_target(&self) -> Option<bool> {
+        self.config
+            .mouse
+            .enabled
+            .then_some(!self.mouse_capture_active)
+    }
+
+    pub(crate) fn set_mouse_capture_active(&mut self, active: bool) {
+        self.mouse_capture_active = active;
     }
 
     pub fn new_loading(
@@ -379,7 +405,7 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let mut terminal = ui::setup_terminal()?;
+        let mut terminal = ui::setup_terminal(self.mouse_capture_active)?;
 
         // データが既にロード済み（キャッシュヒット）の場合、プリフェッチを開始
         if matches!(self.data_state, DataState::Loaded { .. }) {
@@ -425,7 +451,7 @@ impl App {
                     let editor = self.config.editor.clone();
                     ui::restore_terminal(&mut terminal)?;
                     let _ = crate::editor::open_file_at_line(editor.as_deref(), &path_str, line);
-                    terminal = ui::setup_terminal()?;
+                    terminal = ui::setup_terminal(self.mouse_capture_active)?;
                 }
             }
             terminal.draw(|frame| ui::render(frame, self))?;

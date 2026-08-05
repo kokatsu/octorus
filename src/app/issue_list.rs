@@ -117,6 +117,88 @@ impl App {
         });
     }
 
+    pub(crate) fn issue_list_move_down(&mut self) {
+        let Some(ref state) = self.issue_state else {
+            return;
+        };
+        let issue_count = state.issues.as_loaded().map(|l| l.len()).unwrap_or(0);
+
+        if state.issue_list_filter.is_some() {
+            self.handle_filter_navigation("issue", true);
+        } else if issue_count > 0 {
+            let needs_load_more = {
+                let state = self.issue_state.as_mut().unwrap();
+                state.selected_issue =
+                    (state.selected_issue + 1).min(issue_count.saturating_sub(1));
+                state.issue_list_has_more
+                    && !state.issues.is_loading()
+                    && state.selected_issue + 5 >= issue_count
+            };
+            if needs_load_more {
+                self.load_more_issues();
+            }
+        }
+    }
+
+    pub(crate) fn issue_list_move_up(&mut self) {
+        let Some(ref state) = self.issue_state else {
+            return;
+        };
+
+        if state.issue_list_filter.is_some() {
+            self.handle_filter_navigation("issue", false);
+        } else {
+            let state = self.issue_state.as_mut().unwrap();
+            state.selected_issue = state.selected_issue.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn open_selected_issue(&mut self) {
+        if self.is_filter_selection_empty("issue") {
+            return;
+        }
+        let issue_number = {
+            let Some(ref state) = self.issue_state else {
+                return;
+            };
+            state
+                .issues
+                .as_loaded()
+                .and_then(|issues| issues.get(state.selected_issue))
+                .map(|issue| issue.number)
+        };
+        if let Some(number) = issue_number {
+            self.select_issue(number);
+        }
+    }
+
+    pub(crate) fn issue_list_click_select(&mut self, row: usize, index: usize) -> bool {
+        let Some(ref mut state) = self.issue_state else {
+            return false;
+        };
+
+        let (already_selected, needs_load_more) =
+            if let Some(ref mut filter) = state.issue_list_filter {
+                let already_selected = filter.selected == Some(row);
+                filter.selected = Some(row);
+                state.selected_issue = index;
+                (already_selected, false)
+            } else {
+                let already_selected = state.selected_issue == index;
+                state.selected_issue = index;
+                let issue_count = state.issues.as_loaded().map(|l| l.len()).unwrap_or(0);
+                let needs_load_more = state.issue_list_has_more
+                    && !state.issues.is_loading()
+                    && state.selected_issue + 5 >= issue_count;
+                (already_selected, needs_load_more)
+            };
+
+        if needs_load_more {
+            self.load_more_issues();
+        }
+        already_selected
+    }
+
     pub(crate) async fn handle_issue_list_input(&mut self, key: event::KeyEvent) -> Result<()> {
         let kb = self.config.keybindings.clone();
 
@@ -154,31 +236,12 @@ impl App {
         let has_filter = state.issue_list_filter.is_some();
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if has_filter {
-                self.handle_filter_navigation("issue", true);
-            } else if issue_count > 0 {
-                let needs_load_more = {
-                    let state = self.issue_state.as_mut().unwrap();
-                    state.selected_issue =
-                        (state.selected_issue + 1).min(issue_count.saturating_sub(1));
-                    state.issue_list_has_more
-                        && !state.issues.is_loading()
-                        && state.selected_issue + 5 >= issue_count
-                };
-                if needs_load_more {
-                    self.load_more_issues();
-                }
-            }
+            self.issue_list_move_down();
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            if has_filter {
-                self.handle_filter_navigation("issue", false);
-            } else {
-                let state = self.issue_state.as_mut().unwrap();
-                state.selected_issue = state.selected_issue.saturating_sub(1);
-            }
+            self.issue_list_move_up();
             return Ok(());
         }
 
@@ -259,20 +322,7 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.open_panel) {
-            if self.is_filter_selection_empty("issue") {
-                return Ok(());
-            }
-            let issue_number = {
-                let state = self.issue_state.as_ref().unwrap();
-                state
-                    .issues
-                    .as_loaded()
-                    .and_then(|issues| issues.get(state.selected_issue))
-                    .map(|i| i.number)
-            };
-            if let Some(number) = issue_number {
-                self.select_issue(number);
-            }
+            self.open_selected_issue();
             return Ok(());
         }
 

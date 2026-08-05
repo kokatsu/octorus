@@ -82,7 +82,7 @@ impl App {
         tracing::debug!(?editor_result, "submit_review: editor returned");
 
         // エディタの成否に関わらずターミナルを再セットアップ
-        *terminal = ui::setup_terminal()?;
+        *terminal = ui::setup_terminal(self.mouse_capture_active)?;
 
         let body = match editor_result {
             Ok(body) => body,
@@ -710,23 +710,12 @@ impl App {
         } else if self.matches_single_key(&key, &kb.move_down) {
             match self.cmt.comment_tab {
                 CommentTab::Review => self.review_nav_down(1),
-                CommentTab::Discussion => {
-                    if let Some(ref comments) = self.cmt.discussion_comments {
-                        if !comments.is_empty() {
-                            self.cmt.selected_discussion_comment =
-                                (self.cmt.selected_discussion_comment + 1)
-                                    .min(comments.len().saturating_sub(1));
-                        }
-                    }
-                }
+                CommentTab::Discussion => self.discussion_move_down(),
             }
         } else if self.matches_single_key(&key, &kb.move_up) {
             match self.cmt.comment_tab {
                 CommentTab::Review => self.review_nav_up(1),
-                CommentTab::Discussion => {
-                    self.cmt.selected_discussion_comment =
-                        self.cmt.selected_discussion_comment.saturating_sub(1);
-                }
+                CommentTab::Discussion => self.discussion_move_up(),
             }
         } else if self.matches_single_key(&key, &kb.page_down)
             || Self::is_shift_char_shortcut(&key, 'j')
@@ -758,21 +747,67 @@ impl App {
         } else if self.matches_single_key(&key, &kb.open_panel) {
             match self.cmt.comment_tab {
                 CommentTab::Review => self.review_tab_open_panel(),
-                CommentTab::Discussion => {
-                    if self
-                        .cmt
-                        .discussion_comments
-                        .as_ref()
-                        .map(|c| !c.is_empty())
-                        .unwrap_or(false)
-                    {
-                        self.cmt.discussion_comment_detail_mode = true;
-                        self.cmt.discussion_comment_detail_scroll = 0;
-                    }
-                }
+                CommentTab::Discussion => self.open_selected_discussion_comment(),
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn discussion_move_down(&mut self) {
+        if let Some(ref comments) = self.cmt.discussion_comments {
+            if !comments.is_empty() {
+                self.cmt.selected_discussion_comment = (self.cmt.selected_discussion_comment + 1)
+                    .min(comments.len().saturating_sub(1));
+            }
+        }
+    }
+
+    pub(crate) fn discussion_move_up(&mut self) {
+        self.cmt.selected_discussion_comment =
+            self.cmt.selected_discussion_comment.saturating_sub(1);
+    }
+
+    pub(crate) fn open_selected_discussion_comment(&mut self) {
+        if self
+            .cmt
+            .discussion_comments
+            .as_ref()
+            .map(|comments| !comments.is_empty())
+            .unwrap_or(false)
+        {
+            self.cmt.discussion_comment_detail_mode = true;
+            self.cmt.discussion_comment_detail_scroll = 0;
+        }
+    }
+
+    pub(crate) fn comment_list_click_select(&mut self, row: usize) -> bool {
+        match self.cmt.comment_tab {
+            CommentTab::Review if self.cmt.expanded_thread.is_some() => {
+                if self.cmt.expanded_selected == row {
+                    true
+                } else {
+                    self.cmt.expanded_selected = row;
+                    self.sync_expanded_comment_id();
+                    false
+                }
+            }
+            CommentTab::Review => {
+                if self.cmt.selected_thread == row {
+                    true
+                } else {
+                    self.cmt.selected_thread = row;
+                    false
+                }
+            }
+            CommentTab::Discussion => {
+                if self.cmt.selected_discussion_comment == row {
+                    true
+                } else {
+                    self.cmt.selected_discussion_comment = row;
+                    false
+                }
+            }
+        }
     }
 
     pub(crate) async fn handle_local_comment_list_input(
@@ -852,7 +887,7 @@ impl App {
     /// Enter on the review list: jump within an expanded thread, expand a
     /// thread that has replies, or jump straight to a single-comment file.
     /// Shared by GitHub-mode and local-mode comment list handlers.
-    fn review_tab_open_panel(&mut self) {
+    pub(crate) fn review_tab_open_panel(&mut self) {
         if let Some(thread_idx) = self
             .cmt
             .expanded_thread
@@ -907,7 +942,7 @@ impl App {
         }
     }
 
-    fn review_nav_down(&mut self, step: usize) {
+    pub(crate) fn review_nav_down(&mut self, step: usize) {
         if let Some(thread_idx) = self
             .cmt
             .expanded_thread
@@ -923,7 +958,7 @@ impl App {
         }
     }
 
-    fn review_nav_up(&mut self, step: usize) {
+    pub(crate) fn review_nav_up(&mut self, step: usize) {
         if self
             .cmt
             .expanded_thread

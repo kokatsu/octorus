@@ -9,6 +9,7 @@ use ratatui::{
 use crate::app::App;
 use crate::diff::LineType;
 use crate::ui::common::{build_ci_status_span, build_pr_info};
+use crate::ui::hit::{HitTarget, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -45,6 +46,13 @@ fn render_header(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn render_body(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let content_height = area.height.saturating_sub(2) as usize;
+    let inner_area = Block::default().borders(Borders::ALL).inner(area);
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::PrDescription,
+        },
+    );
 
     let Some(ref cache) = app.pr_description_cache else {
         let no_desc = Paragraph::new(Line::from(Span::styled(

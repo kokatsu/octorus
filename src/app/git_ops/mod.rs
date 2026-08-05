@@ -896,7 +896,7 @@ impl App {
             .current_dir(working_dir)
             .status();
 
-        *terminal = crate::ui::setup_terminal()?;
+        *terminal = crate::ui::setup_terminal(self.mouse_capture_active)?;
 
         match status {
             Ok(s) if s.success() => {
@@ -1150,6 +1150,97 @@ impl App {
         ops.tree.toggle_expand();
     }
 
+    pub(crate) fn git_ops_tree_move_down(&mut self) {
+        if let Some(ref mut ops) = self.git_ops_state {
+            ops.tree.move_down();
+        }
+        self.update_git_ops_diff();
+    }
+
+    pub(crate) fn git_ops_tree_move_up(&mut self) {
+        if let Some(ref mut ops) = self.git_ops_state {
+            ops.tree.move_up();
+        }
+        self.update_git_ops_diff();
+    }
+
+    pub(crate) fn open_selected_git_ops_tree_entry(&mut self) {
+        let is_dir = self
+            .git_ops_state
+            .as_ref()
+            .and_then(|ops| ops.tree.visible_rows.get(ops.tree.selected_row))
+            .map(|row| matches!(row, TreeRow::Dir { .. }))
+            .unwrap_or(false);
+
+        if is_dir {
+            self.toggle_dir_expand();
+        } else {
+            if let Some(ref mut ops) = self.git_ops_state {
+                ops.left_return_focus = LeftPaneFocus::Tree;
+            }
+            self.state = AppState::GitOpsSplitDiff;
+        }
+    }
+
+    pub(crate) fn git_ops_tree_click_select(&mut self, row: usize) -> bool {
+        let Some(ref mut ops) = self.git_ops_state else {
+            return false;
+        };
+        if ops.tree.selected_row == row {
+            return true;
+        }
+        ops.tree.selected_row = row;
+        self.update_git_ops_diff();
+        false
+    }
+
+    pub(crate) fn git_ops_commits_move_down(&mut self) {
+        if let Some(ref mut ops) = self.git_ops_state {
+            let cl = &mut ops.commit_log;
+            if !cl.commits.is_empty() {
+                cl.selected = (cl.selected + 1).min(cl.commits.len() - 1);
+            }
+        }
+        self.start_fetch_git_ops_commit_diff();
+        let should_load_more = self
+            .git_ops_state
+            .as_ref()
+            .map(|ops| {
+                let cl = &ops.commit_log;
+                cl.selected + 5 >= cl.commits.len() && cl.has_more && !cl.loading
+            })
+            .unwrap_or(false);
+        if should_load_more {
+            self.load_more_git_ops_commits();
+        }
+    }
+
+    pub(crate) fn git_ops_commits_move_up(&mut self) {
+        if let Some(ref mut ops) = self.git_ops_state {
+            ops.commit_log.selected = ops.commit_log.selected.saturating_sub(1);
+        }
+        self.start_fetch_git_ops_commit_diff();
+    }
+
+    pub(crate) fn open_selected_git_ops_commit(&mut self) {
+        if let Some(ref mut ops) = self.git_ops_state {
+            ops.left_return_focus = LeftPaneFocus::Commits;
+        }
+        self.state = AppState::GitOpsSplitDiff;
+    }
+
+    pub(crate) fn git_ops_commits_click_select(&mut self, row: usize) -> bool {
+        let Some(ref mut ops) = self.git_ops_state else {
+            return false;
+        };
+        if ops.commit_log.selected == row {
+            return true;
+        }
+        ops.commit_log.selected = row;
+        self.start_fetch_git_ops_commit_diff();
+        false
+    }
+
     /// Handle input for GitOpsSplitTree state
     pub(crate) fn handle_git_ops_tree_input(
         &mut self,
@@ -1178,18 +1269,12 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if let Some(ref mut ops) = self.git_ops_state {
-                ops.tree.move_down();
-            }
-            self.update_git_ops_diff();
+            self.git_ops_tree_move_down();
             return;
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            if let Some(ref mut ops) = self.git_ops_state {
-                ops.tree.move_up();
-            }
-            self.update_git_ops_diff();
+            self.git_ops_tree_move_up();
             return;
         }
 
@@ -1243,21 +1328,7 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.open_panel) {
-            let is_dir = self
-                .git_ops_state
-                .as_ref()
-                .and_then(|ops| ops.tree.visible_rows.get(ops.tree.selected_row))
-                .map(|row| matches!(row, TreeRow::Dir { .. }))
-                .unwrap_or(false);
-
-            if is_dir {
-                self.toggle_dir_expand();
-            } else {
-                if let Some(ref mut ops) = self.git_ops_state {
-                    ops.left_return_focus = LeftPaneFocus::Tree;
-                }
-                self.state = AppState::GitOpsSplitDiff;
-            }
+            self.open_selected_git_ops_tree_entry();
             return;
         }
 
@@ -1322,32 +1393,12 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if let Some(ref mut ops) = self.git_ops_state {
-                let cl = &mut ops.commit_log;
-                if !cl.commits.is_empty() {
-                    cl.selected = (cl.selected + 1).min(cl.commits.len() - 1);
-                }
-            }
-            self.start_fetch_git_ops_commit_diff();
-            let should_load_more = self
-                .git_ops_state
-                .as_ref()
-                .map(|ops| {
-                    let cl = &ops.commit_log;
-                    cl.selected + 5 >= cl.commits.len() && cl.has_more && !cl.loading
-                })
-                .unwrap_or(false);
-            if should_load_more {
-                self.load_more_git_ops_commits();
-            }
+            self.git_ops_commits_move_down();
             return;
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            if let Some(ref mut ops) = self.git_ops_state {
-                ops.commit_log.selected = ops.commit_log.selected.saturating_sub(1);
-            }
-            self.start_fetch_git_ops_commit_diff();
+            self.git_ops_commits_move_up();
             return;
         }
 
@@ -1417,10 +1468,7 @@ impl App {
         if self.matches_single_key(&key, &kb.open_panel)
             || self.matches_single_key(&key, &kb.move_right)
         {
-            if let Some(ref mut ops) = self.git_ops_state {
-                ops.left_return_focus = LeftPaneFocus::Commits;
-            }
-            self.state = AppState::GitOpsSplitDiff;
+            self.open_selected_git_ops_commit();
             return;
         }
 
@@ -1586,19 +1634,10 @@ impl App {
                 // j/k scroll for Previewing
                 let scroll_down = self.matches_single_key(key, &kb.move_down);
                 let scroll_up = self.matches_single_key(key, &kb.move_up);
-                if let Some(PendingGitOpsConfirm::Previewing {
-                    ref mut scroll_offset,
-                    ..
-                }) = self
-                    .git_ops_state
-                    .as_mut()
-                    .and_then(|o| o.pending_confirm.as_mut())
-                {
-                    if scroll_down {
-                        *scroll_offset = scroll_offset.saturating_add(1);
-                    } else if scroll_up {
-                        *scroll_offset = scroll_offset.saturating_sub(1);
-                    }
+                if scroll_down {
+                    self.git_ops_preview_wheel(true);
+                } else if scroll_up {
+                    self.git_ops_preview_wheel(false);
                 }
             }
             PendingGitOpsConfirm::Simulating { .. } => {
@@ -1616,6 +1655,23 @@ impl App {
         None
     }
 
+    pub(crate) fn git_ops_preview_wheel(&mut self, down: bool) {
+        if let Some(PendingGitOpsConfirm::Previewing {
+            ref mut scroll_offset,
+            ..
+        }) = self
+            .git_ops_state
+            .as_mut()
+            .and_then(|ops| ops.pending_confirm.as_mut())
+        {
+            if down {
+                *scroll_offset = scroll_offset.saturating_add(1);
+            } else {
+                *scroll_offset = scroll_offset.saturating_sub(1);
+            }
+        }
+    }
+
     /// Return the active diff_scroll based on left_return_focus
     fn active_git_ops_diff_scroll(&mut self) -> Option<&mut crate::diff_store::DiffScrollState> {
         self.git_ops_state
@@ -1624,6 +1680,33 @@ impl App {
                 LeftPaneFocus::Commits => &mut ops.commit_log.diff_scroll,
                 LeftPaneFocus::Tree => &mut ops.diff_scroll,
             })
+    }
+
+    pub(crate) fn git_ops_diff_wheel_move(&mut self, down: bool) {
+        if let Some(scroll) = self.active_git_ops_diff_scroll() {
+            if down {
+                scroll.move_down();
+            } else {
+                scroll.move_up();
+            }
+        }
+    }
+
+    pub(crate) fn git_ops_diff_click_line(&mut self, line: usize) -> bool {
+        let Some(scroll) = self.active_git_ops_diff_scroll() else {
+            return false;
+        };
+
+        if scroll.selected_line == line {
+            return true;
+        }
+
+        if line > scroll.selected_line {
+            scroll.page_down(line - scroll.selected_line);
+        } else {
+            scroll.page_up(scroll.selected_line - line);
+        }
+        false
     }
 
     /// Handle input for GitOpsSplitDiff state
@@ -1676,16 +1759,12 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if let Some(scroll) = self.active_git_ops_diff_scroll() {
-                scroll.move_down();
-            }
+            self.git_ops_diff_wheel_move(true);
             return;
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            if let Some(scroll) = self.active_git_ops_diff_scroll() {
-                scroll.move_up();
-            }
+            self.git_ops_diff_wheel_move(false);
             return;
         }
 

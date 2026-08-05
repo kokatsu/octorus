@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::app::{App, IssueDetailFocus};
 use crate::diff::LineType;
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     {
@@ -112,6 +113,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
 
     render_body(frame, app, chunks[1], body_border_style);
+    app.hit_map.push(
+        Block::default().borders(Borders::ALL).inner(chunks[1]),
+        HitTarget::Pane {
+            pane: PaneKind::IssueBody,
+        },
+    );
 
     let linked_prs_chunk_idx = if linked_prs_height > 0 || linked_prs_loading {
         Some(2)
@@ -201,6 +208,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 None
             });
 
+            let item_count = items.len();
             let list = List::new(items)
                 .block(
                     Block::default()
@@ -210,6 +218,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 )
                 .highlight_style(Style::default().bg(Color::DarkGray));
             frame.render_stateful_widget(list, chunks[idx], &mut list_state);
+
+            let inner = Block::default().borders(Borders::ALL).inner(chunks[idx]);
+            app.hit_map.push(
+                inner,
+                HitTarget::Pane {
+                    pane: PaneKind::List(ListKind::IssueLinkedPrs),
+                },
+            );
+            let offset = list_state.offset();
+            let visible = usize::from(inner.height);
+            for (visible_row, row) in (offset..item_count.min(offset + visible)).enumerate() {
+                app.hit_map.push(
+                    ratatui::layout::Rect {
+                        x: inner.x,
+                        y: inner.y.saturating_add(visible_row as u16),
+                        width: inner.width,
+                        height: 1,
+                    },
+                    HitTarget::ListRow {
+                        list: ListKind::IssueLinkedPrs,
+                        row,
+                        index: row,
+                    },
+                );
+            }
         }
     }
 

@@ -13,11 +13,18 @@ use super::common::{build_pr_info, truncate_with_width};
 use crate::ai::{RallyState, ReviewAction, RevieweeStatus};
 use crate::app::{AiRallyState, App, LogEntry, LogEventType, PauseState};
 use crate::config::KeybindingsConfig;
+use crate::ui::hit::{HitMap, HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let pr_info = build_pr_info(app);
 
-    let Some(rally_state) = &mut app.ai_rally_state else {
+    let App {
+        ai_rally_state,
+        config,
+        hit_map,
+        ..
+    } = app;
+    let Some(rally_state) = ai_rally_state else {
         return;
     };
 
@@ -30,9 +37,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    let kb = &app.config.keybindings;
+    let kb = &config.keybindings;
     render_header(frame, chunks[0], rally_state, &pr_info);
-    render_main_content(frame, chunks[1], rally_state, kb);
+    render_main_content(frame, chunks[1], rally_state, kb, hit_map);
     render_status_bar(frame, chunks[2], rally_state, kb);
 
     if rally_state.showing_log_detail {
@@ -117,9 +124,10 @@ fn render_main_content(
     area: Rect,
     state: &mut AiRallyState,
     kb: &KeybindingsConfig,
+    hit_map: &mut HitMap,
 ) {
     if state.pending_config_warning.is_some() {
-        render_config_warning(frame, area, state, kb);
+        render_config_warning(frame, area, state, kb, hit_map);
         return;
     }
 
@@ -149,10 +157,10 @@ fn render_main_content(
     render_history(frame, chunks[0], state);
 
     if is_waiting {
-        render_waiting_prompt(frame, chunks[1], state, kb);
-        render_logs(frame, chunks[2], state);
+        render_logs(frame, chunks[2], state, hit_map);
+        render_waiting_prompt(frame, chunks[1], state, kb, hit_map);
     } else {
-        render_logs(frame, chunks[1], state);
+        render_logs(frame, chunks[1], state, hit_map);
     }
 }
 
@@ -161,6 +169,7 @@ fn render_config_warning(
     area: Rect,
     state: &AiRallyState,
     kb: &KeybindingsConfig,
+    hit_map: &mut HitMap,
 ) {
     let warnings = match &state.pending_config_warning {
         Some(w) => w,
@@ -211,6 +220,8 @@ fn render_config_warning(
     );
 
     frame.render_widget(warning, area);
+    hit_map.push(frame.area(), HitTarget::Backdrop { dismiss: false });
+    hit_map.push(area, HitTarget::OverlaySurface);
 }
 
 fn render_waiting_prompt(
@@ -218,6 +229,7 @@ fn render_waiting_prompt(
     area: Rect,
     state: &AiRallyState,
     kb: &KeybindingsConfig,
+    hit_map: &mut HitMap,
 ) {
     let yes = kb.confirm_yes.display();
     let no = kb.confirm_no.display();
@@ -344,6 +356,8 @@ fn render_waiting_prompt(
     );
 
     frame.render_widget(prompt, area);
+    hit_map.push(frame.area(), HitTarget::Backdrop { dismiss: false });
+    hit_map.push(area, HitTarget::OverlaySurface);
 }
 
 fn render_history(frame: &mut Frame, area: Rect, state: &AiRallyState) {
@@ -469,7 +483,7 @@ fn render_history(frame: &mut Frame, area: Rect, state: &AiRallyState) {
     frame.render_widget(list, area);
 }
 
-fn render_logs(frame: &mut Frame, area: Rect, state: &mut AiRallyState) {
+fn render_logs(frame: &mut Frame, area: Rect, state: &mut AiRallyState, hit_map: &mut HitMap) {
     let visible_height = area.height.saturating_sub(2) as usize;
     state.last_visible_log_height = visible_height;
     let total_logs = state.logs.len();
@@ -506,6 +520,28 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &mut AiRallyState) {
 
     let list = List::new(items);
     frame.render_widget(list, inner_area);
+
+    hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::AiRallyLog),
+        },
+    );
+    for (visible_row, index) in (scroll_offset..total_logs).take(visible_height).enumerate() {
+        hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y.saturating_add(visible_row as u16),
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::AiRallyLog,
+                row: index,
+                index,
+            },
+        );
+    }
 
     if total_logs > visible_height {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)

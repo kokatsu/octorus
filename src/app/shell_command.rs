@@ -228,7 +228,7 @@ impl App {
         }
     }
 
-    fn shell_scroll_by(&mut self, delta: i32) {
+    pub(crate) fn shell_scroll_by(&mut self, delta: i32) {
         let Some(ref mut shell) = self.shell_state else {
             return;
         };

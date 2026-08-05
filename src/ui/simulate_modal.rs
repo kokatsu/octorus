@@ -8,8 +8,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, PendingGitOpsConfirm, SimulationResult};
+use crate::app::{App, AppState, PendingGitOpsConfirm, SimulationResult};
 use crate::gitfilm::GitfilmAreaSnapshot;
+use crate::ui::hit::{HitTarget, PaneKind};
 
 /// ファイルがどのエリアにどのステータスで存在するかの要約
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,10 +116,7 @@ fn transition_color(label: &str) -> Color {
 }
 
 pub fn render_simulating(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let width = 40_u16.min(area.width.saturating_sub(4));
-    let height = 3_u16.min(area.height.saturating_sub(4));
-    let modal_area = centered_rect(width, height, area);
+    let modal_area = simulating_modal_rect(frame.area());
 
     frame.render_widget(Clear, modal_area);
 
@@ -151,14 +149,7 @@ pub fn render_preview(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = frame.area();
-    let modal_width = (area.width as f32 * 0.7) as u16;
-    let modal_height = (area.height as f32 * 0.6) as u16;
-    let modal_area = centered_rect(
-        modal_width.max(40).min(area.width.saturating_sub(4)),
-        modal_height.max(10).min(area.height.saturating_sub(4)),
-        area,
-    );
+    let modal_area = preview_modal_rect(frame.area());
 
     frame.render_widget(Clear, modal_area);
 
@@ -214,6 +205,61 @@ pub fn render_preview(frame: &mut Frame, app: &App) {
         .scroll((scroll_offset as u16, 0));
 
     frame.render_widget(paragraph, modal_area);
+}
+
+/// Register hit regions for the active Git Ops simulation modal.
+///
+/// This is safe to call unconditionally after rendering; it is a no-op unless
+/// the pending confirmation is currently simulating or showing a preview.
+pub(crate) fn register_hit_regions(app: &mut App, area: Rect) {
+    if !matches!(
+        app.state,
+        AppState::GitOpsSplitTree | AppState::GitOpsSplitDiff
+    ) {
+        return;
+    }
+
+    let (modal_area, preview_text_area) = match app
+        .git_ops_state
+        .as_ref()
+        .and_then(|ops| ops.pending_confirm.as_ref())
+    {
+        Some(PendingGitOpsConfirm::Simulating { .. }) => (simulating_modal_rect(area), None),
+        Some(PendingGitOpsConfirm::Previewing { .. }) => {
+            let modal_area = preview_modal_rect(area);
+            let text_area = Block::default().borders(Borders::ALL).inner(modal_area);
+            (modal_area, Some(text_area))
+        }
+        _ => return,
+    };
+
+    app.hit_map
+        .push(area, HitTarget::Backdrop { dismiss: false });
+    app.hit_map.push(modal_area, HitTarget::OverlaySurface);
+    if let Some(preview_text_area) = preview_text_area {
+        app.hit_map.push(
+            preview_text_area,
+            HitTarget::Pane {
+                pane: PaneKind::GitOpsPreview,
+            },
+        );
+    }
+}
+
+fn simulating_modal_rect(area: Rect) -> Rect {
+    let width = 40_u16.min(area.width.saturating_sub(4));
+    let height = 3_u16.min(area.height.saturating_sub(4));
+    centered_rect(width, height, area)
+}
+
+fn preview_modal_rect(area: Rect) -> Rect {
+    let modal_width = (area.width as f32 * 0.7) as u16;
+    let modal_height = (area.height as f32 * 0.6) as u16;
+    centered_rect(
+        modal_width.max(40).min(area.width.saturating_sub(4)),
+        modal_height.max(10).min(area.height.saturating_sub(4)),
+        area,
+    )
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

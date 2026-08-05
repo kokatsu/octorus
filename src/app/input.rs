@@ -9,19 +9,103 @@ use crate::filter::ListFilter;
 use crate::github::{self, ChangedFile};
 use crate::keybinding::{event_to_keybinding, SequenceMatch};
 
+use super::input_mouse::coalesce;
+
 use super::types::*;
 use super::{App, AppState, DataState};
 
 impl App {
+    /// toggle_mouse キー(既定 F2)を処理する。処理したら true。
+    /// mouse.enabled=false のときはキーを消費せず他の処理へ流す。
+    pub(crate) fn handle_toggle_mouse_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        if !self.matches_single_key(key, &self.config.keybindings.toggle_mouse) {
+            return false;
+        }
+        let Some(target) = self.mouse_capture_target() else {
+            return false;
+        };
+        let applied = if target {
+            crate::ui::enable_mouse_capture_runtime().is_ok()
+        } else {
+            crate::ui::cleanup_mouse_capture();
+            true
+        };
+        if applied {
+            self.set_mouse_capture_active(target);
+        }
+        true
+    }
+
     pub(crate) async fn handle_input(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            let event = if let Some(ev) = self.pending_events.pop_front() {
+                ev
+            } else {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if !event::poll(timeout)? {
+                    return Ok(());
+                }
+                event::read()?
+            };
+
+            match event {
+                Event::Key(key) => return self.handle_key_event(key, terminal).await,
+                Event::Mouse(mouse) => {
+                    let mut batch = vec![Event::Mouse(mouse)];
+                    while let Some(ev) = self.pending_events.pop_front() {
+                        batch.push(ev);
+                    }
+                    while event::poll(std::time::Duration::ZERO)? {
+                        batch.push(event::read()?);
+                    }
+                    let (coalesced, leftover) = coalesce(batch);
+                    self.pending_events = leftover;
+                    if coalesced.is_empty() {
+                        if self.pending_events.is_empty() {
+                            // Moved だけのバッチではフレームを進めない(?1003h の移動洪水対策)
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                    let mut fingerprint = self.mouse_context_fingerprint();
+                    for ev in coalesced {
+                        self.handle_mouse(ev, terminal).await?;
+                        let current = self.mouse_context_fingerprint();
+                        if current != fingerprint {
+                            // 画面/モーダルが変わったら残りは旧レイアウト前提のため破棄
+                            break;
+                        }
+                        fingerprint = current;
+                    }
+                    return Ok(());
+                }
+                // Resize 等は次イテレーションの無条件再描画が拾う
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    pub(crate) async fn handle_key_event(
+        &mut self,
+        key: event::KeyEvent,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        {
+            {
                 // Only handle Press events to avoid double-execution when
                 // Kitty keyboard protocol reports Release/Repeat events.
                 if key.kind != KeyEventKind::Press {
+                    return Ok(());
+                }
+
+                // Mouse-capture toggle works in every state, including loading,
+                // error, and overlays — that is when the user wants terminal-native
+                // text selection back.
+                if self.handle_toggle_mouse_key(&key) {
                     return Ok(());
                 }
 
@@ -239,25 +323,12 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if has_filter {
-                self.handle_filter_navigation("file", true);
-            } else if tree_active {
-                self.file_tree_move_down();
-            } else if !self.files().is_empty() {
-                self.selected_file =
-                    (self.selected_file + 1).min(self.files().len().saturating_sub(1));
-            }
+            self.file_list_move_down();
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            if has_filter {
-                self.handle_filter_navigation("file", false);
-            } else if tree_active {
-                self.file_tree_move_up();
-            } else {
-                self.selected_file = self.selected_file.saturating_sub(1);
-            }
+            self.file_list_move_up();
             return Ok(());
         }
 
@@ -356,17 +427,7 @@ impl App {
         if self.matches_single_key(&key, &kb.open_panel)
             || self.matches_single_key(&key, &kb.move_right)
         {
-            if self.is_filter_selection_empty("file") {
-                return Ok(());
-            }
-            // Tree mode: toggle expand on dir rows, enter diff on file rows
-            if tree_active && self.file_tree_enter() {
-                return Ok(());
-            }
-            if !self.files().is_empty() {
-                self.enter_diff_from_file_list();
-                self.sync_diff_to_selected_file();
-            }
+            self.open_selected_file_entry();
             return Ok(());
         }
 
@@ -721,15 +782,12 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if check_count > 0 {
-                self.chk.selected_check =
-                    (self.chk.selected_check + 1).min(check_count.saturating_sub(1));
-            }
+            self.checks_move_down();
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            self.chk.selected_check = self.chk.selected_check.saturating_sub(1);
+            self.checks_move_up();
             return Ok(());
         }
 
@@ -758,13 +816,7 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.open_panel) {
-            if let Some(ref checks) = self.chk.checks {
-                if let Some(check) = checks.get(self.chk.selected_check) {
-                    if let Some(ref url) = check.link {
-                        Self::open_url_in_browser(url);
-                    }
-                }
-            }
+            self.open_selected_check();
             return Ok(());
         }
 
@@ -788,6 +840,36 @@ impl App {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn checks_move_down(&mut self) {
+        let check_count = self.chk.checks.as_ref().map(|c| c.len()).unwrap_or(0);
+        if check_count > 0 {
+            self.chk.selected_check =
+                (self.chk.selected_check + 1).min(check_count.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn checks_move_up(&mut self) {
+        self.chk.selected_check = self.chk.selected_check.saturating_sub(1);
+    }
+
+    pub(crate) fn open_selected_check(&mut self) {
+        if let Some(ref checks) = self.chk.checks {
+            if let Some(check) = checks.get(self.chk.selected_check) {
+                if let Some(ref url) = check.link {
+                    Self::open_url_in_browser(url);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn checks_click_select(&mut self, index: usize) -> bool {
+        if self.chk.selected_check == index {
+            return true;
+        }
+        self.chk.selected_check = index;
+        false
     }
 
     pub(crate) fn open_url_in_browser(url: &str) {
@@ -856,6 +938,73 @@ impl App {
                 self.selected_file = idx;
             }
         }
+    }
+
+    pub(crate) fn file_list_move_down(&mut self) {
+        if self.file_list_filter.is_some() {
+            self.handle_filter_navigation("file", true);
+        } else if self.is_file_tree_active() {
+            self.file_tree_move_down();
+        } else if !self.files().is_empty() {
+            self.selected_file = (self.selected_file + 1).min(self.files().len().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn file_list_move_up(&mut self) {
+        if self.file_list_filter.is_some() {
+            self.handle_filter_navigation("file", false);
+        } else if self.is_file_tree_active() {
+            self.file_tree_move_up();
+        } else {
+            self.selected_file = self.selected_file.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn open_selected_file_entry(&mut self) {
+        if self.is_filter_selection_empty("file") {
+            return;
+        }
+        // Tree mode: toggle expand on dir rows, enter diff on file rows
+        if self.is_file_tree_active() && self.file_tree_enter() {
+            return;
+        }
+        if !self.files().is_empty() {
+            self.enter_diff_from_file_list();
+            self.sync_diff_to_selected_file();
+        }
+    }
+
+    pub(crate) fn file_list_click_select(&mut self, row: usize, index: usize) -> bool {
+        if let Some(filter) = self.file_list_filter.as_mut() {
+            if filter.selected == Some(row) {
+                return true;
+            }
+            filter.selected = Some(row);
+            self.selected_file = index;
+            return false;
+        }
+
+        if self.is_file_tree_active() {
+            let Some(tree) = self.file_tree_state.as_mut() else {
+                return false;
+            };
+            if tree.selected_row == row {
+                return true;
+            }
+            let selected_file =
+                matches!(tree.visible_rows.get(row), Some(TreeRow::File { .. })).then_some(index);
+            tree.selected_row = row;
+            if let Some(index) = selected_file {
+                self.selected_file = index;
+            }
+            return false;
+        }
+
+        if self.selected_file == index {
+            return true;
+        }
+        self.selected_file = index;
+        false
     }
 
     pub(crate) fn file_tree_move_down(&mut self) {

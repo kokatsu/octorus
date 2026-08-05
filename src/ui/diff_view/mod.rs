@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use lasso::Rodeo;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
@@ -22,6 +22,7 @@ use crate::syntax::{
     apply_line_highlights, collect_line_highlights, collect_line_highlights_with_injections,
     get_theme, highlight_code_line, syntax_for_file, Highlighter, ParserPool,
 };
+use crate::ui::hit::{HitMap, HitTarget, PaneKind};
 
 /// Expand tab characters to spaces with fixed width.
 ///
@@ -1157,7 +1158,7 @@ pub fn render_cached_lines<'a>(
         .collect()
 }
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     if app.cmt.comment_panel_open {
         render_with_inline_comment(frame, app);
         return;
@@ -1196,7 +1197,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 /// Render diff view with inline comment panel at bottom
-fn render_with_inline_comment(frame: &mut Frame, app: &App) {
+fn render_with_inline_comment(frame: &mut Frame, app: &mut App) {
     let has_rally = app.has_background_rally();
     let constraints = if has_rally {
         vec![
@@ -1250,11 +1251,12 @@ pub(crate) fn render_header(frame: &mut Frame, app: &App, area: ratatui::layout:
     frame.render_widget(header, area);
 }
 
-pub(crate) fn render_diff_content(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+pub(crate) fn render_diff_content(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let visible_height = area.height.saturating_sub(2) as usize;
+    app.diff_scroll.set_visible_lines(visible_height);
 
     // Try to use cached lines if available
-    let (lines, scroll_row) = if let Some(ref cache) = app.diff_store.current {
+    let (lines, scroll_row, first_line) = if let Some(ref cache) = app.diff_store.current {
         let line_count = cache.lines.len();
         // Slice from scroll_offset so Paragraph starts at the correct logical line.
         // This avoids Wrap-induced mismatch between logical and display rows.
@@ -1275,7 +1277,7 @@ pub(crate) fn render_diff_content(frame: &mut Frame, app: &App, area: ratatui::l
             multiline_range,
             area.width.saturating_sub(2),
         );
-        (rendered, 0u16)
+        (rendered, 0u16, start)
     } else {
         // Fallback: parse without cache (should rarely happen)
         let file = app.files().get(app.selected_file);
@@ -1301,11 +1303,20 @@ pub(crate) fn render_diff_content(frame: &mut Frame, app: &App, area: ratatui::l
             },
             None => vec![Line::from("No file selected")],
         };
-        (rendered, app.diff_scroll.scroll_offset as u16)
+        (rendered, app.diff_scroll.scroll_offset as u16, 0)
     };
 
+    let block = Block::default().borders(Borders::ALL);
+    let inner_area = block.inner(area);
+    register_diff_hit_regions(
+        &mut app.hit_map,
+        inner_area,
+        &lines,
+        first_line,
+        scroll_row as usize,
+    );
     let diff_block = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL))
+        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((scroll_row, 0));
 
@@ -1331,6 +1342,49 @@ pub(crate) fn render_diff_content(frame: &mut Frame, app: &App, area: ratatui::l
                 }),
                 &mut scrollbar_state,
             );
+        }
+    }
+}
+
+pub(super) fn register_diff_hit_regions(
+    hit_map: &mut HitMap,
+    inner_area: Rect,
+    lines: &[Line<'_>],
+    first_line: usize,
+    mut hidden_rows: usize,
+) {
+    hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::Diff,
+        },
+    );
+
+    let mut visible_row = 0usize;
+    for (relative_line, line) in lines.iter().enumerate() {
+        let rendered_rows = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_area.width);
+        let skipped_rows = hidden_rows.min(rendered_rows);
+        hidden_rows -= skipped_rows;
+
+        for _ in skipped_rows..rendered_rows {
+            if visible_row >= inner_area.height as usize {
+                return;
+            }
+            hit_map.push(
+                Rect {
+                    x: inner_area.x,
+                    y: inner_area.y.saturating_add(visible_row as u16),
+                    width: inner_area.width,
+                    height: 1,
+                },
+                HitTarget::ContentLine {
+                    pane: PaneKind::Diff,
+                    line: first_line.saturating_add(relative_line),
+                },
+            );
+            visible_row += 1;
         }
     }
 }
@@ -1470,7 +1524,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 /// Render inline comments panel for current line
-fn render_inline_comments(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn render_inline_comments(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let indices = app.get_comment_indices_at_current_line();
 
     let mut lines: Vec<Line> = vec![];
@@ -1531,6 +1585,7 @@ fn render_inline_comments(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(title);
+    let inner_area = block.inner(area);
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -1538,6 +1593,12 @@ fn render_inline_comments(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .scroll((app.cmt.comment_panel_scroll, 0));
 
     frame.render_widget(paragraph, area);
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::CommentPanel,
+        },
+    );
 
     if total_lines > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)

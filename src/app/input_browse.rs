@@ -18,7 +18,7 @@ use crate::keybinding::{event_to_keybinding, SequenceMatch};
 use super::browse::ModuleGraphState;
 use super::browse::{
     BrowseCommitDiffState, BrowseOverlay, IndexState, ModuleGraphDirection, ModuleGraphPaneState,
-    PrLookupState,
+    ModuleGraphPanel, PrLookupState,
 };
 use super::browse_discussion::{DiscussionView, LineDiscussionState};
 use super::{App, AppState, PrOpenSource};
@@ -49,17 +49,7 @@ impl App {
         if self.matches_single_key(&key, &kb.open_panel)
             || self.matches_single_key(&key, &kb.move_right)
         {
-            let is_dir = self
-                .browse_state
-                .as_ref()
-                .is_some_and(|state| state.tree.selected_dir_path().is_some());
-            if is_dir {
-                if let Some(state) = self.browse_state.as_mut() {
-                    state.tree.toggle_expand();
-                }
-            } else {
-                self.browse_open_selected();
-            }
+            self.open_selected_browse_entry();
             return Ok(());
         }
 
@@ -82,23 +72,58 @@ impl App {
         let page_up = self.matches_single_key(&key, &kb.page_up);
         let jump_last = self.matches_single_key(&key, &kb.jump_to_last);
 
-        let Some(state) = self.browse_state.as_mut() else {
-            return Ok(());
-        };
-
         if move_down {
-            state.tree.move_down();
+            self.browse_tree_move_down();
         } else if move_up {
-            state.tree.move_up();
-        } else if page_down {
-            state.tree.page_down(PAGE_STEP);
-        } else if page_up {
-            state.tree.page_up(PAGE_STEP);
-        } else if jump_last {
-            state.tree.jump_to_last();
+            self.browse_tree_move_up();
+        } else if let Some(state) = self.browse_state.as_mut() {
+            if page_down {
+                state.tree.page_down(PAGE_STEP);
+            } else if page_up {
+                state.tree.page_up(PAGE_STEP);
+            } else if jump_last {
+                state.tree.jump_to_last();
+            }
         }
 
         Ok(())
+    }
+
+    pub(crate) fn browse_tree_move_down(&mut self) {
+        if let Some(state) = self.browse_state.as_mut() {
+            state.tree.move_down();
+        }
+    }
+
+    pub(crate) fn browse_tree_move_up(&mut self) {
+        if let Some(state) = self.browse_state.as_mut() {
+            state.tree.move_up();
+        }
+    }
+
+    pub(crate) fn open_selected_browse_entry(&mut self) {
+        let is_dir = self
+            .browse_state
+            .as_ref()
+            .is_some_and(|state| state.tree.selected_dir_path().is_some());
+        if is_dir {
+            if let Some(state) = self.browse_state.as_mut() {
+                state.tree.toggle_expand();
+            }
+        } else {
+            self.browse_open_selected();
+        }
+    }
+
+    pub(crate) fn browse_tree_click_select(&mut self, row: usize) -> bool {
+        let Some(state) = self.browse_state.as_mut() else {
+            return false;
+        };
+        let already_selected = state.tree.selected_row == row;
+        if !already_selected {
+            state.tree.selected_row = row;
+        }
+        already_selected
     }
 
     pub(crate) fn handle_repo_browse_file_input(
@@ -176,28 +201,43 @@ impl App {
         let move_up = self.matches_single_key(&key, &kb.move_up);
         let jump_last = self.matches_single_key(&key, &kb.jump_to_last);
 
-        let Some(state) = self.browse_state.as_mut() else {
-            return Ok(());
-        };
-
         if move_down {
-            state.move_cursor(1);
+            self.browse_file_wheel_move(true);
         } else if move_up {
-            state.move_cursor(-1);
-        } else if page_down {
-            state.move_cursor(PAGE_STEP as isize);
-        } else if page_up {
-            state.move_cursor(-(PAGE_STEP as isize));
-        } else if jump_last {
-            let last = state
-                .open
-                .as_ref()
-                .map(|open| open.line_count().saturating_sub(1))
-                .unwrap_or(0);
-            state.focus_line(last);
+            self.browse_file_wheel_move(false);
+        } else if let Some(state) = self.browse_state.as_mut() {
+            if page_down {
+                state.move_cursor(PAGE_STEP as isize);
+            } else if page_up {
+                state.move_cursor(-(PAGE_STEP as isize));
+            } else if jump_last {
+                let last = state
+                    .open
+                    .as_ref()
+                    .map(|open| open.line_count().saturating_sub(1))
+                    .unwrap_or(0);
+                state.focus_line(last);
+            }
         }
 
         Ok(())
+    }
+
+    pub(crate) fn browse_file_wheel_move(&mut self, down: bool) {
+        if let Some(state) = self.browse_state.as_mut() {
+            state.move_cursor(if down { 1 } else { -1 });
+        }
+    }
+
+    pub(crate) fn browse_file_click_line(&mut self, line: usize) -> bool {
+        let Some(state) = self.browse_state.as_mut() else {
+            return false;
+        };
+        if state.cursor_line == line {
+            return true;
+        }
+        state.focus_line(line);
+        false
     }
 
     fn handle_pr_lookup_selection_input(&mut self, key: &event::KeyEvent) -> bool {
@@ -214,100 +254,208 @@ impl App {
         let down = self.matches_single_key(key, &kb.move_down);
         let up = self.matches_single_key(key, &kb.move_up);
         let confirm = self.matches_single_key(key, &kb.open_panel);
-        let mut selected_pull = None;
 
-        if let Some(state) = self.browse_state.as_mut() {
-            let PrLookupState::Selecting {
-                sha,
-                pulls,
-                selected,
-            } = &mut state.pr_lookup
-            else {
-                return false;
-            };
-            if close {
-                state.pr_lookup = PrLookupState::Idle;
-            } else if down {
-                *selected = (*selected + 1).min(pulls.len().saturating_sub(1));
-            } else if up {
-                *selected = selected.saturating_sub(1);
-            } else if confirm {
-                selected_pull = pulls.get(*selected).map(|pull| (pull.number, sha.clone()));
-            }
-        }
-
-        if let Some((number, sha)) = selected_pull {
-            self.open_pr_from_browse(number, PrOpenSource::ConfirmedCommit { sha });
+        if close {
+            self.browse_pr_choice_dismiss();
+        } else if down {
+            self.browse_pr_choice_move(true);
+        } else if up {
+            self.browse_pr_choice_move(false);
+        } else if confirm {
+            self.browse_pr_choice_open_selected();
         }
         true
     }
 
+    pub(crate) fn browse_pr_choice_move(&mut self, down: bool) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let PrLookupState::Selecting {
+            pulls, selected, ..
+        } = &mut state.pr_lookup
+        else {
+            return;
+        };
+        if down {
+            *selected = (*selected + 1).min(pulls.len().saturating_sub(1));
+        } else {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn browse_pr_choice_click_select(&mut self, row: usize) -> bool {
+        let Some(state) = self.browse_state.as_mut() else {
+            return false;
+        };
+        let PrLookupState::Selecting { selected, .. } = &mut state.pr_lookup else {
+            return false;
+        };
+        let already_selected = *selected == row;
+        if !already_selected {
+            *selected = row;
+        }
+        already_selected
+    }
+
+    pub(crate) fn browse_pr_choice_open_selected(&mut self) {
+        let selected_pull = self.browse_state.as_ref().and_then(|state| {
+            let PrLookupState::Selecting {
+                sha,
+                pulls,
+                selected,
+            } = &state.pr_lookup
+            else {
+                return None;
+            };
+            pulls.get(*selected).map(|pull| (pull.number, sha.clone()))
+        });
+        if let Some((number, sha)) = selected_pull {
+            self.open_pr_from_browse(number, PrOpenSource::ConfirmedCommit { sha });
+        }
+    }
+
+    pub(crate) fn browse_pr_choice_dismiss(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        if matches!(state.pr_lookup, PrLookupState::Selecting { .. }) {
+            state.pr_lookup = PrLookupState::Idle;
+        }
+    }
+
     fn handle_line_discussion_input(&mut self, key: &event::KeyEvent) -> bool {
+        let active = self.browse_state.as_ref().is_some_and(|state| {
+            matches!(
+                state.line_discussion,
+                LineDiscussionState::Ready {
+                    view: DiscussionView::ThreadList { .. } | DiscussionView::Expanded { .. },
+                    ..
+                }
+            )
+        });
+        if !active {
+            return false;
+        }
+
         let kb = self.config.keybindings.clone();
         let close = key.code == KeyCode::Esc || self.matches_single_key(key, &kb.quit);
         let down = self.matches_single_key(key, &kb.move_down);
         let up = self.matches_single_key(key, &kb.move_up);
         let confirm = self.matches_single_key(key, &kb.open_panel);
 
+        if close {
+            self.browse_line_discussion_dismiss();
+        } else if down {
+            self.browse_line_discussion_move(true);
+        } else if up {
+            self.browse_line_discussion_move(false);
+        } else if confirm {
+            self.browse_line_discussion_open_selected();
+        }
+        true
+    }
+
+    pub(crate) fn browse_line_discussion_move(&mut self, down: bool) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let LineDiscussionState::Ready { index, view, .. } = &mut state.line_discussion else {
+            return;
+        };
+        let (selected, count) = match view {
+            DiscussionView::ThreadList { line, selected, .. } => {
+                (selected, index.thread_indices_at(*line).len())
+            }
+            DiscussionView::Expanded {
+                line,
+                thread_position,
+                selected,
+                ..
+            } => {
+                let count = index
+                    .thread_indices_at(*line)
+                    .get(*thread_position)
+                    .and_then(|thread| index.threads.get(*thread))
+                    .map(|thread| thread.replies.len() + 1)
+                    .unwrap_or(0);
+                (selected, count)
+            }
+            DiscussionView::Closed => return,
+        };
+        if down {
+            *selected = (*selected + 1).min(count.saturating_sub(1));
+        } else {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn browse_line_discussion_click_select(&mut self, row: usize) -> bool {
         let Some(state) = self.browse_state.as_mut() else {
             return false;
         };
-        match &mut state.line_discussion {
-            LineDiscussionState::Ready { index, view, .. } => match view {
-                DiscussionView::Closed => return false,
-                DiscussionView::ThreadList {
-                    line,
-                    selected,
-                    scroll: _,
-                } => {
-                    let count = index.thread_indices_at(*line).len();
-                    if close {
-                        *view = DiscussionView::Closed;
-                    } else if down {
-                        *selected = (*selected + 1).min(count.saturating_sub(1));
-                    } else if up {
-                        *selected = selected.saturating_sub(1);
-                    } else if confirm && count > 0 {
-                        *view = DiscussionView::Expanded {
-                            line: *line,
-                            thread_position: *selected,
-                            selected: 0,
-                            scroll: 0,
-                        };
-                    }
-                }
-                DiscussionView::Expanded {
-                    line,
-                    thread_position,
-                    selected,
-                    scroll: _,
-                } => {
-                    let count = index
-                        .thread_indices_at(*line)
-                        .get(*thread_position)
-                        .and_then(|thread| index.threads.get(*thread))
-                        .map(|thread| thread.replies.len() + 1)
-                        .unwrap_or(0);
-                    if close {
-                        *view = DiscussionView::ThreadList {
-                            line: *line,
-                            selected: *thread_position,
-                            scroll: 0,
-                        };
-                    } else if down {
-                        *selected = (*selected + 1).min(count.saturating_sub(1));
-                    } else if up {
-                        *selected = selected.saturating_sub(1);
-                    }
-                }
-            },
-            LineDiscussionState::Idle
-            | LineDiscussionState::ResolvingPullRequests { .. }
-            | LineDiscussionState::LoadingComments { .. }
-            | LineDiscussionState::Failed { .. } => return false,
+        let LineDiscussionState::Ready { view, .. } = &mut state.line_discussion else {
+            return false;
+        };
+        let selected = match view {
+            DiscussionView::ThreadList { selected, .. }
+            | DiscussionView::Expanded { selected, .. } => selected,
+            DiscussionView::Closed => return false,
+        };
+        let already_selected = *selected == row;
+        if !already_selected {
+            *selected = row;
         }
+        already_selected
+    }
 
-        true
+    pub(crate) fn browse_line_discussion_open_selected(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let LineDiscussionState::Ready { index, view, .. } = &mut state.line_discussion else {
+            return;
+        };
+        let DiscussionView::ThreadList {
+            line,
+            selected,
+            scroll: _,
+        } = view
+        else {
+            return;
+        };
+        if !index.thread_indices_at(*line).is_empty() {
+            *view = DiscussionView::Expanded {
+                line: *line,
+                thread_position: *selected,
+                selected: 0,
+                scroll: 0,
+            };
+        }
+    }
+
+    pub(crate) fn browse_line_discussion_dismiss(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let LineDiscussionState::Ready { view, .. } = &mut state.line_discussion else {
+            return;
+        };
+        match view {
+            DiscussionView::Closed => {}
+            DiscussionView::ThreadList { .. } => *view = DiscussionView::Closed,
+            DiscussionView::Expanded {
+                line,
+                thread_position,
+                ..
+            } => {
+                *view = DiscussionView::ThreadList {
+                    line: *line,
+                    selected: *thread_position,
+                    scroll: 0,
+                };
+            }
+        }
     }
 
     /// Resolve tree-pane sequences (`Space /` filter, `gg` jump to first).
@@ -602,7 +750,7 @@ impl App {
         crate::ui::restore_terminal(terminal)?;
         let result =
             crate::editor::open_file_at_line(editor.as_deref(), &path.to_string_lossy(), line);
-        *terminal = crate::ui::setup_terminal()?;
+        *terminal = crate::ui::setup_terminal(self.mouse_capture_active)?;
         terminal.clear()?;
 
         if let Err(e) = result {
@@ -683,42 +831,108 @@ impl App {
         let up = self.matches_single_key(&key, &kb.move_up);
         let confirm = self.matches_single_key(&key, &kb.open_panel);
 
+        if close {
+            self.browse_outline_dismiss();
+        } else if down {
+            self.browse_outline_move(true);
+        } else if up {
+            self.browse_outline_move(false);
+        } else if confirm {
+            self.browse_outline_open_selected();
+        }
+    }
+
+    pub(crate) fn browse_outline_move(&mut self, down: bool) {
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
         let count = state.outline_symbols().len();
-
-        if close {
-            state.overlay = BrowseOverlay::None;
-            return;
-        }
-
         let BrowseOverlay::Outline { selected } = state.overlay else {
             return;
         };
+        state.overlay = BrowseOverlay::Outline {
+            selected: if down {
+                (selected + 1).min(count.saturating_sub(1))
+            } else {
+                selected.saturating_sub(1)
+            },
+        };
+    }
 
-        if down {
-            state.overlay = BrowseOverlay::Outline {
-                selected: (selected + 1).min(count.saturating_sub(1)),
+    pub(crate) fn browse_outline_click_select(&mut self, row: usize) -> bool {
+        let Some(state) = self.browse_state.as_mut() else {
+            return false;
+        };
+        let BrowseOverlay::Outline { selected } = &mut state.overlay else {
+            return false;
+        };
+        let already_selected = *selected == row;
+        if !already_selected {
+            *selected = row;
+        }
+        already_selected
+    }
+
+    pub(crate) fn browse_outline_open_selected(&mut self) {
+        let target = self.browse_state.as_ref().and_then(|state| {
+            let BrowseOverlay::Outline { selected } = state.overlay else {
+                return None;
             };
-        } else if up {
-            state.overlay = BrowseOverlay::Outline {
-                selected: selected.saturating_sub(1),
-            };
-        } else if confirm {
-            let target = state.outline_symbols().get(selected).map(|s| s.line);
-            state.overlay = BrowseOverlay::None;
-            if let Some(line) = target {
-                self.browse_push_jump();
-                if let Some(state) = self.browse_state.as_mut() {
-                    state.focus_line(line.saturating_sub(1));
-                }
-                self.state = AppState::RepoBrowseFile;
+            state
+                .outline_symbols()
+                .get(selected)
+                .map(|symbol| symbol.line)
+        });
+        self.browse_outline_dismiss();
+        if let Some(line) = target {
+            self.browse_push_jump();
+            if let Some(state) = self.browse_state.as_mut() {
+                state.focus_line(line.saturating_sub(1));
             }
+            self.state = AppState::RepoBrowseFile;
+        }
+    }
+
+    pub(crate) fn browse_outline_dismiss(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        if matches!(state.overlay, BrowseOverlay::Outline { .. }) {
+            state.overlay = BrowseOverlay::None;
         }
     }
 
     fn handle_browse_symbol_search_input(&mut self, key: event::KeyEvent) {
+        // Typing wins over navigation: only arrows and Ctrl-n/p move the
+        // selection, so `j` and `k` stay usable inside the query.
+        match key.code {
+            KeyCode::Esc => {
+                self.browse_symbol_search_dismiss();
+                return;
+            }
+            KeyCode::Enter => {
+                self.browse_symbol_search_open_selected();
+                return;
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.browse_symbol_search_move(true);
+                return;
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.browse_symbol_search_move(false);
+                return;
+            }
+            KeyCode::Down => {
+                self.browse_symbol_search_move(true);
+                return;
+            }
+            KeyCode::Up => {
+                self.browse_symbol_search_move(false);
+                return;
+            }
+            _ => {}
+        }
+
         let Some(state) = self.browse_state.as_mut() else {
             return;
         };
@@ -729,29 +943,7 @@ impl App {
         else {
             return;
         };
-
-        // Typing wins over navigation: only arrows and Ctrl-n/p move the
-        // selection, so `j` and `k` stay usable inside the query.
         match key.code {
-            KeyCode::Esc => {
-                state.overlay = BrowseOverlay::None;
-                return;
-            }
-            KeyCode::Enter => {
-                let query = query.clone();
-                let selected = *selected;
-                let target = state
-                    .symbol_search_results(&query)
-                    .into_iter()
-                    .nth(selected)
-                    .map(|(path, line, _)| (path, line));
-                state.overlay = BrowseOverlay::None;
-                if let Some((path, line)) = target {
-                    self.browse_push_jump();
-                    self.browse_open_path(&path, line.saturating_sub(1));
-                }
-                return;
-            }
             KeyCode::Backspace => {
                 query.pop();
                 *selected = 0;
@@ -760,14 +952,6 @@ impl App {
                 query.clear();
                 *selected = 0;
             }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                *selected += 1;
-            }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                *selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down => *selected += 1,
-            KeyCode::Up => *selected = selected.saturating_sub(1),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 query.push(c);
                 *selected = 0;
@@ -776,6 +960,62 @@ impl App {
         }
 
         state.clamp_symbol_search_selection();
+    }
+
+    pub(crate) fn browse_symbol_search_move(&mut self, down: bool) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        let BrowseOverlay::SymbolSearch { selected, .. } = &mut state.overlay else {
+            return;
+        };
+        if down {
+            *selected += 1;
+        } else {
+            *selected = selected.saturating_sub(1);
+        }
+        state.clamp_symbol_search_selection();
+    }
+
+    pub(crate) fn browse_symbol_search_click_select(&mut self, row: usize) -> bool {
+        let Some(state) = self.browse_state.as_mut() else {
+            return false;
+        };
+        let BrowseOverlay::SymbolSearch { selected, .. } = &mut state.overlay else {
+            return false;
+        };
+        let already_selected = *selected == row;
+        if !already_selected {
+            *selected = row;
+        }
+        already_selected
+    }
+
+    pub(crate) fn browse_symbol_search_open_selected(&mut self) {
+        let target = self.browse_state.as_ref().and_then(|state| {
+            let BrowseOverlay::SymbolSearch { query, selected } = &state.overlay else {
+                return None;
+            };
+            state
+                .symbol_search_results(query)
+                .into_iter()
+                .nth(*selected)
+                .map(|(path, line, _)| (path, line))
+        });
+        self.browse_symbol_search_dismiss();
+        if let Some((path, line)) = target {
+            self.browse_push_jump();
+            self.browse_open_path(&path, line.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn browse_symbol_search_dismiss(&mut self) {
+        let Some(state) = self.browse_state.as_mut() else {
+            return;
+        };
+        if matches!(state.overlay, BrowseOverlay::SymbolSearch { .. }) {
+            state.overlay = BrowseOverlay::None;
+        }
     }
 
     pub(crate) fn handle_repo_browse_graph_input(&mut self, key: event::KeyEvent) {
@@ -816,44 +1056,92 @@ impl App {
         let show_dependents =
             key.code == KeyCode::Right || self.matches_single_key(&key, &kb.move_right);
         let toggle = key.code == KeyCode::Tab;
-        let mut jump = None;
 
-        let Some(state) = self.browse_state.as_mut() else {
-            return;
-        };
-        let ModuleGraphPaneState::Ready(panel) = &mut state.module_graph_pane else {
-            if matches!(state.module_graph_pane, ModuleGraphPaneState::Closed) {
-                self.state = AppState::RepoBrowseFile;
-            }
-            return;
-        };
-        if toggle {
-            panel.set_direction(match panel.direction {
-                ModuleGraphDirection::Dependencies => ModuleGraphDirection::Dependents,
-                ModuleGraphDirection::Dependents => ModuleGraphDirection::Dependencies,
-            });
-        } else if show_dependencies {
-            panel.set_direction(ModuleGraphDirection::Dependencies);
-        } else if show_dependents {
-            panel.set_direction(ModuleGraphDirection::Dependents);
-        } else if down {
-            panel.selected = (panel.selected + 1).min(panel.current_rows().len().saturating_sub(1));
-        } else if up {
-            panel.selected = panel.selected.saturating_sub(1);
-        } else if confirm {
-            if let Some(row) = panel.current_rows().get(panel.selected) {
-                jump = row.jump.clone();
-                if jump.is_none() {
-                    state.status =
-                        Some("This dependency target is not a listed repository file".into());
+        {
+            let Some(state) = self.browse_state.as_ref() else {
+                return;
+            };
+            if !matches!(state.module_graph_pane, ModuleGraphPaneState::Ready(_)) {
+                if matches!(state.module_graph_pane, ModuleGraphPaneState::Closed) {
+                    self.state = AppState::RepoBrowseFile;
                 }
+                return;
             }
         }
 
+        if toggle {
+            self.browse_graph_toggle_direction();
+        } else if show_dependencies {
+            let _ = self
+                .with_graph_panel(|panel| panel.set_direction(ModuleGraphDirection::Dependencies));
+        } else if show_dependents {
+            let _ = self
+                .with_graph_panel(|panel| panel.set_direction(ModuleGraphDirection::Dependents));
+        } else if down || up {
+            self.browse_graph_move(down);
+        } else if confirm {
+            self.browse_graph_open_selected();
+        }
+    }
+
+    fn with_graph_panel<T>(&mut self, f: impl FnOnce(&mut ModuleGraphPanel) -> T) -> Option<T> {
+        let state = self.browse_state.as_mut()?;
+        let ModuleGraphPaneState::Ready(panel) = &mut state.module_graph_pane else {
+            return None;
+        };
+        Some(f(panel))
+    }
+
+    pub(crate) fn browse_graph_move(&mut self, down: bool) {
+        let _ = self.with_graph_panel(|panel| {
+            if down {
+                panel.selected =
+                    (panel.selected + 1).min(panel.current_rows().len().saturating_sub(1));
+            } else {
+                panel.selected = panel.selected.saturating_sub(1);
+            }
+        });
+    }
+
+    pub(crate) fn browse_graph_click_select(&mut self, row: usize) -> bool {
+        self.with_graph_panel(|panel| {
+            if panel.selected == row {
+                return true;
+            }
+            panel.selected = row.min(panel.current_rows().len().saturating_sub(1));
+            false
+        })
+        .unwrap_or(false)
+    }
+
+    pub(crate) fn browse_graph_open_selected(&mut self) {
+        let mut jump = None;
+        let mut unlisted = false;
+        let _ = self.with_graph_panel(|panel| {
+            if let Some(row) = panel.current_rows().get(panel.selected) {
+                jump = row.jump.clone();
+                unlisted = jump.is_none();
+            }
+        });
+        if unlisted {
+            if let Some(state) = self.browse_state.as_mut() {
+                state.status =
+                    Some("This dependency target is not a listed repository file".into());
+            }
+        }
         if let Some(jump) = jump {
             self.browse_push_jump();
             self.browse_open_path(&jump.path, jump.line);
         }
+    }
+
+    pub(crate) fn browse_graph_toggle_direction(&mut self) {
+        let _ = self.with_graph_panel(|panel| {
+            panel.set_direction(match panel.direction {
+                ModuleGraphDirection::Dependencies => ModuleGraphDirection::Dependents,
+                ModuleGraphDirection::Dependents => ModuleGraphDirection::Dependencies,
+            });
+        });
     }
 
     fn handle_browse_graph_module_sequence(&mut self, key: &event::KeyEvent) -> bool {
@@ -3492,6 +3780,74 @@ mod tests {
         settle_module_graph(&mut app).await;
         assert_eq!(open_path(&app), "src/app.ts");
         assert_eq!(app.browse_state.as_ref().unwrap().cursor_line, 1);
+    }
+
+    #[tokio::test]
+    async fn test_browse_graph_mouse_helpers_follow_key_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_source = "import { helper } from './helper';\nimport { util } from './util';\n";
+        let mut app = browsing_app_on_disk(
+            dir.path(),
+            &[
+                ("src/app.ts", app_source),
+                ("src/helper.ts", "export function helper() { return 1; }\n"),
+                ("src/util.ts", "export function util() { return 2; }\n"),
+            ],
+        );
+        attach_open_file(&mut app, "src/app.ts", app_source, Vec::new());
+        attach_code_index(
+            &mut app,
+            dir.path(),
+            &["src/app.ts", "src/helper.ts", "src/util.ts"],
+        );
+        app.state = AppState::RepoBrowseFile;
+
+        app.open_browse_module_graph();
+        settle_module_graph(&mut app).await;
+        app.state = AppState::RepoBrowseGraph;
+
+        // ホイール相当: 1 行下 → クランプ確認
+        app.browse_graph_move(true);
+        let selected = |app: &App| {
+            let ModuleGraphPaneState::Ready(panel) =
+                &app.browse_state.as_ref().unwrap().module_graph_pane
+            else {
+                panic!("panel not ready");
+            };
+            panel.selected
+        };
+        assert_eq!(selected(&app), 1);
+        app.browse_graph_move(true);
+        assert_eq!(selected(&app), 1, "末尾でクランプ(依存 2 件)");
+        app.browse_graph_move(false);
+        assert_eq!(selected(&app), 0);
+
+        // クリック: 未選択行は選択のみ、選択済み行は true
+        assert!(!app.browse_graph_click_select(1));
+        assert_eq!(selected(&app), 1);
+        assert!(app.browse_graph_click_select(1));
+
+        // タイトルクリックで方向トグル
+        let direction = |app: &App| {
+            let ModuleGraphPaneState::Ready(panel) =
+                &app.browse_state.as_ref().unwrap().module_graph_pane
+            else {
+                panic!("panel not ready");
+            };
+            panel.direction
+        };
+        let before = direction(&app);
+        app.browse_graph_toggle_direction();
+        assert_ne!(direction(&app), before);
+    }
+
+    #[test]
+    fn test_browse_graph_mouse_helpers_are_noop_without_panel() {
+        let mut app = App::new_cockpit("owner/repo", crate::config::Config::default(), true);
+        app.browse_graph_move(true);
+        assert!(!app.browse_graph_click_select(0));
+        app.browse_graph_toggle_direction();
+        app.browse_graph_open_selected();
     }
 
     #[test]

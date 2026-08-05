@@ -416,6 +416,15 @@ the original Git listing. Nodes without a jump stay visible and report why they
 cannot be opened. Opening a node returns focus to code and refreshes the still
 visible pane for that new current file.
 
+**Mouse routing**: mouse events do not pass through these key layers. Instead,
+renderers register hit regions into `App::hit_map` (`src/ui/hit.rs`) each frame
+and `handle_mouse` (`src/app/input_mouse.rs`) resolves the topmost region —
+overlay z-order is expressed by registration order (backdrop → surface → rows),
+so a click can never reach a layer the keyboard could not. Mouse actions call
+the same `pub(crate)` methods the key branches call (`browse_tree_move_down`,
+`browse_file_click_line`, `browse_graph_move`, the four `browse_*_dismiss`
+overlay closers, …), so behaviour cannot drift between the two input paths.
+
 ## 5. Keybinding registration caveats
 
 `KeybindingsConfig::validate()` detects exact duplicates between single keys and
@@ -466,6 +475,16 @@ before the sequence layer.
 
 `src/ui/browse.rs`. In zen mode the header and footer are dropped and the whole
 frame becomes the active panes.
+
+Renderers also populate the frame's mouse hit map while they draw: the tree
+pane registers one `ListRow` per visible row using the same centered offset it
+renders with, the content pane registers one `ContentLine` per rendered row
+with the logical file line resolved at wrap time (`WrappedRows` keeps rendered
+rows and logical lines in lockstep), the graph pane registers one three-row
+region per visible node plus a title-row direction toggle, and each overlay
+registers backdrop → surface → rows on top. Because registration happens at
+draw time with the renderer's own offsets, the input side never re-derives
+layout math.
 
 - Tree pane: "loading spinner", "error", or "tree" according to `LoadState`
 - Content pane: nothing selected / the binary or oversized-file notice / the contents

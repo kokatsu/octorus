@@ -28,6 +28,7 @@ use crate::diff::LineType;
 use crate::github::{CommitPullRequest, CommitPullRequestState};
 use crate::symbols::Symbol;
 use crate::ui::common::truncate_with_width;
+use crate::ui::hit::{HitMap, HitTarget, ListKind, PaneKind, TabGroup};
 
 /// Narrowest the line-number gutter ever gets.
 ///
@@ -107,9 +108,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             };
             render_module_graph_pane(frame, state, right_panes[1], graph_focused, &graph_help);
         }
+        register_module_graph_hits(app, right_panes[1]);
     } else {
         render_content(frame, app, panes[1], !tree_focused);
     }
+
+    super::split_view::register_split_divider(app, panes[0], body);
 
     if !zen {
         render_footer(frame, app, chunks[2]);
@@ -155,7 +159,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(header, area);
 }
 
-fn render_tree(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+fn render_tree(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let Some(state) = app.browse_state.as_ref() else {
         return;
     };
@@ -264,13 +268,43 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         _ => "Files".to_string(),
     };
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(title),
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner_area = block.inner(area);
+    let list = List::new(items).block(block);
     frame.render_widget(list, area);
+
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::BrowseTree),
+        },
+    );
+    for (i, _) in state
+        .tree
+        .visible_rows
+        .iter()
+        .skip(offset)
+        .take(inner_height)
+        .enumerate()
+    {
+        let row = offset + i;
+        app.hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y + i as u16,
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::BrowseTree,
+                row,
+                index: row,
+            },
+        );
+    }
 }
 
 fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
@@ -290,6 +324,17 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         render_commit_diff(frame, state, area, border_style, bg_color, &spinner);
         return;
     }
+
+    let inner_area = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::BrowseFile,
+        },
+    );
 
     let Some(open) = state.open.as_ref() else {
         let paragraph = Paragraph::new(Line::from(Span::styled(
@@ -341,7 +386,7 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         _ => None,
     };
     let content_width = area.width.saturating_sub(2) as usize;
-    let lines = content_lines(
+    let (lines, logical_lines) = content_lines_with_logical_lines(
         &window,
         state.cursor_line,
         bg_color,
@@ -365,6 +410,21 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             .title(title),
     );
     frame.render_widget(paragraph, area);
+
+    for (rendered_row, line) in logical_lines.into_iter().enumerate() {
+        app.hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y.saturating_add(rendered_row as u16),
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ContentLine {
+                pane: PaneKind::BrowseFile,
+                line,
+            },
+        );
+    }
 
     if total > inner_height {
         let max_scroll = total.saturating_sub(inner_height);
@@ -565,6 +625,7 @@ fn gutter_width(total: usize) -> usize {
 /// A file line wider than the pane continues on extra visual rows instead of
 /// being cut off; `max_rows` caps the emitted rows at the viewport height so
 /// the work stays O(viewport) even when every visible line wraps.
+#[cfg(test)]
 fn content_lines<'a>(
     window: &ContentWindow<'a>,
     cursor_line: usize,
@@ -574,14 +635,35 @@ fn content_lines<'a>(
     content_width: usize,
     max_rows: usize,
 ) -> Vec<Line<'a>> {
+    content_lines_with_logical_lines(
+        window,
+        cursor_line,
+        bg_color,
+        blame,
+        discussion,
+        content_width,
+        max_rows,
+    )
+    .0
+}
+
+fn content_lines_with_logical_lines<'a>(
+    window: &ContentWindow<'a>,
+    cursor_line: usize,
+    bg_color: bool,
+    blame: Option<&'a BlameGutter>,
+    discussion: Option<&DiscussionIndex>,
+    content_width: usize,
+    max_rows: usize,
+) -> (Vec<Line<'a>>, Vec<usize>) {
     let width = gutter_width(window.total);
     let discussion_width = discussion.map_or(0, |_| DISCUSSION_GUTTER_WIDTH);
     let blame_width =
         blame_gutter_width(content_width.saturating_sub(discussion_width), window.total);
 
-    let mut rows: Vec<Line<'a>> = Vec::new();
+    let mut out = WrappedRows::default();
     for (offset, cached) in window.lines.iter().enumerate() {
-        if rows.len() >= max_rows {
+        if out.len() >= max_rows {
             break;
         }
         let line_index = window.first_line + offset;
@@ -612,8 +694,6 @@ fn content_lines<'a>(
                 Color::DarkGray
             }),
         ));
-        let prefix_width: usize = prefix.iter().map(|span| span.content.width()).sum();
-
         let content: Vec<(&'a str, Style)> = cached
             .spans
             .iter()
@@ -635,16 +715,34 @@ fn content_lines<'a>(
             .collect();
 
         push_wrapped_line(
-            &mut rows,
+            &mut out,
+            line_index,
             prefix,
-            prefix_width,
             &content,
             content_width,
             max_rows,
             is_cursor && bg_color,
         );
     }
-    rows
+    (out.rows, out.logical_lines)
+}
+
+/// 折返し描画の出力バッファ。可視行とその論理行番号を常に同数で保持する。
+#[derive(Default)]
+struct WrappedRows<'a> {
+    rows: Vec<Line<'a>>,
+    logical_lines: Vec<usize>,
+}
+
+impl<'a> WrappedRows<'a> {
+    fn push(&mut self, logical_line: usize, row: Line<'a>) {
+        self.rows.push(row);
+        self.logical_lines.push(logical_line);
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
 }
 
 /// Append one file line as visual rows no wider than `content_width` cells.
@@ -655,14 +753,15 @@ fn content_lines<'a>(
 /// keeping the line-number column straight. Sub-spans borrow slices of the
 /// same interned text as the unwrapped path, and emission stops at `max_rows`.
 fn push_wrapped_line<'a>(
-    rows: &mut Vec<Line<'a>>,
+    out: &mut WrappedRows<'a>,
+    line_index: usize,
     prefix: Vec<Span<'a>>,
-    prefix_width: usize,
     content: &[(&'a str, Style)],
     content_width: usize,
     max_rows: usize,
     cursor_bg: bool,
 ) {
+    let prefix_width: usize = prefix.iter().map(|span| span.content.width()).sum();
     let text_width = content_width.saturating_sub(prefix_width);
     // Degenerate pane: no room for text next to the gutter. Emit the single
     // row the unwrapped path produced and let the renderer clip it.
@@ -673,7 +772,7 @@ fn push_wrapped_line<'a>(
                 .iter()
                 .map(|&(text, style)| Span::styled(text, style)),
         );
-        rows.push(Line::from(spans));
+        out.push(line_index, Line::from(spans));
         return;
     }
 
@@ -710,8 +809,8 @@ fn push_wrapped_line<'a>(
                 if byte > start {
                     current.push(Span::styled(&text[start..byte], style));
                 }
-                rows.push(Line::from(std::mem::take(&mut current)));
-                if rows.len() >= max_rows {
+                out.push(line_index, Line::from(std::mem::take(&mut current)));
+                if out.len() >= max_rows {
                     return;
                 }
                 current.push(pad());
@@ -724,7 +823,7 @@ fn push_wrapped_line<'a>(
             current.push(Span::styled(&text[start..], style));
         }
     }
-    rows.push(Line::from(current));
+    out.push(line_index, Line::from(current));
 }
 
 fn blame_gutter_width(content_width: usize, total: usize) -> Option<BlameGutterWidth> {
@@ -888,7 +987,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_overlay(frame: &mut Frame, app: &mut App) {
-    let Some(state) = app.browse_state.as_mut() else {
+    let frame_area = frame.area();
+    let (browse_state, hit_map) = (&mut app.browse_state, &mut app.hit_map);
+    let Some(state) = browse_state.as_mut() else {
         return;
     };
 
@@ -896,7 +997,10 @@ fn render_overlay(frame: &mut Frame, app: &mut App) {
         LineDiscussionState::Ready { index, view, .. }
             if !matches!(view, DiscussionView::Closed) =>
         {
-            render_line_discussion(frame, index, view);
+            let area = overlay_rect(frame_area, 80, 75);
+            hit_map.push(frame_area, HitTarget::Backdrop { dismiss: true });
+            hit_map.push(area, HitTarget::OverlaySurface);
+            render_line_discussion(frame, hit_map, area, index, view);
             return;
         }
         _ => {}
@@ -906,22 +1010,40 @@ fn render_overlay(frame: &mut Frame, app: &mut App) {
         pulls, selected, ..
     } = &state.pr_lookup
     {
-        render_pr_selection(frame, pulls, *selected);
+        let area = overlay_rect(frame_area, 70, 60);
+        hit_map.push(frame_area, HitTarget::Backdrop { dismiss: true });
+        hit_map.push(area, HitTarget::OverlaySurface);
+        render_pr_selection(frame, hit_map, area, pulls, *selected);
         return;
     }
 
     match state.overlay {
         BrowseOverlay::None => {}
-        BrowseOverlay::Outline { selected } => render_outline(frame, state, selected),
+        BrowseOverlay::Outline { selected } => {
+            let area = overlay_rect(frame_area, 60, 70);
+            hit_map.push(frame_area, HitTarget::Backdrop { dismiss: true });
+            hit_map.push(area, HitTarget::OverlaySurface);
+            render_outline(frame, hit_map, area, state, selected);
+        }
         BrowseOverlay::SymbolSearch {
             ref query,
             selected,
-        } => render_symbol_search(frame, state, query, selected),
+        } => {
+            let area = overlay_rect(frame_area, 80, 70);
+            hit_map.push(frame_area, HitTarget::Backdrop { dismiss: true });
+            hit_map.push(area, HitTarget::OverlaySurface);
+            render_symbol_search(frame, hit_map, area, state, query, selected);
+        }
     }
 }
 
-fn render_line_discussion(frame: &mut Frame, index: &DiscussionIndex, view: &mut DiscussionView) {
-    let area = overlay_rect(frame.area(), 80, 75);
+fn render_line_discussion(
+    frame: &mut Frame,
+    hit_map: &mut HitMap,
+    area: Rect,
+    index: &DiscussionIndex,
+    view: &mut DiscussionView,
+) {
     clear_overlay_area(frame, area);
     let content_area = if let Some(note) = index.confidence_note() {
         let rows = Layout::default()
@@ -939,6 +1061,34 @@ fn render_line_discussion(frame: &mut Frame, index: &DiscussionIndex, view: &mut
     } else {
         area
     };
+    let register_rows = |hit_map: &mut HitMap, item_heights: &[usize], offset: usize| {
+        let inner = Block::default().borders(Borders::ALL).inner(content_area);
+        let bottom = inner.y.saturating_add(inner.height);
+        let mut y = inner.y;
+        for (row, &item_height) in item_heights.iter().enumerate().skip(offset) {
+            if y >= bottom {
+                break;
+            }
+            let remaining_height = usize::from(bottom - y);
+            if item_height > remaining_height {
+                break;
+            }
+            hit_map.push(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: item_height as u16,
+                },
+                HitTarget::ListRow {
+                    list: ListKind::BrowseLineDiscussion,
+                    row,
+                    index: row,
+                },
+            );
+            y = y.saturating_add(item_height as u16);
+        }
+    };
     let resolved = HashSet::new();
     match view {
         DiscussionView::Closed => {}
@@ -946,18 +1096,35 @@ fn render_line_discussion(frame: &mut Frame, index: &DiscussionIndex, view: &mut
             line,
             selected,
             scroll,
-        } => crate::ui::comment_list::render_review_thread_list_data(
-            frame,
-            content_area,
-            crate::ui::comment_list::ReviewThreadListData {
-                comments: &index.comments,
-                threads: &index.threads,
-                visible_threads: Some(index.thread_indices_at(*line)),
-                selected: *selected,
-                resolved_ids: &resolved,
-            },
-            scroll,
-        ),
+        } => {
+            let body_width = (content_area.width.saturating_sub(4) as usize).saturating_sub(4);
+            let visible_threads = index.thread_indices_at(*line);
+            let item_heights = visible_threads
+                .iter()
+                .filter_map(|thread_index| index.threads.get(*thread_index))
+                .map(|thread| {
+                    let comment = &index.comments[thread.root];
+                    2 + comment
+                        .body
+                        .lines()
+                        .map(|line| crate::ui::common::wrap_text(line, body_width).len())
+                        .sum::<usize>()
+                })
+                .collect::<Vec<_>>();
+            crate::ui::comment_list::render_review_thread_list_data(
+                frame,
+                content_area,
+                crate::ui::comment_list::ReviewThreadListData {
+                    comments: &index.comments,
+                    threads: &index.threads,
+                    visible_threads: Some(visible_threads),
+                    selected: *selected,
+                    resolved_ids: &resolved,
+                },
+                scroll,
+            );
+            register_rows(hit_map, &item_heights, *scroll);
+        }
         DiscussionView::Expanded {
             line,
             thread_position,
@@ -970,6 +1137,18 @@ fn render_line_discussion(frame: &mut Frame, index: &DiscussionIndex, view: &mut
             let Some(thread) = index.threads.get(*thread_index) else {
                 return;
             };
+            let body_width = (content_area.width.saturating_sub(4) as usize).saturating_sub(6);
+            let item_heights = std::iter::once(thread.root)
+                .chain(thread.replies.iter().copied())
+                .map(|comment_index| {
+                    let comment = &index.comments[comment_index];
+                    2 + comment
+                        .body
+                        .lines()
+                        .map(|line| crate::ui::common::wrap_text(line, body_width).len())
+                        .sum::<usize>()
+                })
+                .collect::<Vec<_>>();
             crate::ui::comment_list::render_review_thread_data(
                 frame,
                 content_area,
@@ -979,12 +1158,18 @@ fn render_line_discussion(frame: &mut Frame, index: &DiscussionIndex, view: &mut
                 scroll,
                 &resolved,
             );
+            register_rows(hit_map, &item_heights, *scroll);
         }
     }
 }
 
-fn render_pr_selection(frame: &mut Frame, pulls: &[CommitPullRequest], selected: usize) {
-    let area = overlay_rect(frame.area(), 70, 60);
+fn render_pr_selection(
+    frame: &mut Frame,
+    hit_map: &mut HitMap,
+    area: Rect,
+    pulls: &[CommitPullRequest],
+    selected: usize,
+) {
     clear_overlay_area(frame, area);
     let inner_height = area.height.saturating_sub(2) as usize;
     let offset = scroll_offset(selected, pulls.len(), inner_height);
@@ -1014,20 +1199,36 @@ fn render_pr_selection(frame: &mut Frame, pulls: &[CommitPullRequest], selected:
             )))
         })
         .collect::<Vec<_>>();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!(
-                "Pull requests containing this commit ({})",
-                pulls.len()
-            ))
-            .title_bottom(Line::from(Span::styled(
-                " j/k move | Enter open | Esc cancel ",
-                Style::default().fg(Color::DarkGray),
-            ))),
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            "Pull requests containing this commit ({})",
+            pulls.len()
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " j/k move | Enter open | Esc cancel ",
+            Style::default().fg(Color::DarkGray),
+        )));
+    let inner_area = block.inner(area);
+    let list = List::new(items).block(block);
     frame.render_widget(list, area);
+    for visible_row in 0..pulls.len().saturating_sub(offset).min(inner_height) {
+        let row = offset + visible_row;
+        hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y.saturating_add(visible_row as u16),
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::BrowsePrChoice,
+                row,
+                index: row,
+            },
+        );
+    }
 }
 
 /// Clear `area` for an overlay, blanking the double-width glyph it lands inside.
@@ -1063,8 +1264,13 @@ fn clear_overlay_area(frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_outline(frame: &mut Frame, state: &BrowseState, selected: usize) {
-    let area = overlay_rect(frame.area(), 60, 70);
+fn render_outline(
+    frame: &mut Frame,
+    hit_map: &mut HitMap,
+    area: Rect,
+    state: &BrowseState,
+    selected: usize,
+) {
     clear_overlay_area(frame, area);
 
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -1079,17 +1285,33 @@ fn render_outline(frame: &mut Frame, state: &BrowseState, selected: usize) {
         .map(|(index, symbol)| ListItem::new(outline_row(symbol, index == selected)))
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("Outline ({} symbols)", symbols.len()))
-            .title_bottom(Line::from(Span::styled(
-                " j/k move | Enter jump | Esc close ",
-                Style::default().fg(Color::DarkGray),
-            ))),
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!("Outline ({} symbols)", symbols.len()))
+        .title_bottom(Line::from(Span::styled(
+            " j/k move | Enter jump | Esc close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+    let inner_area = block.inner(area);
+    let list = List::new(items).block(block);
     frame.render_widget(list, area);
+    for visible_row in 0..symbols.len().saturating_sub(offset).min(inner_height) {
+        let row = offset + visible_row;
+        hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y.saturating_add(visible_row as u16),
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::BrowseOutline,
+                row,
+                index: row,
+            },
+        );
+    }
 }
 
 fn render_module_graph_pane(
@@ -1241,6 +1463,67 @@ fn render_module_graph_ready_pane(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// モジュールグラフペインのヒット領域を登録する。
+/// レンダラーは &BrowseState 借用中で app に触れないため、同じ
+/// scroll_offset / 1 ノード 3 行のレイアウト計算をここで共有して逆写像する。
+fn register_module_graph_hits(app: &mut App, area: Rect) {
+    let Some(state) = app.browse_state.as_ref() else {
+        return;
+    };
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let mut regions: Vec<(Rect, HitTarget)> = vec![
+        (
+            inner,
+            HitTarget::Pane {
+                pane: PaneKind::ModuleGraph,
+            },
+        ),
+        // 上枠(タイトル行)クリックで方向トグル
+        (
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            },
+            HitTarget::Tab {
+                group: TabGroup::GraphDirection,
+                index: 0,
+            },
+        ),
+    ];
+
+    if let ModuleGraphPaneState::Ready(panel) = &state.module_graph_pane {
+        let rows = panel.current_rows();
+        let inner_height = usize::from(inner.height);
+        let visible_nodes = inner_height.saturating_sub(3) / 3;
+        let offset = scroll_offset(panel.selected, rows.len(), visible_nodes);
+        for (visible_index, index) in (offset..rows.len().min(offset + visible_nodes)).enumerate() {
+            let y = inner.y.saturating_add(3 + (visible_index * 3) as u16);
+            if y >= inner.bottom() {
+                break;
+            }
+            regions.push((
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 3.min(inner.bottom().saturating_sub(y)),
+                },
+                HitTarget::ListRow {
+                    list: ListKind::BrowseGraph,
+                    row: index,
+                    index,
+                },
+            ));
+        }
+    }
+
+    for (rect, target) in regions {
+        app.hit_map.push(rect, target);
+    }
+}
+
 fn module_graph_block<'a>(
     title: impl Into<Line<'a>>,
     border_style: Style,
@@ -1357,8 +1640,14 @@ fn outline_row(symbol: &Symbol, selected: bool) -> Line<'static> {
     ))
 }
 
-fn render_symbol_search(frame: &mut Frame, state: &BrowseState, query: &str, selected: usize) {
-    let area = overlay_rect(frame.area(), 80, 70);
+fn render_symbol_search(
+    frame: &mut Frame,
+    hit_map: &mut HitMap,
+    area: Rect,
+    state: &BrowseState,
+    query: &str,
+    selected: usize,
+) {
     clear_overlay_area(frame, area);
 
     let rows = Layout::default()
@@ -1411,17 +1700,33 @@ fn render_symbol_search(frame: &mut Frame, state: &BrowseState, query: &str, sel
         format!("{} matches", hits.len())
     };
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title)
-            .title_bottom(Line::from(Span::styled(
-                " ↑/↓ or Ctrl-p/n move | Enter jump | Esc close ",
-                Style::default().fg(Color::DarkGray),
-            ))),
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_bottom(Line::from(Span::styled(
+            " ↑/↓ or Ctrl-p/n move | Enter jump | Esc close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+    let inner_area = block.inner(rows[1]);
+    let list = List::new(items).block(block);
     frame.render_widget(list, rows[1]);
+    for visible_row in 0..hits.len().saturating_sub(offset).min(inner_height) {
+        let row = offset + visible_row;
+        hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y.saturating_add(visible_row as u16),
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::BrowseSymbolSearch,
+                row,
+                index: row,
+            },
+        );
+    }
 }
 
 /// Keep `selected` visible inside a window `height` rows tall.

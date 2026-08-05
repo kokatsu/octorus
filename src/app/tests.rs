@@ -8287,3 +8287,59 @@ fn test_diff_page_down_in_diff_focus_matches_page_down_step() {
         30 + super::input_diff::DIFF_PAGE_STEP
     );
 }
+
+#[test]
+fn test_mouse_capture_active_initialized_from_config() {
+    let enabled = App::new_cockpit("owner/repo", Config::default(), false);
+    assert!(enabled.mouse_capture_active);
+
+    let mut config = Config::default();
+    config.mouse.enabled = false;
+    let disabled = App::new_cockpit("owner/repo", config, false);
+    assert!(!disabled.mouse_capture_active);
+}
+
+#[test]
+fn test_mouse_capture_target_none_when_disabled_in_config() {
+    let mut config = Config::default();
+    config.mouse.enabled = false;
+    let app = App::new_cockpit("owner/repo", config, false);
+    assert_eq!(app.mouse_capture_target(), None);
+}
+
+#[test]
+fn test_mouse_capture_target_flips_from_current_state() {
+    let mut app = App::new_cockpit("owner/repo", Config::default(), false);
+    assert_eq!(app.mouse_capture_target(), Some(false));
+    app.set_mouse_capture_active(false);
+    assert_eq!(app.mouse_capture_target(), Some(true));
+}
+
+#[test]
+#[serial]
+fn test_toggle_mouse_key_flips_capture_state() {
+    let mut app = App::new_cockpit("owner/repo", Config::default(), false);
+    let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+
+    assert!(app.handle_toggle_mouse_key(&f2));
+    assert!(!app.mouse_capture_active);
+
+    assert!(app.handle_toggle_mouse_key(&f2));
+    assert!(app.mouse_capture_active);
+
+    let other = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+    assert!(!app.handle_toggle_mouse_key(&other));
+    assert!(app.mouse_capture_active);
+}
+
+#[test]
+#[serial]
+fn test_toggle_mouse_key_ignored_when_disabled_in_config() {
+    let mut config = Config::default();
+    config.mouse.enabled = false;
+    let mut app = App::new_cockpit("owner/repo", config, false);
+    let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+
+    assert!(!app.handle_toggle_mouse_key(&f2));
+    assert!(!app.mouse_capture_active);
+}

@@ -42,10 +42,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_file_list_pane(frame, app, h_chunks[0], is_file_focused);
     render_diff_pane(frame, app, h_chunks[1], is_diff_focused);
+    register_split_divider(app, h_chunks[0], outer_chunks[0]);
 
     if has_rally {
         render_rally_status_bar(frame, outer_chunks[1], app);
     }
+}
+
+/// スプリット境界(左ペイン右端の 2 桁)をドラッグリサイズ対象として登録する。
+/// ペイン内容の登録より後に呼ぶことで最上位ヒットになる。
+pub(super) fn register_split_divider(
+    app: &mut App,
+    left_pane: ratatui::layout::Rect,
+    body: ratatui::layout::Rect,
+) {
+    app.hit_map.push(
+        ratatui::layout::Rect {
+            x: left_pane.right().saturating_sub(1),
+            y: left_pane.y,
+            width: 2,
+            height: left_pane.height,
+        },
+        crate::ui::hit::HitTarget::SplitDivider {
+            split: crate::ui::hit::SplitKind::LeftPanel,
+            body_x: body.x,
+            body_width: body.width,
+        },
+    );
 }
 
 fn render_file_list_pane(
@@ -258,6 +281,8 @@ fn render_file_list_pane(
         }
     }
 
+    super::file_list::register_file_list_hits(app, chunks[1]);
+
     let mut next_chunk = 2;
 
     if has_filter_bar {
@@ -294,7 +319,12 @@ fn render_file_list_pane(
     frame.render_widget(footer, chunks[next_chunk]);
 }
 
-fn render_diff_pane(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, is_focused: bool) {
+fn render_diff_pane(
+    frame: &mut Frame,
+    app: &mut App,
+    area: ratatui::layout::Rect,
+    is_focused: bool,
+) {
     let border_color = if is_focused {
         Color::Yellow
     } else {
@@ -312,7 +342,7 @@ fn render_diff_pane(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, i
 
 fn render_diff_pane_normal(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: ratatui::layout::Rect,
     border_color: Color,
     is_focused: bool,
@@ -359,7 +389,7 @@ fn render_diff_footer(
 
 fn render_diff_pane_with_comments(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: ratatui::layout::Rect,
     border_color: Color,
 ) {
@@ -418,16 +448,22 @@ fn render_diff_pane_with_comments(
     let title = "Comments (j/k/↑↓: scroll, c: comment, s: suggest, r: reply)";
     let total_lines = lines.len();
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+    let inner_area = block.inner(chunks[2]);
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(title),
-        )
+        .block(block)
         .wrap(Wrap { trim: true })
         .scroll((app.cmt.comment_panel_scroll, 0));
     frame.render_widget(paragraph, chunks[2]);
+    app.hit_map.push(
+        inner_area,
+        crate::ui::hit::HitTarget::Pane {
+            pane: crate::ui::hit::PaneKind::CommentPanel,
+        },
+    );
 
     if total_lines > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -480,12 +516,13 @@ fn render_diff_header(
 
 fn render_diff_body(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: ratatui::layout::Rect,
     border_color: Color,
 ) {
     let visible_height = area.height.saturating_sub(2) as usize;
-    let (lines, scroll_row) = if let Some(ref cache) = app.diff_store.current {
+    app.diff_scroll.set_visible_lines(visible_height);
+    let (lines, scroll_row, first_line) = if let Some(ref cache) = app.diff_store.current {
         let line_count = cache.lines.len();
         // Slice from scroll_offset, bounded to visible viewport + buffer for wrap handling.
         let max_scroll = line_count.saturating_sub(visible_height);
@@ -504,7 +541,7 @@ fn render_diff_body(
             multiline_range,
             area.width.saturating_sub(2),
         );
-        (rendered, 0u16)
+        (rendered, 0u16, start)
     } else {
         let file = app.files().get(app.selected_file);
         let rendered = match file {
@@ -520,15 +557,22 @@ fn render_diff_body(
             },
             None => vec![Line::from("No file selected")],
         };
-        (rendered, app.diff_scroll.scroll_offset as u16)
+        (rendered, app.diff_scroll.scroll_offset as u16, 0)
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner_area = block.inner(area);
+    diff_view::register_diff_hit_regions(
+        &mut app.hit_map,
+        inner_area,
+        &lines,
+        first_line,
+        scroll_row as usize,
+    );
     let diff_block = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
+        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((scroll_row, 0));
 
