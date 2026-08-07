@@ -1100,13 +1100,22 @@ mod tests {
         }
     }
 
+    /// A throwaway terminal for handlers that take one but do not draw.
+    fn test_terminal() -> ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>> {
+        ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .expect("terminal")
+    }
+
     #[tokio::test]
     async fn test_reclick_on_selected_diff_line_opens_panel_on_up_not_down() {
         let mut app = diff_app_with_hit_rows(20);
         app.diff_scroll.selected_line = 5;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = test_terminal();
 
         // 選択済み行への Down: この時点ではパネルを開かない
         app.mouse_down(diff_line_target(5), &mut terminal)
@@ -1136,9 +1145,7 @@ mod tests {
     async fn test_drag_from_selected_line_selects_range_instead_of_opening_panel() {
         let mut app = diff_app_with_hit_rows(20);
         app.diff_scroll.selected_line = 5;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = test_terminal();
 
         // カーソル行から Down → Drag: パネルではなく複数行選択になる
         app.mouse_down(diff_line_target(5), &mut terminal)
@@ -1164,9 +1171,7 @@ mod tests {
         app.cmt.comment_panel_open = true;
         app.cmt.comment_panel_scroll = 7;
         app.cmt.selected_inline_comment = 1;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = test_terminal();
 
         app.mouse_down(diff_line_target(9), &mut terminal)
             .await

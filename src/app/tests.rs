@@ -2053,6 +2053,17 @@ fn test_enter_multiline_selection_rejected_on_header() {
     assert!(app.multiline_selection.is_none());
 }
 
+/// A throwaway terminal for handlers that take one but do not draw.
+fn test_terminal() -> ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>> {
+    ratatui::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 120, 40)),
+        },
+    )
+    .expect("terminal")
+}
+
 #[tokio::test]
 #[serial]
 async fn test_multiline_select_extend_and_confirm_via_key_dispatch() {
@@ -2060,8 +2071,7 @@ async fn test_multiline_select_extend_and_confirm_via_key_dispatch() {
     app.state = AppState::DiffView;
     app.diff_scroll.line_count = 4;
     app.diff_scroll.selected_line = 1;
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+    let mut terminal = test_terminal();
 
     let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
         code,
@@ -2113,8 +2123,7 @@ async fn test_shift_enter_multiline_confirm_via_full_key_path() {
     app.state = AppState::DiffView;
     app.diff_scroll.line_count = 4;
     app.diff_scroll.selected_line = 1;
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+    let mut terminal = test_terminal();
 
     let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
         code,
@@ -2159,8 +2168,7 @@ async fn test_shift_enter_starts_selection_even_while_comment_panel_open() {
     app.diff_scroll.selected_line = 1;
     // マウスの再クリック等でパネルが開いたままの状態を再現
     app.cmt.comment_panel_open = true;
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+    let mut terminal = test_terminal();
 
     let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
         code,
