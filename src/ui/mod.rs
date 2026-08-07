@@ -9,6 +9,7 @@ mod file_list;
 pub(super) mod footer;
 mod git_ops;
 mod help;
+pub mod hit;
 mod issue_comment_list;
 mod issue_detail;
 mod issue_list;
@@ -20,7 +21,10 @@ pub mod text_area;
 
 use anyhow::Result;
 use crossterm::{
-    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -41,8 +45,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::app::{App, AppState, DataState, ShellCommandResult, ShellPhase};
 
 static KITTY_ENABLED: AtomicBool = AtomicBool::new(false);
+static MOUSE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+pub fn setup_terminal(mouse_capture: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -59,17 +64,54 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     {
         KITTY_ENABLED.store(true, Ordering::SeqCst);
     }
+    if mouse_capture {
+        write_enable_mouse_capture(&mut stdout)?;
+        MOUSE_CAPTURE_ENABLED.store(true, Ordering::SeqCst);
+    }
     let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
-    Ok(terminal)
+    match Terminal::new(backend) {
+        Ok(terminal) => Ok(terminal),
+        Err(e) => {
+            cleanup_mouse_capture();
+            Err(e.into())
+        }
+    }
 }
 
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    cleanup_mouse_capture();
     cleanup_keyboard_enhancement();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+pub fn write_enable_mouse_capture(w: &mut impl io::Write) -> io::Result<()> {
+    execute!(w, EnableMouseCapture)
+}
+
+pub fn write_disable_mouse_capture(w: &mut impl io::Write) -> io::Result<()> {
+    execute!(w, DisableMouseCapture)
+}
+
+/// ランタイムトグルでマウスキャプチャを有効化する。
+/// エスケープ発行が成功したときだけ状態を更新する。
+pub fn enable_mouse_capture_runtime() -> io::Result<()> {
+    write_enable_mouse_capture(&mut io::stdout())?;
+    MOUSE_CAPTURE_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Disable mouse capture if previously enabled.
+/// Uses CAS to prevent double-disable. Safe to call multiple times.
+pub fn cleanup_mouse_capture() {
+    if MOUSE_CAPTURE_ENABLED
+        .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+        .is_ok()
+    {
+        let _ = write_disable_mouse_capture(&mut io::stdout());
+    }
 }
 
 /// Pop Kitty keyboard enhancement flags if previously pushed.
@@ -84,6 +126,7 @@ pub fn cleanup_keyboard_enhancement() {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    app.hit_map.clear();
     if !app.state.is_data_state_independent() {
         if matches!(app.data_state, DataState::Loading) {
             file_list::render_loading(frame, app);
@@ -133,20 +176,51 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             }
         }
     }
+    simulate_modal::register_hit_regions(app, frame.area());
 
-    if let Some(ref popup) = app.symbol_popup {
-        render_symbol_popup(frame, popup);
+    if app.symbol_popup.is_some() {
+        render_symbol_popup(frame, app);
     }
 
-    if let Some(ref shell) = app.shell_state {
+    let shell_popup = if let Some(ref shell) = app.shell_state {
         match &shell.phase {
-            ShellPhase::Input => {} // Handled by build_footer_line + build_footer_block_with_border
-            ShellPhase::Running => render_shell_running_indicator(frame, app, false),
-            ShellPhase::Cancelling => render_shell_running_indicator(frame, app, true),
-            ShellPhase::Done(result) => {
-                render_shell_output_popup(frame, result, shell.scroll_offset)
+            ShellPhase::Input => Some(None),
+            ShellPhase::Running => {
+                render_shell_running_indicator(frame, app, false);
+                Some(None)
             }
+            ShellPhase::Cancelling => {
+                render_shell_running_indicator(frame, app, true);
+                Some(None)
+            }
+            ShellPhase::Done(result) => Some(Some(render_shell_output_popup(
+                frame,
+                result,
+                shell.scroll_offset,
+            ))),
         }
+    } else {
+        None
+    };
+    match shell_popup {
+        // 出力ポップアップ: 外側クリックで閉じる + 内部はホイールスクロール
+        Some(Some(popup_area)) => {
+            app.hit_map
+                .push(frame.area(), hit::HitTarget::Backdrop { dismiss: true });
+            app.hit_map.push(popup_area, hit::HitTarget::OverlaySurface);
+            app.hit_map.push(
+                Block::default().borders(Borders::ALL).inner(popup_area),
+                hit::HitTarget::Pane {
+                    pane: hit::PaneKind::ShellOutput,
+                },
+            );
+        }
+        // 入力中/実行中はクリックを吸収する(誤操作防止)
+        Some(None) => {
+            app.hit_map
+                .push(frame.area(), hit::HitTarget::Backdrop { dismiss: false });
+        }
+        None => {}
     }
 }
 
@@ -156,7 +230,10 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
-fn render_symbol_popup(frame: &mut Frame, popup: &crate::app::SymbolPopupState) {
+fn render_symbol_popup(frame: &mut Frame, app: &mut App) {
+    let Some(ref popup) = app.symbol_popup else {
+        return;
+    };
     let area = frame.area();
 
     let max_width = popup
@@ -198,6 +275,27 @@ fn render_symbol_popup(frame: &mut Frame, popup: &crate::app::SymbolPopupState) 
     );
 
     frame.render_widget(list, popup_area);
+
+    let symbol_count = app.symbol_popup.as_ref().map_or(0, |p| p.symbols.len());
+    app.hit_map
+        .push(area, hit::HitTarget::Backdrop { dismiss: true });
+    app.hit_map.push(popup_area, hit::HitTarget::OverlaySurface);
+    let inner = Block::default().borders(Borders::ALL).inner(popup_area);
+    for row in 0..symbol_count.min(usize::from(inner.height)) {
+        app.hit_map.push(
+            Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(row as u16),
+                width: inner.width,
+                height: 1,
+            },
+            hit::HitTarget::ListRow {
+                list: hit::ListKind::SymbolPopup,
+                row,
+                index: row,
+            },
+        );
+    }
 }
 
 fn render_shell_running_indicator(frame: &mut Frame, app: &App, cancelling: bool) {
@@ -226,7 +324,11 @@ fn render_shell_running_indicator(frame: &mut Frame, app: &App, cancelling: bool
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_shell_output_popup(frame: &mut Frame, result: &ShellCommandResult, scroll_offset: usize) {
+fn render_shell_output_popup(
+    frame: &mut Frame,
+    result: &ShellCommandResult,
+    scroll_offset: usize,
+) -> Rect {
     let area = frame.area();
     let width = (area.width * 80 / 100).max(40).min(area.width);
     let height = (area.height * 70 / 100).max(10).min(area.height);
@@ -301,5 +403,30 @@ fn render_shell_output_popup(frame: &mut Frame, result: &ShellCommandResult, scr
             }),
             &mut scrollbar_state,
         );
+    }
+
+    popup_area
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    #[test]
+    fn test_write_enable_mouse_capture_emits_tracking_sequences() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_enable_mouse_capture(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("\x1b[?1000h"), "normal tracking on: {out:?}");
+        assert!(out.contains("\x1b[?1006h"), "SGR mode on: {out:?}");
+    }
+
+    #[test]
+    fn test_write_disable_mouse_capture_emits_reset_sequences() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_disable_mouse_capture(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("\x1b[?1000l"), "normal tracking off: {out:?}");
+        assert!(out.contains("\x1b[?1006l"), "SGR mode off: {out:?}");
     }
 }

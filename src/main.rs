@@ -238,6 +238,7 @@ fn is_root_help(raw_args: &[OsString]) -> bool {
 
 /// Restore terminal to normal state
 fn restore_terminal() {
+    octorus::ui::cleanup_mouse_capture();
     octorus::ui::cleanup_keyboard_enhancement();
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);

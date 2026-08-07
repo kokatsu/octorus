@@ -29,16 +29,15 @@ impl App {
         let Some(ref cockpit) = self.cockpit_state else {
             return Ok(());
         };
-        let selected = cockpit.selected_item;
         let repo_available = cockpit.repo_available;
 
         if is_move_down {
-            self.cockpit_state.as_mut().unwrap().selected_item = selected.next();
+            self.cockpit_move_down();
             return Ok(());
         }
 
         if is_move_up {
-            self.cockpit_state.as_mut().unwrap().selected_item = selected.prev();
+            self.cockpit_move_up();
             return Ok(());
         }
 
@@ -48,21 +47,56 @@ impl App {
         }
 
         if is_open {
-            if selected.requires_repo() && !repo_available {
-                return Ok(());
-            }
-
-            match selected {
-                CockpitMenuItem::PrList => self.open_pr_list_from_cockpit(),
-                CockpitMenuItem::IssueList => self.open_issue_list(),
-                CockpitMenuItem::LocalDiff => self.enter_local_mode_from_cockpit(),
-                CockpitMenuItem::GitOps => self.open_git_ops(),
-                CockpitMenuItem::RepoBrowse => self.open_repo_browse(),
-            }
+            self.activate_cockpit_selection();
             return Ok(());
         }
 
         Ok(())
+    }
+
+    pub(crate) fn cockpit_move_down(&mut self) {
+        if let Some(ref mut cockpit) = self.cockpit_state {
+            cockpit.selected_item = cockpit.selected_item.next();
+        }
+    }
+
+    pub(crate) fn cockpit_move_up(&mut self) {
+        if let Some(ref mut cockpit) = self.cockpit_state {
+            cockpit.selected_item = cockpit.selected_item.prev();
+        }
+    }
+
+    pub(crate) fn activate_cockpit_selection(&mut self) {
+        let Some(ref cockpit) = self.cockpit_state else {
+            return;
+        };
+        let selected = cockpit.selected_item;
+        let repo_available = cockpit.repo_available;
+
+        if selected.requires_repo() && !repo_available {
+            return;
+        }
+
+        match selected {
+            CockpitMenuItem::PrList => self.open_pr_list_from_cockpit(),
+            CockpitMenuItem::IssueList => self.open_issue_list(),
+            CockpitMenuItem::LocalDiff => self.enter_local_mode_from_cockpit(),
+            CockpitMenuItem::GitOps => self.open_git_ops(),
+            CockpitMenuItem::RepoBrowse => self.open_repo_browse(),
+        }
+    }
+
+    pub(crate) fn cockpit_click_select(&mut self, row: usize) -> bool {
+        let Some(ref mut cockpit) = self.cockpit_state else {
+            return false;
+        };
+
+        if cockpit.selected_item.index() == row {
+            true
+        } else {
+            cockpit.selected_item = CockpitMenuItem::from_index(row);
+            false
+        }
     }
 
     /// Single entry point for all cockpit return paths to prevent partial resets.

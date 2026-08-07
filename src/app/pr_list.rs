@@ -37,26 +37,12 @@ impl App {
         let has_filter = self.prs.pr_list_filter.is_some();
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if has_filter {
-                self.handle_filter_navigation("pr", true);
-            } else if pr_count > 0 {
-                self.prs.selected_pr = (self.prs.selected_pr + 1).min(pr_count.saturating_sub(1));
-                if self.prs.pr_list_has_more
-                    && !self.prs.pr_list.is_loading()
-                    && self.prs.selected_pr + 5 >= pr_count
-                {
-                    self.load_more_prs();
-                }
-            }
+            self.pr_list_move_down();
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            if has_filter {
-                self.handle_filter_navigation("pr", false);
-            } else {
-                self.prs.selected_pr = self.prs.selected_pr.saturating_sub(1);
-            }
+            self.pr_list_move_up();
             return Ok(());
         }
 
@@ -134,14 +120,7 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.open_panel) {
-            if self.is_filter_selection_empty("pr") {
-                return Ok(());
-            }
-            if let Some(prs) = self.prs.pr_list.as_loaded() {
-                if let Some(pr) = prs.get(self.prs.selected_pr) {
-                    self.select_pr(pr.number);
-                }
-            }
+            self.open_selected_pr();
             return Ok(());
         }
 
@@ -220,6 +199,69 @@ impl App {
 
         Ok(())
     }
+
+    pub(crate) fn pr_list_move_down(&mut self) {
+        if self.prs.pr_list_filter.is_some() {
+            self.handle_filter_navigation("pr", true);
+            return;
+        }
+
+        let pr_count = self.prs.pr_list.as_loaded().map(|l| l.len()).unwrap_or(0);
+        if pr_count > 0 {
+            self.prs.selected_pr = (self.prs.selected_pr + 1).min(pr_count.saturating_sub(1));
+            if self.prs.pr_list_has_more
+                && !self.prs.pr_list.is_loading()
+                && self.prs.selected_pr + 5 >= pr_count
+            {
+                self.load_more_prs();
+            }
+        }
+    }
+
+    pub(crate) fn pr_list_move_up(&mut self) {
+        if self.prs.pr_list_filter.is_some() {
+            self.handle_filter_navigation("pr", false);
+        } else {
+            self.prs.selected_pr = self.prs.selected_pr.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn open_selected_pr(&mut self) {
+        if self.is_filter_selection_empty("pr") {
+            return;
+        }
+        if let Some(prs) = self.prs.pr_list.as_loaded() {
+            if let Some(pr) = prs.get(self.prs.selected_pr) {
+                self.select_pr(pr.number);
+            }
+        }
+    }
+
+    pub(crate) fn pr_list_click_select(&mut self, row: usize, index: usize) -> bool {
+        if let Some(filter) = self.prs.pr_list_filter.as_mut() {
+            if filter.selected == Some(row) {
+                return true;
+            }
+            filter.selected = Some(row);
+            self.prs.selected_pr = index;
+            return false;
+        }
+
+        if self.prs.selected_pr == index {
+            return true;
+        }
+
+        self.prs.selected_pr = index;
+        let pr_count = self.prs.pr_list.as_loaded().map(|l| l.len()).unwrap_or(0);
+        if self.prs.pr_list_has_more
+            && !self.prs.pr_list.is_loading()
+            && self.prs.selected_pr + 5 >= pr_count
+        {
+            self.load_more_prs();
+        }
+        false
+    }
+
     pub(crate) fn reload_pr_list(&mut self) {
         self.prs.selected_pr = 0;
         self.prs.pr_list_scroll_offset = 0;

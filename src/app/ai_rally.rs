@@ -206,29 +206,9 @@ impl App {
                 }
             }
         } else if self.matches_single_key(&key, &kb.move_down) {
-            if let Some(ref mut rally_state) = self.ai_rally_state {
-                let total_logs = rally_state.logs.len();
-                if total_logs == 0 {
-                    return Ok(());
-                }
-                let current = rally_state.selected_log_index.unwrap_or(0);
-                let new_index = (current + 1).min(total_logs.saturating_sub(1));
-                rally_state.selected_log_index = Some(new_index);
-                self.adjust_log_scroll_to_selection();
-            }
+            self.rally_log_move_down();
         } else if self.matches_single_key(&key, &kb.move_up) {
-            if let Some(ref mut rally_state) = self.ai_rally_state {
-                let total_logs = rally_state.logs.len();
-                if total_logs == 0 {
-                    return Ok(());
-                }
-                let current = rally_state
-                    .selected_log_index
-                    .unwrap_or(total_logs.saturating_sub(1));
-                let new_index = current.saturating_sub(1);
-                rally_state.selected_log_index = Some(new_index);
-                self.adjust_log_scroll_to_selection();
-            }
+            self.rally_log_move_up();
         } else if self.matches_single_key(&key, &kb.page_down)
             || Self::is_shift_char_shortcut(&key, 'j')
         {
@@ -260,11 +240,7 @@ impl App {
                 self.adjust_log_scroll_to_selection();
             }
         } else if self.matches_single_key(&key, &kb.open_panel) {
-            if let Some(ref mut rally_state) = self.ai_rally_state {
-                if rally_state.selected_log_index.is_some() && !rally_state.logs.is_empty() {
-                    rally_state.showing_log_detail = true;
-                }
-            }
+            self.open_selected_rally_log();
         } else if self.matches_single_key(&key, &kb.jump_to_last) {
             if let Some(ref mut rally_state) = self.ai_rally_state {
                 let total_logs = rally_state.logs.len();
@@ -317,6 +293,56 @@ impl App {
         }
         Ok(())
     }
+
+    pub(crate) fn rally_log_move_down(&mut self) {
+        if let Some(ref mut rally_state) = self.ai_rally_state {
+            let total_logs = rally_state.logs.len();
+            if total_logs == 0 {
+                return;
+            }
+            let current = rally_state.selected_log_index.unwrap_or(0);
+            let new_index = (current + 1).min(total_logs.saturating_sub(1));
+            rally_state.selected_log_index = Some(new_index);
+            self.adjust_log_scroll_to_selection();
+        }
+    }
+
+    pub(crate) fn rally_log_move_up(&mut self) {
+        if let Some(ref mut rally_state) = self.ai_rally_state {
+            let total_logs = rally_state.logs.len();
+            if total_logs == 0 {
+                return;
+            }
+            let current = rally_state
+                .selected_log_index
+                .unwrap_or(total_logs.saturating_sub(1));
+            let new_index = current.saturating_sub(1);
+            rally_state.selected_log_index = Some(new_index);
+            self.adjust_log_scroll_to_selection();
+        }
+    }
+
+    pub(crate) fn open_selected_rally_log(&mut self) {
+        if let Some(ref mut rally_state) = self.ai_rally_state {
+            if rally_state.selected_log_index.is_some() && !rally_state.logs.is_empty() {
+                rally_state.showing_log_detail = true;
+            }
+        }
+    }
+
+    pub(crate) fn rally_log_click_select(&mut self, row: usize) -> bool {
+        let Some(ref mut rally_state) = self.ai_rally_state else {
+            return false;
+        };
+
+        if rally_state.selected_log_index == Some(row) {
+            true
+        } else {
+            rally_state.selected_log_index = Some(row);
+            false
+        }
+    }
+
     pub(crate) fn adjust_log_scroll_to_selection(&mut self) {
         if let Some(ref mut rally_state) = self.ai_rally_state {
             let Some(selected) = rally_state.selected_log_index else {
@@ -398,7 +424,7 @@ impl App {
             crate::editor::open_clarification_editor(self.config.editor.as_deref(), question)?;
 
         // Re-setup terminal after editor closes
-        *terminal = ui::setup_terminal()?;
+        *terminal = ui::setup_terminal(self.mouse_capture_active)?;
 
         // Process result
         if let Some(ref mut rally_state) = self.ai_rally_state {

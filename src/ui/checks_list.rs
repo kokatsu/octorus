@@ -12,6 +12,7 @@ use ratatui::{
 use super::common::truncate_with_width;
 use crate::app::App;
 use crate::github::CheckItem;
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -88,9 +89,43 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         frame.render_widget(empty, chunks[1]);
     }
 
+    register_checks_list_hits(app, chunks[1]);
+
     let help_text = super::footer::footer_hint_back(&app.config.keybindings);
     let footer = Paragraph::new(help_text).block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
+}
+
+fn register_checks_list_hits(app: &mut App, area: ratatui::layout::Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    app.hit_map.push(
+        inner,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::ChecksList),
+        },
+    );
+
+    let total = if app.chk.checks_loading {
+        0
+    } else {
+        app.chk.checks.as_ref().map_or(0, Vec::len)
+    };
+    let offset = app.chk.checks_scroll_offset;
+    for (visible_row, index) in (offset..total).take(usize::from(inner.height)).enumerate() {
+        app.hit_map.push(
+            ratatui::layout::Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(visible_row as u16),
+                width: inner.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::ChecksList,
+                row: index,
+                index,
+            },
+        );
+    }
 }
 
 fn check_status_icon(check: &CheckItem) -> (char, Color) {

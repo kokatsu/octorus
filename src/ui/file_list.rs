@@ -12,9 +12,9 @@ use ratatui::{
 use super::common::{
     build_ci_status_span, build_pr_info, render_rally_status_bar, render_update_bar,
 };
-use crate::app::App;
-use crate::app::TreeRow;
+use crate::app::{App, TreeRow};
 use crate::github::ChangedFile;
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 use std::collections::HashMap;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -205,6 +205,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    register_file_list_hits(app, chunks[1]);
+
     let mut next_chunk = 2;
 
     if has_filter_bar {
@@ -228,6 +230,64 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let footer_line = super::footer::build_footer_line(app, &help_text);
     let footer = Paragraph::new(footer_line).block(super::footer::build_footer_block(app));
     frame.render_widget(footer, chunks[next_chunk]);
+}
+
+pub(super) fn register_file_list_hits(app: &mut App, area: ratatui::layout::Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    app.hit_map.push(
+        inner,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::FileList),
+        },
+    );
+
+    let visible_height = usize::from(inner.height);
+    let rows: Vec<(usize, usize)> = if let Some(ref filter) = app.file_list_filter {
+        filter
+            .matched_indices
+            .iter()
+            .enumerate()
+            .skip(app.file_list_scroll_offset)
+            .take(visible_height)
+            .map(|(row, &index)| (row, index))
+            .collect()
+    } else if app.is_file_tree_active() {
+        let tree = app.file_tree_state.as_ref().unwrap();
+        tree.visible_rows
+            .iter()
+            .enumerate()
+            .skip(tree.scroll_offset)
+            .take(visible_height)
+            .map(|(row, entry)| {
+                let index = match entry {
+                    TreeRow::File { index, .. } => *index,
+                    TreeRow::Dir { .. } => row,
+                };
+                (row, index)
+            })
+            .collect()
+    } else {
+        (app.file_list_scroll_offset..app.files().len())
+            .take(visible_height)
+            .map(|index| (index, index))
+            .collect()
+    };
+
+    for (visible_row, (row, index)) in rows.into_iter().enumerate() {
+        app.hit_map.push(
+            ratatui::layout::Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(visible_row as u16),
+                width: inner.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::FileList,
+                row,
+                index,
+            },
+        );
+    }
 }
 
 pub fn render_loading(frame: &mut Frame, app: &App) {

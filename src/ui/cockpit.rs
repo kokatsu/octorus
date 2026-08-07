@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, CockpitMenuItem, LoadState};
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 
 use super::footer;
 
@@ -32,7 +33,11 @@ fn logo_color(line_index: usize) -> Color {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let Some(ref cockpit) = app.cockpit_state else {
+    let Some((selected, repo_available)) = app
+        .cockpit_state
+        .as_ref()
+        .map(|cockpit| (cockpit.selected_item, cockpit.repo_available))
+    else {
         return;
     };
 
@@ -46,12 +51,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     render_header(frame, app, chunks[0]);
-    render_menu(
-        frame,
-        cockpit.selected_item,
-        cockpit.repo_available,
-        chunks[1],
-    );
+    render_menu(frame, app, selected, repo_available, chunks[1]);
 
     let help_text = "q: quit  ?: help  r: refresh";
     let footer_line = footer::build_footer_line(app, help_text);
@@ -119,9 +119,10 @@ fn format_count_span<'a>(
 
 fn render_menu(
     frame: &mut Frame,
+    app: &mut App,
     selected: CockpitMenuItem,
     repo_available: bool,
-    area: ratatui::layout::Rect,
+    area: Rect,
 ) {
     let items: Vec<ListItem> = CockpitMenuItem::ALL
         .iter()
@@ -140,8 +141,10 @@ fn render_menu(
     let mut list_state = ListState::default();
     list_state.select(Some(selected.index()));
 
+    let block = Block::default().borders(Borders::ALL).title("Navigation");
+    let inner_area = block.inner(area);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Navigation"))
+        .block(block)
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -150,6 +153,31 @@ fn render_menu(
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, area, &mut list_state);
+
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::CockpitMenu),
+        },
+    );
+    for (visible_row, index) in (list_state.offset()..CockpitMenuItem::ALL.len())
+        .take(inner_area.height as usize)
+        .enumerate()
+    {
+        app.hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y.saturating_add(visible_row as u16),
+                width: inner_area.width,
+                height: 1,
+            },
+            HitTarget::ListRow {
+                list: ListKind::CockpitMenu,
+                row: index,
+                index,
+            },
+        );
+    }
 }
 
 #[cfg(test)]

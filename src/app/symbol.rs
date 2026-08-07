@@ -234,7 +234,7 @@ impl App {
             &full_path,
             line_number.unwrap_or(1) as usize,
         );
-        *terminal = crate::ui::setup_terminal()?;
+        *terminal = crate::ui::setup_terminal(self.mouse_capture_active)?;
 
         Ok(())
     }
@@ -307,9 +307,9 @@ impl App {
         } else if Self::is_shift_char_shortcut(&key, 'g') {
             self.pr_description_scroll_offset = usize::MAX;
         } else if self.matches_single_key(&key, &kb.move_down) {
-            self.pr_description_scroll_offset = self.pr_description_scroll_offset.saturating_add(1);
+            self.pr_description_wheel(true);
         } else if self.matches_single_key(&key, &kb.move_up) {
-            self.pr_description_scroll_offset = self.pr_description_scroll_offset.saturating_sub(1);
+            self.pr_description_wheel(false);
         } else if self.matches_single_key(&key, &kb.page_down) {
             self.pr_description_scroll_offset =
                 self.pr_description_scroll_offset.saturating_add(half_page);
@@ -319,6 +319,14 @@ impl App {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn pr_description_wheel(&mut self, down: bool) {
+        self.pr_description_scroll_offset = if down {
+            self.pr_description_scroll_offset.saturating_add(1)
+        } else {
+            self.pr_description_scroll_offset.saturating_sub(1)
+        };
     }
 
     pub(crate) fn handle_help_input(
@@ -383,9 +391,11 @@ impl App {
         } else if Self::is_shift_char_shortcut(&key, 'g') {
             offset = usize::MAX;
         } else if self.matches_single_key(&key, &kb.move_down) {
-            offset = offset.saturating_add(1);
+            self.help_wheel(true);
+            return;
         } else if self.matches_single_key(&key, &kb.move_up) {
-            offset = offset.saturating_sub(1);
+            self.help_wheel(false);
+            return;
         } else if self.matches_single_key(&key, &kb.page_down) {
             offset = offset.saturating_add(half_page);
         } else if self.matches_single_key(&key, &kb.page_up) {
@@ -395,6 +405,18 @@ impl App {
         match self.help_tab {
             HelpTab::Keybindings => self.help_scroll_offset = offset,
             HelpTab::Config => self.config_scroll_offset = offset,
+        };
+    }
+
+    pub(crate) fn help_wheel(&mut self, down: bool) {
+        let offset = match self.help_tab {
+            HelpTab::Keybindings => &mut self.help_scroll_offset,
+            HelpTab::Config => &mut self.config_scroll_offset,
+        };
+        *offset = if down {
+            offset.saturating_add(1)
+        } else {
+            offset.saturating_sub(1)
         };
     }
 }

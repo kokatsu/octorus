@@ -280,6 +280,7 @@ impl App {
             // Header(3) + Footer(3) + border(2) = 8
             term_h.saturating_sub(8)
         };
+        self.diff_scroll.set_visible_lines(visible_lines);
         let panel_inner_width = self.comment_panel_inner_width(term_w);
 
         let kb = self.config.keybindings.clone();
@@ -327,18 +328,26 @@ impl App {
         }
 
         if self.cmt.comment_panel_open {
+            // 複数行選択の開始はパネルより優先する。パネルは開いたままだと
+            // 以降の全キーを吸うため(末尾の包括 return)、ここで閉じて
+            // 選択モードへ入る。マウスの再クリックでパネルが開きやすく
+            // なったことで、この取りこぼしが顕在化した。
+            if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+                || self.matches_single_key(&key, &kb.multiline_select)
+            {
+                self.cmt.comment_panel_open = false;
+                self.cmt.comment_panel_scroll = 0;
+                self.enter_multiline_selection();
+                return Ok(());
+            }
+
             if self.matches_single_key(&key, &kb.move_down) {
-                let max_scroll = self.max_comment_panel_scroll(term_h, term_w);
-                self.cmt.comment_panel_scroll = self
-                    .cmt
-                    .comment_panel_scroll
-                    .saturating_add(1)
-                    .min(max_scroll);
+                self.comment_panel_wheel(true);
                 return Ok(());
             }
 
             if self.matches_single_key(&key, &kb.move_up) {
-                self.cmt.comment_panel_scroll = self.cmt.comment_panel_scroll.saturating_sub(1);
+                self.comment_panel_wheel(false);
                 return Ok(());
             }
 
@@ -538,17 +547,12 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if self.diff_scroll.line_count > 0 {
-                self.diff_scroll.selected_line = (self.diff_scroll.selected_line + 1)
-                    .min(self.diff_scroll.line_count.saturating_sub(1));
-                self.adjust_scroll(visible_lines);
-            }
+            self.diff_wheel_move(true);
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            self.diff_scroll.selected_line = self.diff_scroll.selected_line.saturating_sub(1);
-            self.adjust_scroll(visible_lines);
+            self.diff_wheel_move(false);
             return Ok(());
         }
 
@@ -624,6 +628,50 @@ impl App {
 
         Ok(())
     }
+
+    pub(crate) fn diff_wheel_move(&mut self, down: bool) {
+        if down {
+            if self.diff_scroll.line_count > 0 {
+                self.diff_scroll.move_down();
+            }
+        } else {
+            self.diff_scroll.move_up();
+        }
+    }
+
+    pub(crate) fn diff_click_line(&mut self, line: usize) -> bool {
+        if self.diff_scroll.selected_line == line {
+            return true;
+        }
+
+        self.diff_scroll.selected_line = line;
+        self.diff_scroll.page_up(0);
+        false
+    }
+
+    pub(crate) fn diff_open_at_cursor(&mut self) {
+        self.cmt.comment_panel_open = true;
+        self.cmt.comment_panel_scroll = 0;
+        self.cmt.selected_inline_comment = 0;
+    }
+
+    pub(crate) fn comment_panel_wheel(&mut self, down: bool) {
+        if down {
+            let max_scroll = crossterm::terminal::size()
+                .map(|(term_w, term_h)| {
+                    self.max_comment_panel_scroll(term_h as usize, term_w as usize)
+                })
+                .unwrap_or(u16::MAX);
+            self.cmt.comment_panel_scroll = self
+                .cmt
+                .comment_panel_scroll
+                .saturating_add(1)
+                .min(max_scroll);
+        } else {
+            self.cmt.comment_panel_scroll = self.cmt.comment_panel_scroll.saturating_sub(1);
+        }
+    }
+
     pub(crate) fn try_open_comment_panel(
         &mut self,
         key: &event::KeyEvent,
@@ -632,9 +680,7 @@ impl App {
         if !self.matches_single_key(key, &kb.open_panel) {
             return false;
         }
-        self.cmt.comment_panel_open = true;
-        self.cmt.comment_panel_scroll = 0;
-        self.cmt.selected_inline_comment = 0;
+        self.diff_open_at_cursor();
         true
     }
 

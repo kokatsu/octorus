@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use super::common::{truncate_with_width, wrap_text};
 use crate::app::App;
 use crate::github::IssueComment;
+use crate::ui::hit::{HitTarget, ListKind, PaneKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let Some(ref state) = app.issue_state else {
@@ -93,6 +94,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             format_comment_item(comment, i, i == state.selected_issue_comment, body_width)
         })
         .collect();
+    let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
 
     let total_items = comments.len();
 
@@ -100,16 +102,45 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .with_offset(state.issue_comment_list_scroll_offset)
         .with_selected(Some(state.selected_issue_comment));
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+    let block = Block::default().borders(Borders::ALL);
+    let inner_area = block.inner(area);
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(list, area, &mut list_state);
 
-    state.issue_comment_list_scroll_offset = list_state.offset();
+    let final_offset = list_state.offset();
+    state.issue_comment_list_scroll_offset = final_offset;
+
+    app.hit_map.push(
+        inner_area,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::IssueCommentList),
+        },
+    );
+    let mut row_offset = 0usize;
+    for (index, &item_height) in item_heights.iter().enumerate().skip(final_offset) {
+        let remaining_height = (inner_area.height as usize).saturating_sub(row_offset);
+        if item_height > remaining_height {
+            break;
+        }
+        app.hit_map.push(
+            Rect {
+                x: inner_area.x,
+                y: inner_area.y + row_offset as u16,
+                width: inner_area.width,
+                height: item_height as u16,
+            },
+            HitTarget::ListRow {
+                list: ListKind::IssueCommentList,
+                row: index,
+                index,
+            },
+        );
+        row_offset += item_height;
+    }
 
     if total_items > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)

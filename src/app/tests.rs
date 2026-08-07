@@ -2053,6 +2053,151 @@ fn test_enter_multiline_selection_rejected_on_header() {
     assert!(app.multiline_selection.is_none());
 }
 
+#[tokio::test]
+#[serial]
+async fn test_multiline_select_extend_and_confirm_via_key_dispatch() {
+    let mut app = make_app_with_patch("@@ -1,3 +1,4 @@\n context\n+added\n more context");
+    app.state = AppState::DiffView;
+    app.diff_scroll.line_count = 4;
+    app.diff_scroll.selected_line = 1;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+
+    let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+        code,
+        modifiers: mods,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    app.handle_diff_view_input(
+        press(KeyCode::Char('V'), KeyModifiers::SHIFT),
+        &mut terminal,
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.multiline_selection.is_some(),
+        "V で複数行選択モードに入る"
+    );
+
+    app.handle_diff_view_input(press(KeyCode::Char('j'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    let sel = app.multiline_selection.as_ref().unwrap();
+    assert_eq!(
+        (sel.anchor_line, sel.cursor_line),
+        (1, 2),
+        "j で選択が伸びる"
+    );
+
+    app.handle_diff_view_input(press(KeyCode::Char('c'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    assert_eq!(app.state, AppState::TextInput, "c で確定して入力へ");
+    let Some(InputMode::Comment(ref ctx)) = app.input_mode else {
+        panic!("expected comment input mode, got {:?}", app.input_mode);
+    };
+    assert_eq!(ctx.line_number, 2, "終了行は new-side 2 行目");
+    assert_eq!(
+        ctx.start_line_number,
+        Some(1),
+        "開始行が保持され複数行コメントになる"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_shift_enter_multiline_confirm_via_full_key_path() {
+    let mut app = make_app_with_patch("@@ -1,3 +1,4 @@\n context\n+added\n more context");
+    app.state = AppState::DiffView;
+    app.diff_scroll.line_count = 4;
+    app.diff_scroll.selected_line = 1;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+
+    let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+        code,
+        modifiers: mods,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    // handle_key_event = F2/シェル/ガード込みのフル経路
+    app.handle_key_event(press(KeyCode::Enter, KeyModifiers::SHIFT), &mut terminal)
+        .await
+        .unwrap();
+    assert!(
+        app.multiline_selection.is_some(),
+        "Shift+Enter で選択が始まる"
+    );
+
+    app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    app.handle_key_event(press(KeyCode::Char('c'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+
+    assert_eq!(app.state, AppState::TextInput);
+    let Some(InputMode::Comment(ref ctx)) = app.input_mode else {
+        panic!("expected comment input mode, got {:?}", app.input_mode);
+    };
+    assert_eq!(
+        ctx.start_line_number,
+        Some(1),
+        "範囲コメントとして確定される"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_shift_enter_starts_selection_even_while_comment_panel_open() {
+    let mut app = make_app_with_patch("@@ -1,3 +1,4 @@\n context\n+added\n more context");
+    app.state = AppState::DiffView;
+    app.diff_scroll.line_count = 4;
+    app.diff_scroll.selected_line = 1;
+    // マウスの再クリック等でパネルが開いたままの状態を再現
+    app.cmt.comment_panel_open = true;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+
+    let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+        code,
+        modifiers: mods,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    app.handle_key_event(press(KeyCode::Enter, KeyModifiers::SHIFT), &mut terminal)
+        .await
+        .unwrap();
+    assert!(
+        app.multiline_selection.is_some(),
+        "パネルが開いていても Shift+Enter で範囲選択が始まる"
+    );
+
+    app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    app.handle_key_event(press(KeyCode::Char('c'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+
+    assert_eq!(app.state, AppState::TextInput, "c で範囲コメントに入る");
+    let Some(InputMode::Comment(ref ctx)) = app.input_mode else {
+        panic!(
+            "expected multiline comment input, got {:?} (パネル分岐が c を単一行コメントに吸っている)",
+            app.input_mode
+        );
+    };
+    assert_eq!(
+        ctx.start_line_number,
+        Some(1),
+        "パネルが開いた状態から始めても範囲が保持される"
+    );
+}
+
 #[test]
 fn test_multiline_comment_preserves_selection_on_invalid_range() {
     let patch = "@@ -1,2 +1,2 @@\n line1\n+new line2\n@@ -10,2 +10,2 @@\n line10\n+new line11";
@@ -8286,4 +8431,60 @@ fn test_diff_page_down_in_diff_focus_matches_page_down_step() {
         app.diff_scroll.selected_line,
         30 + super::input_diff::DIFF_PAGE_STEP
     );
+}
+
+#[test]
+fn test_mouse_capture_active_initialized_from_config() {
+    let enabled = App::new_cockpit("owner/repo", Config::default(), false);
+    assert!(enabled.mouse_capture_active);
+
+    let mut config = Config::default();
+    config.mouse.enabled = false;
+    let disabled = App::new_cockpit("owner/repo", config, false);
+    assert!(!disabled.mouse_capture_active);
+}
+
+#[test]
+fn test_mouse_capture_target_none_when_disabled_in_config() {
+    let mut config = Config::default();
+    config.mouse.enabled = false;
+    let app = App::new_cockpit("owner/repo", config, false);
+    assert_eq!(app.mouse_capture_target(), None);
+}
+
+#[test]
+fn test_mouse_capture_target_flips_from_current_state() {
+    let mut app = App::new_cockpit("owner/repo", Config::default(), false);
+    assert_eq!(app.mouse_capture_target(), Some(false));
+    app.set_mouse_capture_active(false);
+    assert_eq!(app.mouse_capture_target(), Some(true));
+}
+
+#[test]
+#[serial]
+fn test_toggle_mouse_key_flips_capture_state() {
+    let mut app = App::new_cockpit("owner/repo", Config::default(), false);
+    let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+
+    assert!(app.handle_toggle_mouse_key(&f2));
+    assert!(!app.mouse_capture_active);
+
+    assert!(app.handle_toggle_mouse_key(&f2));
+    assert!(app.mouse_capture_active);
+
+    let other = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+    assert!(!app.handle_toggle_mouse_key(&other));
+    assert!(app.mouse_capture_active);
+}
+
+#[test]
+#[serial]
+fn test_toggle_mouse_key_ignored_when_disabled_in_config() {
+    let mut config = Config::default();
+    config.mouse.enabled = false;
+    let mut app = App::new_cockpit("owner/repo", config, false);
+    let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+
+    assert!(!app.handle_toggle_mouse_key(&f2));
+    assert!(!app.mouse_capture_active);
 }

@@ -70,6 +70,76 @@ impl App {
         state.issue_detail_cache = Some(cache);
     }
 
+    pub(crate) fn issue_body_wheel(&mut self, down: bool) {
+        let Some(state) = self.issue_state.as_mut() else {
+            return;
+        };
+        state.issue_detail_scroll_offset = if down {
+            state.issue_detail_scroll_offset.saturating_add(1)
+        } else {
+            state.issue_detail_scroll_offset.saturating_sub(1)
+        };
+    }
+
+    pub(crate) fn linked_prs_move_down(&mut self) {
+        let pr_count = self
+            .issue_state
+            .as_ref()
+            .and_then(|s| s.linked_prs.as_loaded().map(|p| p.len()))
+            .unwrap_or(0);
+        if pr_count == 0 {
+            return;
+        }
+        if let Some(state) = self.issue_state.as_mut() {
+            state.selected_linked_pr = (state.selected_linked_pr + 1).min(pr_count - 1);
+        }
+    }
+
+    pub(crate) fn linked_prs_move_up(&mut self) {
+        if let Some(state) = self.issue_state.as_mut() {
+            state.selected_linked_pr = state.selected_linked_pr.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn open_selected_linked_pr(&mut self) {
+        let pr_info = self.issue_state.as_ref().and_then(|state| {
+            state
+                .linked_prs
+                .as_loaded()
+                .and_then(|prs| prs.get(state.selected_linked_pr))
+                .map(|pr| (pr.number, pr.repo.clone()))
+        });
+        if let Some((number, repo)) = pr_info {
+            self.enter_pr_from_issue(number, repo.as_deref());
+        }
+    }
+
+    pub(crate) fn linked_pr_click_select(&mut self, row: usize) -> bool {
+        let Some(state) = self.issue_state.as_mut() else {
+            return false;
+        };
+        if state.selected_linked_pr == row {
+            return true;
+        }
+        state.selected_linked_pr = row;
+        false
+    }
+
+    /// リンク PR が存在するときだけフォーカスを切替える(Tab と同じガード)
+    pub(crate) fn issue_detail_set_focus(&mut self, focus: IssueDetailFocus) {
+        let has_linked_prs = self
+            .issue_state
+            .as_ref()
+            .and_then(|s| s.linked_prs.as_loaded().map(|p| !p.is_empty()))
+            .unwrap_or(false);
+        if focus == IssueDetailFocus::LinkedPrs && !has_linked_prs {
+            return;
+        }
+        if let Some(state) = self.issue_state.as_mut() {
+            state.detail_focus = focus;
+        }
+    }
+
     pub(crate) fn handle_issue_detail_input(
         &mut self,
         key: event::KeyEvent,
@@ -95,15 +165,11 @@ impl App {
         match focus {
             IssueDetailFocus::Body => {
                 if self.matches_single_key(&key, &kb.move_down) {
-                    let state = self.issue_state.as_mut().unwrap();
-                    state.issue_detail_scroll_offset =
-                        state.issue_detail_scroll_offset.saturating_add(1);
+                    self.issue_body_wheel(true);
                     return Ok(());
                 }
                 if self.matches_single_key(&key, &kb.move_up) {
-                    let state = self.issue_state.as_mut().unwrap();
-                    state.issue_detail_scroll_offset =
-                        state.issue_detail_scroll_offset.saturating_sub(1);
+                    self.issue_body_wheel(false);
                     return Ok(());
                 }
                 if self.matches_single_key(&key, &kb.page_down)
@@ -124,31 +190,17 @@ impl App {
                 }
             }
             IssueDetailFocus::LinkedPrs => {
-                let pr_count = state.linked_prs.as_loaded().map(|p| p.len()).unwrap_or(0);
-
                 if self.matches_single_key(&key, &kb.move_down) {
-                    if pr_count > 0 {
-                        let state = self.issue_state.as_mut().unwrap();
-                        state.selected_linked_pr =
-                            (state.selected_linked_pr + 1).min(pr_count.saturating_sub(1));
-                    }
+                    self.linked_prs_move_down();
                     return Ok(());
                 }
                 if self.matches_single_key(&key, &kb.move_up) {
-                    let state = self.issue_state.as_mut().unwrap();
-                    state.selected_linked_pr = state.selected_linked_pr.saturating_sub(1);
+                    self.linked_prs_move_up();
                     return Ok(());
                 }
 
                 if self.matches_single_key(&key, &kb.open_panel) {
-                    let pr_info = state
-                        .linked_prs
-                        .as_loaded()
-                        .and_then(|prs| prs.get(state.selected_linked_pr))
-                        .map(|pr| (pr.number, pr.repo.clone()));
-                    if let Some((number, repo)) = pr_info {
-                        self.enter_pr_from_issue(number, repo.as_deref());
-                    }
+                    self.open_selected_linked_pr();
                     return Ok(());
                 }
             }
@@ -271,6 +323,47 @@ impl App {
         self.state = AppState::TextInput;
     }
 
+    pub(crate) fn issue_comments_move_down(&mut self) {
+        let Some(ref state) = self.issue_state else {
+            return;
+        };
+        let comment_count = state.issue_comments.as_ref().map(|c| c.len()).unwrap_or(0);
+
+        if comment_count > 0 {
+            let state = self.issue_state.as_mut().unwrap();
+            state.selected_issue_comment =
+                (state.selected_issue_comment + 1).min(comment_count.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn issue_comments_move_up(&mut self) {
+        let Some(ref mut state) = self.issue_state else {
+            return;
+        };
+        state.selected_issue_comment = state.selected_issue_comment.saturating_sub(1);
+    }
+
+    pub(crate) fn open_selected_issue_comment(&mut self) {
+        let Some(ref mut state) = self.issue_state else {
+            return;
+        };
+        let comment_count = state.issue_comments.as_ref().map(|c| c.len()).unwrap_or(0);
+
+        if comment_count > 0 {
+            state.issue_comment_detail_mode = true;
+            state.issue_comment_detail_scroll = 0;
+        }
+    }
+
+    pub(crate) fn issue_comment_click_select(&mut self, index: usize) -> bool {
+        let Some(ref mut state) = self.issue_state else {
+            return false;
+        };
+        let already_selected = state.selected_issue_comment == index;
+        state.selected_issue_comment = index;
+        already_selected
+    }
+
     pub(crate) fn handle_issue_comment_list_input(&mut self, key: event::KeyEvent) -> Result<()> {
         let kb = self.config.keybindings.clone();
 
@@ -290,17 +383,12 @@ impl App {
         let comment_count = state.issue_comments.as_ref().map(|c| c.len()).unwrap_or(0);
 
         if self.matches_single_key(&key, &kb.move_down) {
-            if comment_count > 0 {
-                let state = self.issue_state.as_mut().unwrap();
-                state.selected_issue_comment =
-                    (state.selected_issue_comment + 1).min(comment_count.saturating_sub(1));
-            }
+            self.issue_comments_move_down();
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.move_up) {
-            let state = self.issue_state.as_mut().unwrap();
-            state.selected_issue_comment = state.selected_issue_comment.saturating_sub(1);
+            self.issue_comments_move_up();
             return Ok(());
         }
 
@@ -328,11 +416,7 @@ impl App {
         }
 
         if self.matches_single_key(&key, &kb.open_panel) {
-            if comment_count > 0 {
-                let state = self.issue_state.as_mut().unwrap();
-                state.issue_comment_detail_mode = true;
-                state.issue_comment_detail_scroll = 0;
-            }
+            self.open_selected_issue_comment();
             return Ok(());
         }
 

@@ -193,6 +193,42 @@ impl LayoutConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MouseConfig {
+    /// マウスキャプチャを起動時に有効化するかどうか。
+    /// 有効中は端末ネイティブのテキスト選択が効かなくなる(F2 で一時切替)。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// ホイール1ノッチあたりのカーソル/選択移動行数
+    #[serde(
+        default = "default_wheel_step",
+        deserialize_with = "deserialize_wheel_step"
+    )]
+    pub wheel_step: u16,
+}
+
+fn default_wheel_step() -> u16 {
+    3
+}
+
+fn deserialize_wheel_step<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u16::deserialize(deserializer)?;
+    Ok(value.clamp(1, 10))
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wheel_step: default_wheel_step(),
+        }
+    }
+}
+
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -31,6 +31,8 @@ pub enum NamedKey {
     PageUp,
     PageDown,
     BackTab,
+    /// Function key F1-F12 (validated at parse time)
+    F(u8),
 }
 
 impl NamedKey {
@@ -51,7 +53,10 @@ impl NamedKey {
             "pageup" | "pgup" => Some(NamedKey::PageUp),
             "pagedown" | "pgdn" => Some(NamedKey::PageDown),
             "backtab" | "shifttab" => Some(NamedKey::BackTab),
-            _ => None,
+            other => {
+                let n: u8 = other.strip_prefix('f')?.parse().ok()?;
+                (1..=12).contains(&n).then_some(NamedKey::F(n))
+            }
         }
     }
 
@@ -72,6 +77,7 @@ impl NamedKey {
             NamedKey::PageUp => KeyCode::PageUp,
             NamedKey::PageDown => KeyCode::PageDown,
             NamedKey::BackTab => KeyCode::BackTab,
+            NamedKey::F(n) => KeyCode::F(n),
         }
     }
 
@@ -92,6 +98,21 @@ impl NamedKey {
             NamedKey::PageUp => "PageUp",
             NamedKey::PageDown => "PageDown",
             NamedKey::BackTab => "Shift-Tab",
+            NamedKey::F(n) => match n {
+                1 => "F1",
+                2 => "F2",
+                3 => "F3",
+                4 => "F4",
+                5 => "F5",
+                6 => "F6",
+                7 => "F7",
+                8 => "F8",
+                9 => "F9",
+                10 => "F10",
+                11 => "F11",
+                12 => "F12",
+                _ => "F?",
+            },
         }
     }
 }
@@ -686,6 +707,7 @@ pub fn event_to_keybinding(event: &KeyEvent) -> Option<KeyBinding> {
         KeyCode::End => KeyCodeConfig::Named(NamedKey::End),
         KeyCode::PageUp => KeyCodeConfig::Named(NamedKey::PageUp),
         KeyCode::PageDown => KeyCodeConfig::Named(NamedKey::PageDown),
+        KeyCode::F(n) if (1..=12).contains(&n) => KeyCodeConfig::Named(NamedKey::F(n)),
         _ => return None,
     };
 
@@ -886,5 +908,49 @@ mod tests {
     #[test]
     fn test_display_named() {
         assert_eq!(KeyBinding::named(NamedKey::Enter).display(), "Enter");
+    }
+
+    #[test]
+    fn test_parse_f_key() {
+        assert_eq!(NamedKey::parse("f1"), Some(NamedKey::F(1)));
+        assert_eq!(NamedKey::parse("F2"), Some(NamedKey::F(2)));
+        assert_eq!(NamedKey::parse("f12"), Some(NamedKey::F(12)));
+        assert_eq!(NamedKey::parse("f0"), None);
+        assert_eq!(NamedKey::parse("f13"), None);
+        assert_eq!(NamedKey::parse("f"), None);
+    }
+
+    #[test]
+    fn test_parse_key_string_f_key() {
+        let key = parse_key_string("F2").unwrap();
+        assert_eq!(key.code, KeyCodeConfig::Named(NamedKey::F(2)));
+        assert!(key.modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_f_key_to_keycode() {
+        assert_eq!(NamedKey::F(2).to_keycode(), KeyCode::F(2));
+        assert_eq!(NamedKey::F(12).to_keycode(), KeyCode::F(12));
+    }
+
+    #[test]
+    fn test_f_key_display() {
+        assert_eq!(NamedKey::F(2).display_name(), "F2");
+        assert_eq!(KeyBinding::named(NamedKey::F(2)).display(), "F2");
+    }
+
+    #[test]
+    fn test_event_to_keybinding_f_key() {
+        let kb = event_to_keybinding(&key_event(KeyCode::F(2))).unwrap();
+        assert_eq!(kb.code, KeyCodeConfig::Named(NamedKey::F(2)));
+        assert!(event_to_keybinding(&key_event(KeyCode::F(13))).is_none());
+    }
+
+    #[test]
+    fn test_keybinding_matches_f_key() {
+        let binding = KeyBinding::named(NamedKey::F(2));
+        assert!(binding.matches(&key_event(KeyCode::F(2))));
+        assert!(!binding.matches(&key_event(KeyCode::F(3))));
+        assert!(!binding.matches(&key_event(KeyCode::Char('2'))));
     }
 }

@@ -29,6 +29,14 @@ tab_width = 4
 # Hide header/footer for focused editing (default: false)
 # zen_mode = false
 
+[mouse]
+# Mouse support (click to select, wheel to scroll, drag to select diff lines).
+# While capture is on, use F2 (toggle_mouse) to copy text with the terminal,
+# or disable entirely here. (default: true)
+# enabled = true
+# Lines moved per wheel notch (1-10, default: 3)
+# wheel_step = 3
+
 [keybindings]
 approve = 'a'
 request_changes = 'r'
@@ -78,6 +86,10 @@ pub(crate) const DEFAULT_LOCAL_CONFIG: &str = r#"# Project-local octorus configu
 # [layout]
 # left_panel_width = 35
 # zen_mode = false
+
+# [mouse]
+# enabled = true
+# wheel_step = 3
 
 # [ai]
 # reviewer = "claude"
@@ -899,10 +911,10 @@ mod tests {
 
         // config.toml matches a known default hash, so version should be detected
         let config_version = &manifest.files["config.toml"].version;
-        // DEFAULT_LOCAL_CONFIG currently matches the 0.5.8 hash in DEFAULT_HASHES
+        // DEFAULT_LOCAL_CONFIG currently matches the 0.8.0 hash in DEFAULT_HASHES
         assert!(
-            config_version == "0.5.8",
-            "skipped file should detect version 0.5.8 from hash, got {}",
+            config_version == "0.8.0",
+            "skipped file should detect version 0.8.0 from hash, got {}",
             config_version
         );
     }

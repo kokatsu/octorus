@@ -10,6 +10,7 @@ use crate::ai::{PromptLoader, PromptSource};
 use crate::app::{App, HelpTab};
 use crate::config::{Config, KeybindingsConfig};
 use crate::syntax::available_themes;
+use crate::ui::hit::{HitTarget, PaneKind, TabGroup};
 
 /// Format a key display with padding for alignment
 fn fmt_key(key: &str, width: usize) -> String {
@@ -32,6 +33,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     render_tab_header(frame, app, chunks[0]);
+    register_help_tab_hits(app, chunks[0]);
+
+    let body_area = Block::default().borders(Borders::ALL).inner(chunks[1]);
+    app.hit_map.push(
+        body_area,
+        HitTarget::Pane {
+            pane: PaneKind::Help,
+        },
+    );
 
     match app.help_tab {
         HelpTab::Keybindings => render_keybindings_tab(frame, app, chunks[1]),
@@ -39,6 +49,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     render_help_footer(frame, app, chunks[2]);
+}
+
+/// タブ見出しのクリック領域。Tabs ウィジェットの描画順
+/// (` Keybindings │ Config `)と同じ幅計算で位置を出す。
+fn register_help_tab_hits(app: &mut App, area: Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let first_width = " Keybindings ".len() as u16;
+    let regions = [
+        (inner.x, first_width, 0),
+        (
+            inner.x.saturating_add(first_width + 1),
+            " Config ".len() as u16,
+            1,
+        ),
+    ];
+    for (x, width, index) in regions {
+        app.hit_map.push(
+            Rect {
+                x,
+                y: inner.y,
+                width,
+                height: 1,
+            },
+            HitTarget::Tab {
+                group: TabGroup::HelpTabs,
+                index,
+            },
+        );
+    }
 }
 
 fn render_tab_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -304,6 +343,25 @@ pub fn build_config_lines(config: &Config) -> Vec<Line<'static>> {
         ),
         Line::from(""),
         Line::from(vec![Span::styled(
+            "Mouse Settings",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        config_value_line(
+            "Mouse support",
+            &config.mouse.enabled.to_string(),
+            "mouse.enabled",
+            overrides,
+        ),
+        config_value_line(
+            "Wheel step",
+            &config.mouse.wheel_step.to_string(),
+            "mouse.wheel_step",
+            overrides,
+        ),
+        Line::from(""),
+        Line::from(vec![Span::styled(
             "Editor",
             Style::default()
                 .fg(Color::Yellow)
@@ -552,6 +610,10 @@ fn build_help_lines(kb: &KeybindingsConfig) -> Vec<Line<'static>> {
         Line::from(format!(
             "{}  Toggle zen mode",
             fmt_key(&kb.toggle_zen_mode.display(), key_width)
+        )),
+        Line::from(format!(
+            "{}  Toggle mouse capture (release to copy text with the terminal)",
+            fmt_key(&kb.toggle_mouse.display(), key_width)
         )),
         Line::from(format!(
             "{}  Filter list",

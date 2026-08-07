@@ -5,7 +5,8 @@ mod schema;
 pub use keybindings::KeybindingsConfig;
 pub use loader::{find_project_root, find_project_root_in};
 pub use schema::{
-    AiConfig, DiffConfig, GitOpsConfig, LayoutConfig, ProposalPostStrategy, ShellConfig,
+    AiConfig, DiffConfig, GitOpsConfig, LayoutConfig, MouseConfig, ProposalPostStrategy,
+    ShellConfig,
 };
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ pub struct Config {
     #[serde(alias = "git_log")]
     pub git_ops: GitOpsConfig,
     pub shell: ShellConfig,
+    pub mouse: MouseConfig,
     #[serde(skip)]
     pub project_root: PathBuf,
     /// Path of the global config file if it was loaded successfully.
@@ -1500,6 +1502,98 @@ zen_mode = true
     fn test_layout_zen_mode_default() {
         let config: Config = toml::from_str("").unwrap();
         assert!(!config.layout.zen_mode);
+    }
+
+    #[test]
+    fn test_mouse_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.mouse.enabled);
+        assert_eq!(config.mouse.wheel_step, 3);
+    }
+
+    #[test]
+    fn test_mouse_custom() {
+        let config: Config = toml::from_str(
+            r#"
+            [mouse]
+            enabled = false
+            wheel_step = 5
+        "#,
+        )
+        .unwrap();
+        assert!(!config.mouse.enabled);
+        assert_eq!(config.mouse.wheel_step, 5);
+    }
+
+    #[test]
+    fn test_mouse_partial_section_keeps_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            [mouse]
+            enabled = false
+        "#,
+        )
+        .unwrap();
+        assert!(!config.mouse.enabled);
+        assert_eq!(config.mouse.wheel_step, 3);
+    }
+
+    #[test]
+    fn test_mouse_wheel_step_clamped() {
+        let low: Config = toml::from_str(
+            r#"
+            [mouse]
+            wheel_step = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(low.mouse.wheel_step, 1, "wheel_step below 1 clamps to 1");
+
+        let high: Config = toml::from_str(
+            r#"
+            [mouse]
+            wheel_step = 20
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            high.mouse.wheel_step, 10,
+            "wheel_step above 10 clamps to 10"
+        );
+    }
+
+    #[test]
+    fn test_toggle_mouse_default_is_f2() {
+        let kb = KeybindingsConfig::default();
+        assert_eq!(kb.toggle_mouse.display(), "F2");
+    }
+
+    #[test]
+    fn test_toggle_mouse_custom_binding() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings]
+            toggle_mouse = "F5"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.keybindings.toggle_mouse.display(), "F5");
+        assert!(config.keybindings.validate().is_ok());
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_includes_toggle_mouse() {
+        let config = KeybindingsConfig::default();
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            serialized.contains("toggle_mouse"),
+            "Serialized output should include toggle_mouse"
+        );
+        let deserialized: KeybindingsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.toggle_mouse.display(),
+            config.toggle_mouse.display()
+        );
     }
 
     #[test]

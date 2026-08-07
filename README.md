@@ -420,6 +420,13 @@ All octorus settings are configurable. Settings can be global or project-local.
 | `left_panel_width` | `u16` | `35` | Left panel width percentage in split view (clamped to `10`–`90`). Right panel fills the rest |
 | `zen_mode` | `bool` | `false` | Zen mode — hides UI chrome for distraction-free diff reading |
 
+#### `[mouse]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | `bool` | `true` | Enable mouse support (click, wheel, drag). While capture is on, the terminal's native text selection is unavailable — press `F2` (`toggle_mouse`) to temporarily release the mouse for copying, or set this to `false` to opt out entirely |
+| `wheel_step` | `u16` | `3` | Lines moved per wheel notch (clamped to `1`–`10`) |
+
 #### `[ai]`
 
 | Key | Type | Default | Description |
@@ -579,6 +586,27 @@ theme = "MyCustomTheme"
 Custom themes with the same name as a built-in theme will override it.
 
 ## Keybindings
+
+### Mouse
+
+Mouse support works on every screen and follows the same paths as the keyboard,
+so lazy loading, prefetching, and state transitions behave identically.
+
+| Gesture | Action |
+|---------|--------|
+| Click a list row / diff line | Select it (also focuses the clicked pane in split views) |
+| Click the selected row / line again | Open it (`Enter` equivalent) |
+| Wheel | Move the cursor/selection under the pointer by `wheel_step` lines (works on unfocused panes too) |
+| Drag on diff lines | Multi-line selection (`V` equivalent) |
+| Drag the split border | Resize the left panel (session only) |
+| Click outside an informational overlay | Close it (`Esc` equivalent) |
+| Click outside a confirmation dialog | Ignored — destructive confirmations are answered with `y`/`n` only |
+| `F2` | Toggle mouse capture on/off |
+
+> **Copying text:** while mouse capture is on, the terminal's native
+> drag-to-select is unavailable. Press `F2` to release the mouse, copy, then
+> press `F2` again (many terminals also support `Shift`+drag as a bypass).
+> Set `[mouse] enabled = false` to disable mouse support entirely.
 
 ### PR List View
 
@@ -1046,6 +1074,7 @@ go_to_definition = ["g", "d"]
 | `open_blame_pr` | `gp` | Open the PR for the blamed line's commit (browser file pane only) |
 | `open_line_discussion` | `gr` | Anchor review threads to lines and open the cursor line's discussion (browser file pane only) |
 | `toggle_zen_mode` | `Z` | Toggle zen mode (fullscreen diff) |
+| `toggle_mouse` | `F2` | Toggle mouse capture (release the mouse to copy text with the terminal) |
 | **Git Ops** |||
 | `git_ops_stage` | `Space` | Stage/unstage file or directory |
 | `git_ops_stage_all` | `s` | Stage all files |

@@ -1,7 +1,8 @@
 use super::common::{render_rally_status_bar, wrap_text};
 use crate::app::{App, CommentTab};
+use crate::ui::hit::{HitMap, HitTarget, ListKind, PaneKind, TabGroup};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -10,6 +11,49 @@ use ratatui::{
     },
     Frame,
 };
+
+fn register_comment_list_hits(
+    hit_map: &mut HitMap,
+    area: Rect,
+    item_heights: &[usize],
+    offset: usize,
+) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    hit_map.push(
+        inner,
+        HitTarget::Pane {
+            pane: PaneKind::List(ListKind::CommentList),
+        },
+    );
+
+    let bottom = inner.y.saturating_add(inner.height);
+    let mut y = inner.y;
+    for (row, &item_height) in item_heights.iter().enumerate().skip(offset) {
+        if y >= bottom {
+            break;
+        }
+
+        let remaining_height = usize::from(bottom - y);
+        if item_height > remaining_height {
+            break;
+        }
+        let height = item_height as u16;
+        hit_map.push(
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height,
+            },
+            HitTarget::ListRow {
+                list: ListKind::CommentList,
+                row,
+                index: row,
+            },
+        );
+        y = y.saturating_add(height);
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     if app.is_local_mode() {
@@ -44,6 +88,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     render_tab_header(frame, app, chunks[0]);
+    register_comment_tab_hits(app, chunks[0]);
 
     match app.cmt.comment_tab {
         CommentTab::Review => render_review_comments(frame, app, chunks[1]),
@@ -131,11 +176,12 @@ fn render_local_comment_list(frame: &mut Frame, app: &mut App) {
 #[allow(clippy::too_many_arguments)]
 fn render_comment_list_generic<T, F>(
     frame: &mut Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     comments: Option<&[T]>,
     loading: bool,
     selected_index: usize,
     scroll_offset: &mut usize,
+    hit_map: &mut HitMap,
     label: &str,
     format_item: F,
 ) where
@@ -146,6 +192,7 @@ fn render_comment_list_generic<T, F>(
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL));
         frame.render_widget(loading_msg, area);
+        register_comment_list_hits(hit_map, area, &[], 0);
         return;
     }
 
@@ -154,6 +201,7 @@ fn render_comment_list_generic<T, F>(
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL));
         frame.render_widget(empty, area);
+        register_comment_list_hits(hit_map, area, &[], 0);
         return;
     };
 
@@ -162,6 +210,7 @@ fn render_comment_list_generic<T, F>(
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL));
         frame.render_widget(empty, area);
+        register_comment_list_hits(hit_map, area, &[], 0);
         return;
     }
 
@@ -176,6 +225,7 @@ fn render_comment_list_generic<T, F>(
             format_item(item, i, is_selected, body_width)
         })
         .collect();
+    let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
 
     let mut list_state = ListState::default()
         .with_offset(*scroll_offset)
@@ -192,6 +242,7 @@ fn render_comment_list_generic<T, F>(
     frame.render_stateful_widget(list, area, &mut list_state);
 
     *scroll_offset = list_state.offset();
+    register_comment_list_hits(hit_map, area, &item_heights, *scroll_offset);
 
     if total_items > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -208,6 +259,44 @@ fn render_comment_list_generic<T, F>(
                 horizontal: 0,
             }),
             &mut scrollbar_state,
+        );
+    }
+}
+
+/// タブ見出しのクリック領域。ヘッダ行のラベル描画と同じ幅計算で位置を出す。
+fn register_comment_tab_hits(app: &mut App, area: ratatui::layout::Rect) {
+    use unicode_width::UnicodeWidthStr;
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let review_count = app.cmt.review_threads.len();
+    let discussion_count = app
+        .cmt
+        .discussion_comments
+        .as_ref()
+        .map(|c| c.len())
+        .unwrap_or(0);
+    let review_label = format!("[Review Threads ({})]", review_count);
+    let discussion_label = format!("[Discussion ({})]", discussion_count);
+    let review_width = review_label.width() as u16;
+    let regions = [
+        (inner.x.saturating_add(1), review_width, 0u16),
+        (
+            inner.x.saturating_add(1 + review_width + 2),
+            discussion_label.width() as u16,
+            1,
+        ),
+    ];
+    for (x, width, index) in regions {
+        app.hit_map.push(
+            ratatui::layout::Rect {
+                x,
+                y: inner.y,
+                width,
+                height: 1,
+            },
+            HitTarget::Tab {
+                group: TabGroup::CommentTabs,
+                index: usize::from(index),
+            },
         );
     }
 }
@@ -315,7 +404,7 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
         return;
     };
 
-    render_review_thread_list_data(
+    render_review_thread_list_data_with_hits(
         frame,
         area,
         ReviewThreadListData {
@@ -326,6 +415,7 @@ fn render_review_comments(frame: &mut Frame, app: &mut App, area: ratatui::layou
             resolved_ids: &resolved_ids,
         },
         &mut app.cmt.thread_scroll_offset,
+        Some(&mut app.hit_map),
     );
 }
 
@@ -339,9 +429,19 @@ pub(crate) struct ReviewThreadListData<'a> {
 
 pub(crate) fn render_review_thread_list_data(
     frame: &mut Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     data: ReviewThreadListData<'_>,
     scroll_offset: &mut usize,
+) {
+    render_review_thread_list_data_with_hits(frame, area, data, scroll_offset, None);
+}
+
+fn render_review_thread_list_data_with_hits(
+    frame: &mut Frame,
+    area: Rect,
+    data: ReviewThreadListData<'_>,
+    scroll_offset: &mut usize,
+    hit_map: Option<&mut HitMap>,
 ) {
     let available_width = area.width.saturating_sub(4) as usize;
     let body_width = available_width.saturating_sub(4);
@@ -406,6 +506,7 @@ pub(crate) fn render_review_thread_list_data(
             Some(ListItem::new(lines))
         })
         .collect();
+    let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
 
     let mut list_state = ListState::default()
         .with_offset(*scroll_offset)
@@ -420,6 +521,9 @@ pub(crate) fn render_review_thread_list_data(
     frame.render_stateful_widget(list, area, &mut list_state);
 
     *scroll_offset = list_state.offset();
+    if let Some(hit_map) = hit_map {
+        register_comment_list_hits(hit_map, area, &item_heights, *scroll_offset);
+    }
 
     if total_items > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -467,7 +571,7 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
         HashSet::new()
     };
 
-    render_review_thread_data(
+    render_review_thread_data_with_hits(
         frame,
         area,
         all_comments,
@@ -475,17 +579,41 @@ fn render_expanded_thread(frame: &mut Frame, app: &mut App, area: ratatui::layou
         app.cmt.expanded_selected,
         &mut app.cmt.expanded_scroll_offset,
         &resolved_ids,
+        Some(&mut app.hit_map),
     );
 }
 
 pub(crate) fn render_review_thread_data(
     frame: &mut Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     all_comments: &[crate::github::comment::ReviewComment],
     thread: &crate::app::CommentThread,
     selected: usize,
     scroll_offset: &mut usize,
     resolved_ids: &std::collections::HashSet<u64>,
+) {
+    render_review_thread_data_with_hits(
+        frame,
+        area,
+        all_comments,
+        thread,
+        selected,
+        scroll_offset,
+        resolved_ids,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_review_thread_data_with_hits(
+    frame: &mut Frame,
+    area: Rect,
+    all_comments: &[crate::github::comment::ReviewComment],
+    thread: &crate::app::CommentThread,
+    selected: usize,
+    scroll_offset: &mut usize,
+    resolved_ids: &std::collections::HashSet<u64>,
+    hit_map: Option<&mut HitMap>,
 ) {
     let available_width = area.width.saturating_sub(4) as usize;
     let body_width = available_width.saturating_sub(6);
@@ -557,6 +685,7 @@ pub(crate) fn render_review_thread_data(
             ListItem::new(lines)
         })
         .collect();
+    let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
 
     let total_items = comment_indices.len();
     let root_comment = &all_comments[thread.root];
@@ -582,6 +711,9 @@ pub(crate) fn render_review_thread_data(
     frame.render_stateful_widget(list, area, &mut list_state);
 
     *scroll_offset = list_state.offset();
+    if let Some(hit_map) = hit_map {
+        register_comment_list_hits(hit_map, area, &item_heights, *scroll_offset);
+    }
 
     if total_items > 1 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -612,6 +744,7 @@ fn render_discussion_comments(frame: &mut Frame, app: &mut App, area: ratatui::l
         app.cmt.discussion_comments_loading,
         app.cmt.selected_discussion_comment,
         &mut app.cmt.discussion_comment_list_scroll_offset,
+        &mut app.hit_map,
         "discussion comments",
         |comment: &DiscussionComment, _i: usize, is_selected: bool, body_width: usize| {
             let prefix = if is_selected { "> " } else { "  " };
