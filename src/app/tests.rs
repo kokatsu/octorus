@@ -2106,6 +2106,98 @@ async fn test_multiline_select_extend_and_confirm_via_key_dispatch() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn test_shift_enter_multiline_confirm_via_full_key_path() {
+    let mut app = make_app_with_patch("@@ -1,3 +1,4 @@\n context\n+added\n more context");
+    app.state = AppState::DiffView;
+    app.diff_scroll.line_count = 4;
+    app.diff_scroll.selected_line = 1;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+
+    let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+        code,
+        modifiers: mods,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    // handle_key_event = F2/シェル/ガード込みのフル経路
+    app.handle_key_event(press(KeyCode::Enter, KeyModifiers::SHIFT), &mut terminal)
+        .await
+        .unwrap();
+    assert!(
+        app.multiline_selection.is_some(),
+        "Shift+Enter で選択が始まる"
+    );
+
+    app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    app.handle_key_event(press(KeyCode::Char('c'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+
+    assert_eq!(app.state, AppState::TextInput);
+    let Some(InputMode::Comment(ref ctx)) = app.input_mode else {
+        panic!("expected comment input mode, got {:?}", app.input_mode);
+    };
+    assert_eq!(
+        ctx.start_line_number,
+        Some(1),
+        "範囲コメントとして確定される"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_shift_enter_starts_selection_even_while_comment_panel_open() {
+    let mut app = make_app_with_patch("@@ -1,3 +1,4 @@\n context\n+added\n more context");
+    app.state = AppState::DiffView;
+    app.diff_scroll.line_count = 4;
+    app.diff_scroll.selected_line = 1;
+    // マウスの再クリック等でパネルが開いたままの状態を再現
+    app.cmt.comment_panel_open = true;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+
+    let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+        code,
+        modifiers: mods,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    app.handle_key_event(press(KeyCode::Enter, KeyModifiers::SHIFT), &mut terminal)
+        .await
+        .unwrap();
+    assert!(
+        app.multiline_selection.is_some(),
+        "パネルが開いていても Shift+Enter で範囲選択が始まる"
+    );
+
+    app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    app.handle_key_event(press(KeyCode::Char('c'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+
+    assert_eq!(app.state, AppState::TextInput, "c で範囲コメントに入る");
+    let Some(InputMode::Comment(ref ctx)) = app.input_mode else {
+        panic!(
+            "expected multiline comment input, got {:?} (パネル分岐が c を単一行コメントに吸っている)",
+            app.input_mode
+        );
+    };
+    assert_eq!(
+        ctx.start_line_number,
+        Some(1),
+        "パネルが開いた状態から始めても範囲が保持される"
+    );
+}
+
 #[test]
 fn test_multiline_comment_preserves_selection_on_invalid_range() {
     let patch = "@@ -1,2 +1,2 @@\n line1\n+new line2\n@@ -10,2 +10,2 @@\n line10\n+new line11";

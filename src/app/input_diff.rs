@@ -328,6 +328,19 @@ impl App {
         }
 
         if self.cmt.comment_panel_open {
+            // 複数行選択の開始はパネルより優先する。パネルは開いたままだと
+            // 以降の全キーを吸うため(末尾の包括 return)、ここで閉じて
+            // 選択モードへ入る。マウスの再クリックでパネルが開きやすく
+            // なったことで、この取りこぼしが顕在化した。
+            if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+                || self.matches_single_key(&key, &kb.multiline_select)
+            {
+                self.cmt.comment_panel_open = false;
+                self.cmt.comment_panel_scroll = 0;
+                self.enter_multiline_selection();
+                return Ok(());
+            }
+
             if self.matches_single_key(&key, &kb.move_down) {
                 self.comment_panel_wheel(true);
                 return Ok(());
