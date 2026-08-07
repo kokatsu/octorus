@@ -49,8 +49,11 @@ pub(crate) enum DragState {
     /// スプリット境界をドラッグ中。body_x/body_width は分割対象領域の水平範囲。
     ResizingSplit { body_x: u16, body_width: u16 },
     /// 差分行を Down した直後の中間状態。まだ通常クリック。
-    /// 最初の Drag で SelectingDiffLines へ昇格する(Drag なしの Up は普通のクリック)。
-    PressedDiffLine { anchor: usize },
+    /// 最初の Drag で SelectingDiffLines へ昇格する。Drag なしの Up は普通の
+    /// クリックとして確定し、open_on_up が真(選択済み行を再クリック)なら
+    /// そこで初めてコメントパネルを開く(Down で開くとカーソル行からの
+    /// ドラッグ選択が武装できない)。
+    PressedDiffLine { anchor: usize, open_on_up: bool },
     /// 複数行選択をドラッグで拡張中(V 相当)
     SelectingDiffLines,
 }
@@ -211,6 +214,12 @@ impl App {
                 Ok(())
             }
             CoalescedMouseEvent::Up { .. } => {
+                if let DragState::PressedDiffLine {
+                    open_on_up: true, ..
+                } = self.drag_state
+                {
+                    self.diff_open_at_cursor();
+                }
                 self.drag_state = DragState::Idle;
                 Ok(())
             }
@@ -228,7 +237,7 @@ impl App {
                 // セッション内のみの変更(ファイルへは書き戻さない)
                 self.config.layout.left_panel_width = percent.clamp(10, 90);
             }
-            DragState::PressedDiffLine { anchor } => {
+            DragState::PressedDiffLine { anchor, .. } => {
                 // 最初の Drag で複数行選択へ昇格(V 相当)
                 if let Some(line) = self.diff_line_at(x, y) {
                     self.multiline_selection = Some(super::MultilineSelection {
@@ -434,10 +443,18 @@ impl App {
                 if self.multiline_selection.is_some() {
                     self.mouse_extend_diff_selection(line);
                     self.drag_state = DragState::SelectingDiffLines;
-                } else if self.diff_click_line(line) && !focus_changed {
-                    self.diff_open_at_cursor();
                 } else {
-                    self.drag_state = DragState::PressedDiffLine { anchor: line };
+                    let already_selected = self.diff_click_line(line);
+                    if !already_selected && self.cmt.comment_panel_open {
+                        // パネル表示中に別行へ移ったらパネル位置をリセット
+                        // (next_comment のキー経路と同じ扱い)
+                        self.cmt.comment_panel_scroll = 0;
+                        self.cmt.selected_inline_comment = 0;
+                    }
+                    self.drag_state = DragState::PressedDiffLine {
+                        anchor: line,
+                        open_on_up: already_selected && !focus_changed,
+                    };
                 }
             }
             // カーソル移動のみ(これらのビューに Enter アクションはない)
@@ -1076,10 +1093,99 @@ mod tests {
         app
     }
 
+    fn diff_line_target(line: usize) -> HitTarget {
+        HitTarget::ContentLine {
+            pane: PaneKind::Diff,
+            line,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reclick_on_selected_diff_line_opens_panel_on_up_not_down() {
+        let mut app = diff_app_with_hit_rows(20);
+        app.diff_scroll.selected_line = 5;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+
+        // 選択済み行への Down: この時点ではパネルを開かない
+        app.mouse_down(diff_line_target(5), &mut terminal)
+            .await
+            .unwrap();
+        assert!(
+            !app.cmt.comment_panel_open,
+            "Down の時点で開くとドラッグ選択が始められない"
+        );
+        assert_eq!(
+            app.drag_state,
+            DragState::PressedDiffLine {
+                anchor: 5,
+                open_on_up: true
+            }
+        );
+
+        // Drag なしの Up で初めて開く(再クリック=Enter 相当)
+        app.handle_mouse(CoalescedMouseEvent::Up { x: 0, y: 5 }, &mut terminal)
+            .await
+            .unwrap();
+        assert!(app.cmt.comment_panel_open, "Up でパネルが開く");
+        assert_eq!(app.drag_state, DragState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_drag_from_selected_line_selects_range_instead_of_opening_panel() {
+        let mut app = diff_app_with_hit_rows(20);
+        app.diff_scroll.selected_line = 5;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+
+        // カーソル行から Down → Drag: パネルではなく複数行選択になる
+        app.mouse_down(diff_line_target(5), &mut terminal)
+            .await
+            .unwrap();
+        app.mouse_drag(0, 9);
+        assert!(!app.cmt.comment_panel_open, "ドラッグしたら開かない");
+        let sel = app.multiline_selection.as_ref().unwrap();
+        assert_eq!((sel.anchor_line, sel.cursor_line), (5, 9));
+
+        // Up で確定してもパネルは開かず選択が残る
+        app.handle_mouse(CoalescedMouseEvent::Up { x: 0, y: 9 }, &mut terminal)
+            .await
+            .unwrap();
+        assert!(!app.cmt.comment_panel_open);
+        assert!(app.multiline_selection.is_some(), "選択は確定後も維持");
+    }
+
+    #[tokio::test]
+    async fn test_click_other_line_while_panel_open_resets_panel_position() {
+        let mut app = diff_app_with_hit_rows(20);
+        app.diff_scroll.selected_line = 5;
+        app.cmt.comment_panel_open = true;
+        app.cmt.comment_panel_scroll = 7;
+        app.cmt.selected_inline_comment = 1;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+
+        app.mouse_down(diff_line_target(9), &mut terminal)
+            .await
+            .unwrap();
+        assert_eq!(app.diff_scroll.selected_line, 9);
+        assert_eq!(
+            app.cmt.comment_panel_scroll, 0,
+            "行が変わればパネル位置リセット"
+        );
+        assert_eq!(app.cmt.selected_inline_comment, 0);
+    }
+
     #[test]
     fn test_pressed_diff_line_promotes_to_selection_on_first_drag() {
         let mut app = diff_app_with_hit_rows(20);
-        app.drag_state = DragState::PressedDiffLine { anchor: 5 };
+        app.drag_state = DragState::PressedDiffLine {
+            anchor: 5,
+            open_on_up: false,
+        };
 
         app.mouse_drag(10, 8);
         assert_eq!(app.drag_state, DragState::SelectingDiffLines);
@@ -1095,7 +1201,10 @@ mod tests {
     #[test]
     fn test_up_without_drag_keeps_plain_click_semantics() {
         let mut app = diff_app_with_hit_rows(20);
-        app.drag_state = DragState::PressedDiffLine { anchor: 5 };
+        app.drag_state = DragState::PressedDiffLine {
+            anchor: 5,
+            open_on_up: false,
+        };
 
         // Drag なしで Up: 選択モードに入らない
         app.drag_state = DragState::Idle;
@@ -1105,7 +1214,10 @@ mod tests {
     #[test]
     fn test_selection_survives_mouse_up() {
         let mut app = diff_app_with_hit_rows(20);
-        app.drag_state = DragState::PressedDiffLine { anchor: 3 };
+        app.drag_state = DragState::PressedDiffLine {
+            anchor: 3,
+            open_on_up: false,
+        };
         app.mouse_drag(0, 7);
         assert!(app.multiline_selection.is_some());
 
@@ -1122,13 +1234,22 @@ mod tests {
     #[test]
     fn test_drag_outside_diff_rows_keeps_selection_unchanged() {
         let mut app = diff_app_with_hit_rows(10);
-        app.drag_state = DragState::PressedDiffLine { anchor: 2 };
+        app.drag_state = DragState::PressedDiffLine {
+            anchor: 2,
+            open_on_up: false,
+        };
         app.mouse_drag(100, 50);
         assert!(
             app.multiline_selection.is_none(),
             "差分行の外では昇格しない"
         );
-        assert_eq!(app.drag_state, DragState::PressedDiffLine { anchor: 2 });
+        assert_eq!(
+            app.drag_state,
+            DragState::PressedDiffLine {
+                anchor: 2,
+                open_on_up: false
+            }
+        );
     }
 
     #[test]

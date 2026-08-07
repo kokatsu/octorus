@@ -2053,6 +2053,59 @@ fn test_enter_multiline_selection_rejected_on_header() {
     assert!(app.multiline_selection.is_none());
 }
 
+#[tokio::test]
+#[serial]
+async fn test_multiline_select_extend_and_confirm_via_key_dispatch() {
+    let mut app = make_app_with_patch("@@ -1,3 +1,4 @@\n context\n+added\n more context");
+    app.state = AppState::DiffView;
+    app.diff_scroll.line_count = 4;
+    app.diff_scroll.selected_line = 1;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+
+    let press = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+        code,
+        modifiers: mods,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    app.handle_diff_view_input(
+        press(KeyCode::Char('V'), KeyModifiers::SHIFT),
+        &mut terminal,
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.multiline_selection.is_some(),
+        "V で複数行選択モードに入る"
+    );
+
+    app.handle_diff_view_input(press(KeyCode::Char('j'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    let sel = app.multiline_selection.as_ref().unwrap();
+    assert_eq!(
+        (sel.anchor_line, sel.cursor_line),
+        (1, 2),
+        "j で選択が伸びる"
+    );
+
+    app.handle_diff_view_input(press(KeyCode::Char('c'), KeyModifiers::NONE), &mut terminal)
+        .await
+        .unwrap();
+    assert_eq!(app.state, AppState::TextInput, "c で確定して入力へ");
+    let Some(InputMode::Comment(ref ctx)) = app.input_mode else {
+        panic!("expected comment input mode, got {:?}", app.input_mode);
+    };
+    assert_eq!(ctx.line_number, 2, "終了行は new-side 2 行目");
+    assert_eq!(
+        ctx.start_line_number,
+        Some(1),
+        "開始行が保持され複数行コメントになる"
+    );
+}
+
 #[test]
 fn test_multiline_comment_preserves_selection_on_invalid_range() {
     let patch = "@@ -1,2 +1,2 @@\n line1\n+new line2\n@@ -10,2 +10,2 @@\n line10\n+new line11";
