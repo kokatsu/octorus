@@ -678,7 +678,7 @@ impl App {
             return self.handle_local_comment_list_input(key, terminal).await;
         }
 
-        let visible_lines = terminal.size()?.height.saturating_sub(8) as usize;
+        let visible_lines = super::viewport_size(terminal).height.saturating_sub(8) as usize;
 
         if self.cmt.discussion_comment_detail_mode {
             return self.handle_discussion_detail_input(key, visible_lines);
@@ -815,7 +815,7 @@ impl App {
         key: event::KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
-        let visible_lines = terminal.size()?.height.saturating_sub(8) as usize;
+        let visible_lines = super::viewport_size(terminal).height.saturating_sub(8) as usize;
         self.handle_local_comment_list_key(key, visible_lines)
     }
 

@@ -334,7 +334,7 @@ impl App {
 
         if self.matches_single_key(&key, &kb.page_down) || Self::is_shift_char_shortcut(&key, 'j') {
             if !has_filter {
-                let page_step = terminal.size()?.height.saturating_sub(8) as usize;
+                let page_step = super::viewport_size(terminal).height.saturating_sub(8) as usize;
                 let step = page_step.max(1);
                 if tree_active {
                     self.file_tree_page_down(step);
@@ -348,7 +348,7 @@ impl App {
 
         if self.matches_single_key(&key, &kb.page_up) || Self::is_shift_char_shortcut(&key, 'k') {
             if !has_filter {
-                let page_step = terminal.size()?.height.saturating_sub(8) as usize;
+                let page_step = super::viewport_size(terminal).height.saturating_sub(8) as usize;
                 let step = page_step.max(1);
                 if tree_active {
                     self.file_tree_page_up(step);

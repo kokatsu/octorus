@@ -244,7 +244,7 @@ impl App {
         key: event::KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
-        let terminal_height = terminal.size()?.height;
+        let terminal_height = super::viewport_size(terminal).height;
         // Viewport overhead: header (3) + body borders (2) + footer (1) = 6
         let visible_lines = terminal_height.saturating_sub(6) as usize;
         let half_page = (visible_lines / 2).max(1);
@@ -334,7 +334,7 @@ impl App {
         key: event::KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
-        let terminal_height = terminal.size()?.height;
+        let terminal_height = super::viewport_size(terminal).height;
         self.apply_help_scroll(key, terminal_height);
         Ok(())
     }

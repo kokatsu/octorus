@@ -26,14 +26,14 @@ impl App {
 
         // diff_page_down / diff_page_up: scroll the diff regardless of focused pane.
         if self.matches_single_key(&key, &kb.diff_page_down) {
-            let term_h = terminal.size()?.height as usize;
+            let term_h = super::viewport_size(terminal).height as usize;
             let visible_lines = self.diff_visible_lines(term_h, DiffViewVariant::SplitPane);
             self.scroll_diff_page_down(visible_lines);
             return Ok(());
         }
 
         if self.matches_single_key(&key, &kb.diff_page_up) {
-            let term_h = terminal.size()?.height as usize;
+            let term_h = super::viewport_size(terminal).height as usize;
             let visible_lines = self.diff_visible_lines(term_h, DiffViewVariant::SplitPane);
             self.scroll_diff_page_up(visible_lines);
             return Ok(());
@@ -86,7 +86,7 @@ impl App {
 
         if self.matches_single_key(&key, &kb.page_down) || Self::is_shift_char_shortcut(&key, 'j') {
             if !has_filter {
-                let page_step = terminal.size()?.height.saturating_sub(8) as usize;
+                let page_step = super::viewport_size(terminal).height.saturating_sub(8) as usize;
                 let step = page_step.max(1);
                 if tree_active {
                     self.file_tree_page_down(step);
@@ -108,7 +108,7 @@ impl App {
 
         if self.matches_single_key(&key, &kb.page_up) || Self::is_shift_char_shortcut(&key, 'k') {
             if !has_filter {
-                let page_step = terminal.size()?.height.saturating_sub(8) as usize;
+                let page_step = super::viewport_size(terminal).height.saturating_sub(8) as usize;
                 let step = page_step.max(1);
                 if tree_active {
                     self.file_tree_page_up(step);
@@ -250,7 +250,7 @@ impl App {
             return Ok(());
         }
 
-        let term_size = terminal.size()?;
+        let term_size = super::viewport_size(terminal);
         let term_h = term_size.height as usize;
         let term_w = term_size.width as usize;
 

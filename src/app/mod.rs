@@ -214,6 +214,14 @@ pub struct App {
     pub(crate) drag_state: input_mouse::DragState,
 }
 
+/// 入力ハンドラ用の画面サイズ。`Terminal::size()` は実端末への問い合わせのため
+/// tty がない環境(テスト、CI)で失敗する — viewport 領域なら I/O なしで取れる。
+pub(crate) fn viewport_size(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> ratatui::layout::Size {
+    terminal.get_frame().area().as_size()
+}
+
 impl App {
     fn base_app(repo: String, config: Config) -> Self {
         let submit_key = config.keybindings.submit.clone();
