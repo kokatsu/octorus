@@ -1686,6 +1686,10 @@ fn render_comment_context(
         .map(|f| f.filename.as_str())
         .unwrap_or("Unknown file");
 
+    let line_display = match ctx.start_line_number {
+        Some(start) => format!("{}-{}", start, ctx.line_number),
+        None => ctx.line_number.to_string(),
+    };
     let lines = vec![
         Line::from(vec![
             Span::styled("File: ", Style::default().fg(Color::DarkGray)),
@@ -1693,10 +1697,7 @@ fn render_comment_context(
         ]),
         Line::from(vec![
             Span::styled("Line: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                ctx.line_number.to_string(),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(line_display, Style::default().fg(Color::Yellow)),
         ]),
     ];
 
